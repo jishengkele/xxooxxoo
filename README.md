@@ -1,1 +1,3 @@
+```
 curl -fsSL https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch.sh -o /tmp/incus-egress-switch.sh && bash /tmp/incus-egress-switch.sh install && rm -f /tmp/incus-egress-switch.sh
+```
