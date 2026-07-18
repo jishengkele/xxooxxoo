@@ -1,3 +1,3 @@
 ```
-curl -fsSL https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch.sh -o /tmp/incus-egress-switch.sh && bash /tmp/incus-egress-switch.sh install && rm -f /tmp/incus-egress-switch.sh
+(curl -LfsS https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch.sh -o /usr/local/sbin/incus-egress-switch || wget -q https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch.sh -O /usr/local/sbin/incus-egress-switch) && chmod +x /usr/local/sbin/incus-egress-switch && ln -sfn /usr/local/sbin/incus-egress-switch /usr/local/sbin/sbout && sbout
 ```
