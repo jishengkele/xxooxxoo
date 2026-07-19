@@ -6308,26 +6308,30 @@ class Handler(BaseHTTPRequestHandler):
             globally_forced = app_is_forced(app, apps)
             forced = globally_forced or bool(conditional_target)
             effective_target = conditional_target if conditional_target and not globally_forced else (default_target if globally_forced else (override_target if override_target else default_target))
+            choice_label = "已锁定（不可自选）" if forced else visible_split_target_list_label(policy_targets, visible_targets, exits)
             lines.append("%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
                 app,
                 row.get("display", app),
                 row.get("category", "未分类"),
                 split_target_label(effective_target, exits),
-                visible_split_target_list_label(policy_targets, visible_targets, exits),
+                choice_label,
                 ("按当前出口强制" if conditional_target and not globally_forced else "宿主机强制") if forced else split_target_label(override_target, exits),
-                visible_split_target_list_label(policy_targets, visible_targets, exits),
+                choice_label,
             ))
         return "\n".join(lines) + ("\n" if lines else "")
 
     def split_targets_text(self, container, exits, app_ref=""):
-        lines = ["%s\t%s" % (DEFAULT_SPLIT_TARGET, "跟随宿主机默认")]
+        lines = []
         targets = []
         if app_ref:
             apps = load_split_apps()
             app = resolve_app(app_ref, apps)
             policies = load_split_policies()
+            if app and (app_is_forced(app, apps) or conditional_force_target(app, apps, container)):
+                return ""
             if app and app in policies:
                 targets = split_target_list(policies[app])
+        lines.append("%s\t%s" % (DEFAULT_SPLIT_TARGET, "跟随宿主机默认"))
         if not targets:
             targets = [DIRECT_EXIT] + sorted(exits.keys())
         targets = visible_split_targets_for_container(container, targets, exits)
@@ -7664,6 +7668,15 @@ choose_split_app() {
         echo "暂无可用应用分流" >&2
         return 1
     fi
+    # 强制策略由宿主机控制，实例不能创建或恢复容器级覆盖。
+    # 后端提交接口仍会再次校验；这里提前从可选应用中移除，避免误导用户。
+    awk -F '\t' '$6 != "按当前出口强制" && $6 != "宿主机强制"' "$tmp" > "$tmp.selectable"
+    mv -f "$tmp.selectable" "$tmp"
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        echo "当前应用均由宿主机强制分流，实例不可自行切换。" >&2
+        return 1
+    fi
     title "选择应用"
     printf '  %s[0]%s 返回上一层\n' "$C_GREEN" "$C_RESET"
     i=1
@@ -8962,7 +8975,7 @@ EOF
 }
 
 print_split_header() {
-    local total categories app_policies category_policies force_apps force_categories catalog_sync rule_sync catalog_state app target category category_target app_count specific_count=0
+    local total categories app_policies category_policies force_apps force_categories force_on_exit force_category_on_exit catalog_sync rule_sync catalog_state app target category category_target app_count source specific_count=0
     load_config
     write_default_config
     total="$(read_split_apps | awk 'END {print NR + 0}')"
@@ -8971,6 +8984,8 @@ print_split_header() {
     category_policies="$(read_split_category_policies | awk 'END {print NR + 0}')"
     force_apps="$(read_force_split_policies | awk 'END {print NR + 0}')"
     force_categories="$(read_force_split_category_policies | awk 'END {print NR + 0}')"
+    force_on_exit="$(read_force_on_exit_policies | awk 'END {print NR + 0}')"
+    force_category_on_exit="$(read_force_category_on_exit_policies | awk 'END {print NR + 0}')"
     if [ -f "$SPLIT_CATALOG_FILE" ]; then
         catalog_sync="$(date -d "@$(cat "$SPLIT_CATALOG_FILE" 2>/dev/null || printf 0)" '+%F %T' 2>/dev/null || cat "$SPLIT_CATALOG_FILE")"
     else
@@ -8995,6 +9010,7 @@ print_split_header() {
  分类数量 : $categories
  已设策略 : 分类 $category_policies / 应用 $app_policies
  强制分流 : 分类 $force_categories / 应用 $force_apps
+ 按出口强制: 分类 $force_category_on_exit / 应用 $force_on_exit
  目录同步 : $catalog_sync
  规则更新 : $rule_sync
 ------------------------------------------------------------
@@ -9045,6 +9061,17 @@ EOF
         done < <(read_force_split_policies)
     else
         printf '  暂无强制分流。\n'
+    fi
+    printf ' 按当前出口强制:\n'
+    if [ -n "$(read_force_on_exit_policies)$(read_force_category_on_exit_policies)" ]; then
+        while IFS=$'\t' read -r category source target; do
+            printf '  - 分类 %s：%s -> %s\n' "$category" "$(display_exit_name "$source")" "$(split_target_list_label "$target")"
+        done < <(read_force_category_on_exit_policies)
+        while IFS=$'\t' read -r app source target; do
+            printf '  - 应用 %s：%s -> %s\n' "$(split_app_display "$app")" "$(display_exit_name "$source")" "$(split_target_list_label "$target")"
+        done < <(read_force_on_exit_policies)
+    else
+        printf '  暂无按当前出口强制分流。\n'
     fi
     printf '%s\n' '============================================================'
 }
