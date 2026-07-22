@@ -8883,12 +8883,18 @@ choose_takeover_allowed_exits() {
     local parts=()
     [ -n "$out_file" ] || return 1
     tmp="$(mktemp)"
-    read_exit_rows | awk -F '\t' '{print $1 "\t" $6}' > "$tmp"
-    if [ ! -s "$tmp" ]; then
+    read_exit_rows | awk -F '\t' '{print $1 "\t" $6}' > "$tmp.exits"
+    if [ ! -s "$tmp.exits" ]; then
+        rm -f "$tmp.exits"
         rm -f "$tmp"
         warn "暂无已添加出口，请先添加出口后再同步容器。"
         return 1
     fi
+    {
+        printf '*\t全部已添加出口\n'
+        cat "$tmp.exits"
+    } > "$tmp"
+    rm -f "$tmp.exits"
     printf '\n请选择允许容器自助切换的出口:\n'
     printf '  0. 返回上一步\n'
     i=1
@@ -8897,7 +8903,8 @@ choose_takeover_allowed_exits() {
         printf '  %s. %s\n' "$i" "${display:-$item}"
         i=$((i + 1))
     done < "$tmp"
-    printf '\n可以输入一个或多个序号/出口名，英文逗号分隔；未选中的出口不会出现在容器 out 中，也不能通过 API 强制切换。\n'
+    printf '\n选择 1 可一次授权全部已添加出口；也可以输入一个或多个序号/出口名，英文逗号分隔。\n'
+    printf '未选中的出口不会出现在容器 out 中，也不能通过 API 强制切换。\n'
     printf '入口机直出是内置回退，不属于已添加出口，容器始终可以切回入口机。\n'
     read -r -p "请输入授权出口: " pick
     case "$pick" in
@@ -8910,7 +8917,15 @@ choose_takeover_allowed_exits() {
         if [[ "$part" =~ ^[0-9]+$ ]]; then
             target="$(sed -n "${part}p" "$tmp" | awk -F '\t' '{print $1}')"
         else
-            target="$(resolve_exit_target "$part" || true)"
+            case "$part" in
+                "*"|all|ALL|全部|全部出口) target="*" ;;
+                *) target="$(resolve_exit_target "$part" || true)" ;;
+            esac
+        fi
+        if [ "$target" = "*" ]; then
+            rm -f "$tmp"
+            printf '*\n' > "$out_file"
+            return 0
         fi
         if [ -z "$target" ] || [ "$target" = "-" ]; then
             rm -f "$tmp"
@@ -9432,22 +9447,18 @@ interactive_container_out_autofill() {
 }
 
 interactive_clear_container_out() {
-    printf '\n这个操作会删除所有已扫描容器内的 out 命令和 token。\n'
-    printf '同时会把所有接管容器的默认出口切回入口机。\n'
-    printf '宿主机应用分流规则仍会继续生效；容器只是不能再自行执行 out use 切换出口。\n\n'
-    load_config
-    if [ "${AUTO_INSTALL_CLIENT:-true}" = "true" ]; then
-        warn "当前容器 out/token 自动补齐仍处于启用状态。"
-        warn "请先返回主菜单，选择“容器 out/token 自动补齐开关”，关闭后再清空。"
-        pause_screen
-        return 0
-    fi
-    if ! confirm_yes "确认清空容器内 out/token 吗"; then
+    printf '\n这个操作会一键清除所有实例的出口接管信息：\n'
+    printf '  - 删除容器内 out 命令和 token\n'
+    printf '  - 清空宿主机容器授权、当前出口和容器级分流覆盖\n'
+    printf '  - 关闭自动同步和 out/token 自动补齐，防止立即重新生成\n'
+    printf '已添加的出口节点和宿主机全局分流规则会保留。\n\n'
+    if ! confirm_yes "确认清空全部实例出口信息吗"; then
         info "已取消。"
         pause_screen
         return 0
     fi
     clear_container_out_access
+    info "如需重新接管实例，请返回主菜单选择 7；可直接选择 1 一次授权全部已添加出口。"
     pause_screen
 }
 
@@ -9563,20 +9574,33 @@ clear_container_out_access() {
     need_root
     load_config
     write_default_config
-    info "分流管理由宿主机 nft/策略路由控制，不依赖容器内 out 命令。"
-    if [ "${AUTO_INSTALL_CLIENT:-true}" = "true" ]; then
-        die "容器 out/token 自动补齐仍处于启用状态。请先在主菜单选择“容器 out/token 自动补齐开关”并关闭，再执行清空。"
-    fi
-    info "检测到自动补齐已关闭，开始清理现有容器内客户端。"
+    local tmp
+    info "正在停止自动同步，并清理所有实例出口接管信息。"
+    set_config_value AUTO_INSTALL_CLIENT false
+    load_config
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop "$APP_NAME-autosync" 2>/dev/null || true
+        systemctl disable --now "$APP_NAME-autosync" 2>/dev/null || true
     fi
-    reset_all_containers_to_entry
     cleanup_container_clients
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart "$APP_NAME-autosync" 2>/dev/null || true
-    fi
-    info "已清空容器内 out/token。由于自动补齐已关闭，后台不会再自动补回。"
+    state_lock_acquire
+    mark_nft_pending
+    tmp="$(mktemp)"
+    cat > "$tmp" <<'EOF'
+# 容器授权配置，每行一台：
+# 名称    容器IP       token               允许出口      当前出口
+# 请通过主菜单 7 重新同步运行中容器并选择授权出口。
+EOF
+    install -m 0600 "$tmp" "$CONTAINERS_FILE"
+    cat > "$tmp" <<'EOF'
+# 容器级应用分流覆盖，每行一条：
+# 容器名  app_id  目标出口
+EOF
+    install -m 0600 "$tmp" "$SPLIT_CONTAINER_POLICIES_FILE"
+    rm -f "$tmp" "$CONFIG_DIR/autosync-state.json"
+    do_apply_nftables
+    state_lock_release
+    info "已清空全部实例出口信息；自动同步和 out/token 自动补齐保持关闭。"
+    info "下一步：执行主菜单 7 重新同步；选择 1 可授权全部已添加出口。"
 }
 
 enable_container_out_access() {
@@ -9733,7 +9757,7 @@ interactive_menu() {
         printf '    %s[7]%s 同步运行中容器，并选择可切换出口\n' "$UI_GREEN" "$UI_RESET"
         printf '    %s[8]%s 同步运行中容器，但仅启用宿主机分流\n' "$UI_GREEN" "$UI_RESET"
         printf '    %s[9]%s 容器 out/token 自动补齐开关\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[10]%s 清空容器 out/token\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[10]%s 一键清空全部实例出口信息\n' "$UI_GREEN" "$UI_RESET"
         printf '    %s[11]%s 全部运行中容器一键切换出口\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【分流管理】%s\n' "$UI_CYAN" "$UI_RESET"
@@ -9991,8 +10015,8 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       应用目录保留，可继续按需重新添加分流。
 
   $0 clear-container-out
-      清空容器内 out/token，并把所有接管容器默认出口切回入口机。
-      执行前必须先关闭容器 out/token 自动补齐；宿主机应用分流仍然生效。
+      一键清空容器内 out/token、宿主机容器授权、当前出口和容器级分流覆盖。
+      自动同步会停止；出口节点与全局分流保留，请通过主菜单 7 重新同步。
 
   $0 enable-container-out
       重新开启容器 out/token 自动注入，并立即同步一次。
