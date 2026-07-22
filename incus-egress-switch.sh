@@ -49,8 +49,20 @@ SYSTEMD_DIR="${EGRESS_SYSTEMD_DIR:-/etc/systemd/system}"
 SERVICE_FILE="$SYSTEMD_DIR/$APP_NAME.service"
 AUTOSYNC_SERVICE="$SYSTEMD_DIR/$APP_NAME-autosync.service"
 EXIT_SERVICE_PREFIX="incus-egress-switch-exit"
+WG_SERVER_DIR="${WG_SERVER_DIR:-/etc/cloudshlii-wg-server}"
+WG_SERVER_ENV="$WG_SERVER_DIR/server.env"
+WG_SERVER_PEERS="$WG_SERVER_DIR/peers.tsv"
+WG_SERVER_PRIVATE_KEY="$WG_SERVER_DIR/server.key"
+WG_SERVER_PUBLIC_KEY="$WG_SERVER_DIR/server.pub"
+WG_SERVER_IFACE="cwg-server"
+WG_SERVER_CONF="/etc/wireguard/${WG_SERVER_IFACE}.conf"
+WG_SERVER_NFT="$WG_SERVER_DIR/server.nft"
+WG_SERVER_NFT_TABLE="csh_wg_server"
+WG_SERVER_SYSCTL="/etc/sysctl.d/99-cloudshlii-wg-server.conf"
+WG_SERVER_LOCK="/run/lock/cloudshlii-wg-server.lock"
+WG_SERVER_OPENRC_SERVICE="/etc/init.d/cloudshlii-wg-server"
 UPDATE_BACKUP_ROOT="${EGRESS_UPDATE_BACKUP_ROOT:-/var/backups/$APP_NAME}"
-DEFAULT_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch.sh"
+DEFAULT_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch-wg.sh"
 UPDATE_BACKUP_PATH=""
 UPDATE_BACKUP_ARCHIVE=""
 
@@ -2808,6 +2820,16 @@ tun_for_exit() {
     printf 'csh-%s-%s\n' "$clean" "${digest:0:4}"
 }
 
+wg_for_exit() {
+    local name="$1" clean digest
+    clean="${name//[!A-Za-z0-9]/-}"
+    clean="${clean:0:5}"
+    [ -n "$clean" ] || clean="exit"
+    digest="$(printf '%s' "$name" | sha256sum)"
+    digest="${digest%% *}"
+    printf 'cwg-%s-%s\n' "$clean" "${digest:0:4}"
+}
+
 json_escape() {
     local s="$1"
     s=${s//\\/\\\\}
@@ -3425,6 +3447,705 @@ add_vless_exit() {
     port="${3:-}"
     uuid="${4:-}"
     add_vless_exit_values "$display" "$server" "$port" "$uuid"
+}
+
+valid_wireguard_key() {
+    local key="${1:-}"
+    [ "$key" = "-" ] && return 0
+    printf '%s' "$key" | grep -Eq '^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$'
+}
+
+valid_wireguard_address() {
+    local family="$1" value="${2:-}"
+    [ "$value" = "-" ] && return 0
+    python3 - "$family" "$value" <<'PY'
+import ipaddress
+import sys
+
+family, value = sys.argv[1:3]
+try:
+    interface = ipaddress.ip_interface(value)
+except ValueError:
+    raise SystemExit(1)
+expected = 4 if family == "4" else 6
+raise SystemExit(0 if interface.version == expected else 1)
+PY
+}
+
+valid_wireguard_endpoint() {
+    local endpoint="${1:-}"
+    python3 - "$endpoint" <<'PY'
+import sys
+from urllib.parse import urlsplit
+
+endpoint = sys.argv[1].strip()
+parsed = None
+try:
+    parsed = urlsplit("wg://" + endpoint)
+    valid = bool(parsed.hostname) and parsed.port is not None and 1 <= parsed.port <= 65535
+except ValueError:
+    valid = False
+raise SystemExit(0 if valid and parsed is not None and not parsed.username and not parsed.password and not parsed.path else 1)
+PY
+}
+
+install_wireguard_tools() {
+    command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1 && return 0
+    info "正在安装 WireGuard 工具；不会修改现有 sing-box 服务。"
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard-tools
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y wireguard-tools
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y wireguard-tools
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache wireguard-tools
+    else
+        die "无法自动安装 wireguard-tools，请先安装 wg 和 wg-quick。"
+    fi
+    command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1 \
+        || die "WireGuard 工具安装后仍不可用。"
+}
+
+install_wg_server_dependencies() {
+    local missing="" cmd
+    for cmd in ip nft python3 flock sysctl ss; do
+        command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
+    done
+    if [ -n "$missing" ]; then
+        info "正在安装 WG 出口服务器依赖:$missing"
+        if command -v apk >/dev/null 2>&1; then
+            apk add --no-cache wireguard-tools iproute2 nftables python3 util-linux procps
+        elif command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard-tools iproute2 nftables python3 util-linux procps
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y wireguard-tools iproute nftables python3 util-linux procps-ng
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y wireguard-tools iproute nftables python3 util-linux procps-ng
+        else
+            die "无法自动安装 WG 服务端依赖:$missing"
+        fi
+    fi
+    install_wireguard_tools
+    for cmd in ip nft python3 flock sysctl ss wg wg-quick; do need_cmd "$cmd"; done
+    if ! command -v systemctl >/dev/null 2>&1 && ! command -v rc-service >/dev/null 2>&1; then
+        die "当前系统既没有 systemd，也没有 OpenRC，暂不支持自动管理 WG 服务。"
+    fi
+}
+
+wg_random_free_udp_port() {
+    local min="${1:-20000}" max="${2:-65535}" span attempts port
+    [[ "$min" =~ ^[0-9]+$ ]] && [[ "$max" =~ ^[0-9]+$ ]] || return 1
+    [ "$min" -ge 1024 ] && [ "$max" -le 65535 ] && [ "$min" -le "$max" ] || return 1
+    span=$((max - min + 1))
+    attempts=$((span * 2))
+    [ "$attempts" -gt 200 ] && attempts=200
+    while [ "$attempts" -gt 0 ]; do
+        port=$((min + RANDOM % span))
+        if ! ss -H -lun "sport = :$port" 2>/dev/null | grep -q .; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+        attempts=$((attempts - 1))
+    done
+    return 1
+}
+
+WG_CHECK_PASS=0
+WG_CHECK_WARN=0
+WG_CHECK_FAIL=0
+
+wg_check_pass() { WG_CHECK_PASS=$((WG_CHECK_PASS + 1)); printf '[PASS] %s\n' "$*"; }
+wg_check_warn() { WG_CHECK_WARN=$((WG_CHECK_WARN + 1)); printf '[WARN] %s\n' "$*"; }
+wg_check_fail() { WG_CHECK_FAIL=$((WG_CHECK_FAIL + 1)); printf '[FAIL] %s\n' "$*"; }
+
+wg_server_preflight() {
+    local port="${1:-}" wan probe_iface probe_table global4 init_name port_owner="" bind_result
+    WG_CHECK_PASS=0
+    WG_CHECK_WARN=0
+    WG_CHECK_FAIL=0
+    [ -n "$port" ] || die "用法: $0 wg-server-check UDP端口"
+    validate_port "$port" || die "UDP 端口无效: $port"
+    printf 'WireGuard 出口部署环境检测（UDP %s）\n\n' "$port"
+
+    if [ "${EUID:-$(id -u)}" -eq 0 ]; then wg_check_pass "当前使用 root 权限。"; else wg_check_fail "必须使用 root 权限。"; fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        init_name="systemd"
+        wg_check_pass "服务管理器: systemd。"
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        init_name="OpenRC"
+        wg_check_pass "服务管理器: OpenRC。"
+    else
+        init_name="unknown"
+        wg_check_fail "未找到受支持的 systemd/OpenRC 服务管理器。"
+    fi
+
+    wan="$(wg_server_detect_wan)"
+    if [ -n "$wan" ] && ip link show "$wan" >/dev/null 2>&1; then
+        wg_check_pass "默认出口网卡: $wan。"
+    else
+        wg_check_fail "没有检测到可用的 IPv4 默认出口网卡。"
+    fi
+    if ip route get 1.1.1.1 >/dev/null 2>&1; then wg_check_pass "IPv4 默认路由可用。"; else wg_check_fail "IPv4 默认路由不可用。"; fi
+
+    global4="$(ip -4 -o addr show dev "$wan" scope global 2>/dev/null | awk 'NR == 1 {split($4,a,"/"); print a[1]}')"
+    if [ -z "$global4" ]; then
+        wg_check_fail "未发现 IPv4 地址。"
+    elif python3 - "$global4" <<'PY' >/dev/null 2>&1
+import ipaddress, sys
+raise SystemExit(0 if ipaddress.ip_address(sys.argv[1]).is_global else 1)
+PY
+    then
+        wg_check_pass "检测到公网 IPv4: $global4。"
+    else
+        wg_check_warn "本机地址 $global4 不是公网地址；若为 LXC/NAT，必须把公网 UDP $port 映射到本容器同端口。"
+    fi
+
+    for cmd in ip wg wg-quick nft python3 ss flock sysctl; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            wg_check_pass "命令可用: $cmd。"
+        elif command -v apk >/dev/null 2>&1 || command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+            wg_check_warn "缺少命令 $cmd，正式部署时会尝试自动安装。"
+        else
+            wg_check_fail "缺少命令 $cmd，且未找到可支持的包管理器。"
+        fi
+    done
+
+    probe_iface="cwgp$((RANDOM % 9000 + 1000))"
+    if ip link add "$probe_iface" type wireguard >/tmp/cloudshlii-wg-probe.log 2>&1; then
+        ip link del "$probe_iface" 2>/dev/null || true
+        wg_check_pass "内核允许创建 WireGuard 接口（CAP_NET_ADMIN 正常）。"
+    else
+        wg_check_fail "无法创建 WireGuard 接口: $(tr '\n' ' ' </tmp/cloudshlii-wg-probe.log 2>/dev/null)"
+    fi
+    rm -f /tmp/cloudshlii-wg-probe.log
+
+    probe_table="csh_wgp_$((RANDOM % 9000 + 1000))"
+    if ! command -v nft >/dev/null 2>&1; then
+        wg_check_warn "nft 命令尚未安装，正式部署时会自动安装 nftables；安装后才能验证 nftables 内核和权限。"
+    elif nft add table inet "$probe_table" >/tmp/cloudshlii-nft-probe.log 2>&1; then
+        nft delete table inet "$probe_table" 2>/dev/null || true
+        wg_check_pass "允许创建和删除独立 nftables 表。"
+    else
+        wg_check_fail "nftables 权限或内核支持不足: $(tr '\n' ' ' </tmp/cloudshlii-nft-probe.log 2>/dev/null)"
+    fi
+    rm -f /tmp/cloudshlii-nft-probe.log
+
+    if [ -w /proc/sys/net/ipv4/ip_forward ]; then
+        wg_check_pass "IPv4 转发参数可写（当前值: $(cat /proc/sys/net/ipv4/ip_forward)）。"
+    else
+        wg_check_fail "IPv4 转发参数不可写。"
+    fi
+    if [ -w /proc/sys/net/ipv6/conf/all/forwarding ]; then
+        wg_check_pass "IPv6 转发参数可写（当前值: $(cat /proc/sys/net/ipv6/conf/all/forwarding)）。"
+    else
+        wg_check_warn "IPv6 转发参数不可写；仅部署 IPv4 时不影响。"
+    fi
+
+    if command -v ss >/dev/null 2>&1 && ss -H -lun "sport = :$port" 2>/dev/null | grep -q .; then
+        if wg_server_load 2>/dev/null && [ "${WG_LISTEN_PORT:-}" = "$port" ] && ip link show "$WG_SERVER_IFACE" >/dev/null 2>&1; then
+            port_owner="当前脚本管理的 $WG_SERVER_IFACE"
+            wg_check_pass "UDP $port 已由$port_owner使用，可安全执行重新配置。"
+        else
+            wg_check_fail "UDP $port 已被其他服务占用。"
+        fi
+    elif command -v python3 >/dev/null 2>&1; then
+        bind_result="$(python3 - "$port" <<'PY' 2>&1
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.bind(("0.0.0.0", int(sys.argv[1])))
+except OSError as exc:
+    print(exc)
+    raise SystemExit(1)
+finally:
+    s.close()
+PY
+)" && wg_check_pass "UDP $port 当前空闲且可绑定。" || wg_check_fail "UDP $port 无法绑定: $bind_result"
+    else
+        wg_check_warn "无法执行 UDP 绑定测试，因为缺少 Python。"
+    fi
+
+    printf '\n检测汇总: PASS=%s  WARN=%s  FAIL=%s\n' "$WG_CHECK_PASS" "$WG_CHECK_WARN" "$WG_CHECK_FAIL"
+    if [ "$WG_CHECK_FAIL" -gt 0 ]; then
+        printf '结论: 当前机器不满足 WG 出口部署条件，请先处理 FAIL 项。\n'
+        return 1
+    fi
+    if [ "$WG_CHECK_WARN" -gt 0 ]; then
+        printf '结论: 本机内核与权限满足部署；请确认 WARN 中的公网端口映射或可自动安装项。\n'
+    else
+        printf '结论: 当前机器完整满足 WG 出口部署条件。\n'
+    fi
+    [ "$init_name" != "unknown" ]
+}
+
+write_wireguard_exit_files() {
+    local name="$1" iface="$2" endpoint="$3" peer_public_key="$4" address4="$5" address6="$6" private_key="$7" preshared_key="$8" mtu="$9"
+    local conf_dir conf service addresses="" allowed_ips="" psk_line=""
+    conf_dir="$EXIT_DIR/$name"
+    # wg-quick 使用配置文件名作为接口名，因此必须保存为 <iface>.conf。
+    conf="$conf_dir/$iface.conf"
+    service="$SYSTEMD_DIR/${EXIT_SERVICE_PREFIX}-${name}.service"
+    [ "$address4" = "-" ] || { addresses="$address4"; allowed_ips="0.0.0.0/0"; }
+    if [ "$address6" != "-" ]; then
+        [ -n "$addresses" ] && addresses="$addresses, "
+        addresses="${addresses}${address6}"
+        [ -n "$allowed_ips" ] && allowed_ips="$allowed_ips, "
+        allowed_ips="${allowed_ips}::/0"
+    fi
+    [ "$preshared_key" = "-" ] || psk_line="PresharedKey = $preshared_key"
+    mkdir -p "$conf_dir"
+    cat > "$conf" <<EOF
+[Interface]
+PrivateKey = $private_key
+Address = $addresses
+MTU = $mtu
+Table = off
+FwMark = 666
+
+[Peer]
+PublicKey = $peer_public_key
+$psk_line
+Endpoint = $endpoint
+AllowedIPs = $allowed_ips
+PersistentKeepalive = 25
+EOF
+    chmod 600 "$conf"
+    cat > "$service" <<EOF
+[Unit]
+Description=cloudshlii WireGuard egress exit $name
+After=network-online.target
+Wants=network-online.target
+Before=$APP_NAME.service $APP_NAME-autosync.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/wg-quick up $conf
+ExecStartPost=/bin/sh -c 'for i in \$(seq 1 20); do ip link show "\$1" >/dev/null 2>&1 && break; sleep 1; done; "\$2" apply-exit-route "\$3" >/dev/null 2>&1 || true' sh $iface $INSTALL_BIN $name
+ExecStop=/usr/bin/wg-quick down $conf
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+add_wireguard_exit() {
+    need_root
+    load_config
+    write_default_config
+    need_cmd python3
+    need_cmd systemctl
+    need_cmd ip
+    state_lock_acquire
+    local display="${1:-}" endpoint="${2:-}" peer_public_key="${3:-}" address4="${4:--}" address6="${5:--}" preshared_key="${6:--}" mtu="${7:-1380}"
+    local name idx mark table iface private_key public_key route4 route6 service
+    [ -n "$display" ] && [ -n "$endpoint" ] && [ -n "$peer_public_key" ] \
+        || die "用法: $0 add-wg 出口名 服务端地址:端口 服务端公钥 IPv4隧道地址 [IPv6隧道地址|-] [PSK|-] [MTU]"
+    display="$(normalize_display_name "$display")"
+    valid_wireguard_endpoint "$endpoint" || die "WireGuard Endpoint 无效，请使用 域名:端口、IPv4:端口 或 [IPv6]:端口。"
+    valid_wireguard_key "$peer_public_key" || die "WireGuard 服务端公钥无效。"
+    valid_wireguard_key "$preshared_key" || die "WireGuard PSK 无效；没有 PSK 请填 -。"
+    valid_wireguard_address 4 "$address4" || die "WireGuard IPv4 隧道地址无效，请包含前缀，例如 10.66.0.2/32；不启用请填 -。"
+    valid_wireguard_address 6 "$address6" || die "WireGuard IPv6 隧道地址无效，请包含前缀；不启用请填 -。"
+    [ "$address4" != "-" ] || [ "$address6" != "-" ] || die "WireGuard 至少需要一个 IPv4 或 IPv6 隧道地址。"
+    [[ "$mtu" =~ ^[0-9]+$ ]] && [ "$mtu" -ge 1280 ] && [ "$mtu" -le 9000 ] || die "WireGuard MTU 必须是 1280-9000 的整数。"
+    name="$(safe_exit_id "wg" "$display" "$endpoint" "")"
+    valid_name "$name" || die "出口内部名称无效: $name"
+    exit_exists "$name" && die "出口已存在: $name"
+    [ -z "$(exit_name_by_display "$display")" ] || die "出口显示名已存在: $display"
+    install_wireguard_tools
+    idx=$(next_exit_index)
+    mark=$(mark_for_index "$idx")
+    table=$(table_for_index "$idx")
+    iface=$(wg_for_exit "$name")
+    private_key="$(wg genkey)"
+    public_key="$(printf '%s' "$private_key" | wg pubkey)"
+    route4="none"; route6="none"
+    [ "$address4" = "-" ] || route4="dev:$iface"
+    [ "$address6" = "-" ] || route6="dev:$iface"
+    write_wireguard_exit_files "$name" "$iface" "$endpoint" "$peer_public_key" "$address4" "$address6" "$private_key" "$preshared_key" "$mtu"
+    service="${EXIT_SERVICE_PREFIX}-${name}"
+    mark_nft_pending
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$mark" "$table" "$route4" "$route6" "$display" >> "$EXITS_FILE"
+    chmod 600 "$EXITS_FILE"
+    state_lock_release
+    if ! systemctl daemon-reload || ! systemctl enable "$service" >/dev/null || ! systemctl start "$service"; then
+        rollback_proxy_exit_add "$name"
+        die "WireGuard 出口 '$display' 启动失败，已回滚本次添加。请查看: journalctl -u $service.service -n 80 --no-pager"
+    fi
+    if ! wait_for_iface "$iface"; then
+        rollback_proxy_exit_add "$name"
+        die "WireGuard 出口 '$display' 的接口 $iface 未启动，已回滚本次添加。"
+    fi
+    if ! (do_apply); then
+        rollback_proxy_exit_add "$name"
+        die "WireGuard 出口 '$display' 已启动，但宿主机路由应用失败，已回滚本次添加。"
+    fi
+    info "WireGuard 出口 '$display' 已添加并启动。"
+    printf '入口机 WireGuard 公钥: %s\n' "$public_key"
+    info "请把上面的入口机公钥配置到出口服务器 Peer；再通过主菜单 7 同步实例授权。"
+}
+
+wg_server_lock() {
+    mkdir -p "$(dirname "$WG_SERVER_LOCK")"
+    exec {WG_SERVER_LOCK_FD}>"$WG_SERVER_LOCK"
+    flock -x "$WG_SERVER_LOCK_FD"
+}
+
+wg_server_unlock() {
+    flock -u "$WG_SERVER_LOCK_FD" 2>/dev/null || true
+    exec {WG_SERVER_LOCK_FD}>&-
+}
+
+wg_server_detect_wan() {
+    ip -4 route show default 2>/dev/null | awk 'NR == 1 {for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}'
+}
+
+wg_server_network() {
+    local value="$1"
+    python3 - "$value" <<'PY'
+import ipaddress, sys
+print(ipaddress.ip_interface(sys.argv[1]).network)
+PY
+}
+
+wg_server_load() {
+    [ -s "$WG_SERVER_ENV" ] || return 1
+    # shellcheck disable=SC1090
+    . "$WG_SERVER_ENV"
+    WG_LISTEN_PORT="${WG_LISTEN_PORT:-51820}"
+    WG_ADDRESS4="${WG_ADDRESS4:--}"
+    WG_ADDRESS6="${WG_ADDRESS6:--}"
+    WG_MTU="${WG_MTU:-1380}"
+    WG_WAN_IFACE="${WG_WAN_IFACE:-}"
+}
+
+wg_server_write_sysctl() {
+    cat > "$WG_SERVER_SYSCTL" <<'EOF'
+# Managed by cloudshlii WireGuard server mode.
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+    chmod 644 "$WG_SERVER_SYSCTL"
+    sysctl -e -q -p "$WG_SERVER_SYSCTL"
+}
+
+wg_server_write_openrc_service() {
+    local wg_quick_bin
+    command -v rc-service >/dev/null 2>&1 || return 0
+    wg_quick_bin="$(command -v wg-quick)"
+    cat > "$WG_SERVER_OPENRC_SERVICE" <<EOF
+#!/sbin/openrc-run
+description="cloudshlii WireGuard egress server"
+
+depend() {
+    need net
+    after firewall
+}
+
+start() {
+    ebegin "Starting cloudshlii WireGuard server"
+    $wg_quick_bin up "$WG_SERVER_CONF"
+    eend \$?
+}
+
+stop() {
+    ebegin "Stopping cloudshlii WireGuard server"
+    $wg_quick_bin down "$WG_SERVER_CONF"
+    eend \$?
+}
+EOF
+    chmod 755 "$WG_SERVER_OPENRC_SERVICE"
+}
+
+wg_server_service_enable_start() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload
+        systemctl enable --now "wg-quick@$WG_SERVER_IFACE"
+        systemctl restart "wg-quick@$WG_SERVER_IFACE"
+    else
+        wg_server_write_openrc_service
+        rc-update add cloudshlii-wg-server default >/dev/null 2>&1 || true
+        if rc-service cloudshlii-wg-server status >/dev/null 2>&1; then
+            rc-service cloudshlii-wg-server restart
+        else
+            rc-service cloudshlii-wg-server start
+        fi
+    fi
+}
+
+wg_server_service_restart() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart "wg-quick@$WG_SERVER_IFACE"
+    else
+        wg_server_write_openrc_service
+        if rc-service cloudshlii-wg-server status >/dev/null 2>&1; then
+            rc-service cloudshlii-wg-server restart
+        else
+            rc-service cloudshlii-wg-server start
+        fi
+    fi
+}
+
+wg_server_service_stop_disable() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "wg-quick@$WG_SERVER_IFACE" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    else
+        rc-service cloudshlii-wg-server stop 2>/dev/null || true
+        rc-update del cloudshlii-wg-server default >/dev/null 2>&1 || true
+        rm -f "$WG_SERVER_OPENRC_SERVICE"
+    fi
+}
+
+wg_server_service_status() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --no-pager --full status "wg-quick@$WG_SERVER_IFACE" 2>/dev/null | sed -n '1,8p' || true
+    else
+        rc-service cloudshlii-wg-server status 2>&1 || true
+        rc-update show default 2>/dev/null | grep -F cloudshlii-wg-server || true
+    fi
+}
+
+wg_server_render() {
+    wg_server_load || die "WireGuard 出口服务器尚未初始化。"
+    local conf_stage conf_tmp nft_tmp nft_check private_key addresses="" network4="" network6="" nat4="" nat6="" peer_lines=""
+    local name public_key allowed4 allowed6 psk rest psk_line allowed_ips
+    conf_stage="$(mktemp -d)"
+    conf_tmp="$conf_stage/${WG_SERVER_IFACE}.conf"
+    nft_tmp="$(mktemp)"
+    nft_check="$(mktemp)"
+    private_key="$(cat "$WG_SERVER_PRIVATE_KEY")"
+    if [ "$WG_ADDRESS4" != "-" ]; then
+        addresses="$WG_ADDRESS4"
+        network4="$(wg_server_network "$WG_ADDRESS4")"
+        nat4="    ip saddr $network4 oifname \"$WG_WAN_IFACE\" masquerade"
+    fi
+    if [ "$WG_ADDRESS6" != "-" ]; then
+        [ -n "$addresses" ] && addresses="$addresses, "
+        addresses="${addresses}${WG_ADDRESS6}"
+        network6="$(wg_server_network "$WG_ADDRESS6")"
+        nat6="    ip6 saddr $network6 oifname \"$WG_WAN_IFACE\" masquerade"
+    fi
+    while IFS=$'\t' read -r name public_key allowed4 allowed6 psk rest; do
+        [ -n "${name:-}" ] || continue
+        case "$name" in \#*) continue ;; esac
+        psk_line=""
+        [ "${psk:--}" = "-" ] || psk_line="PresharedKey = $psk"
+        allowed_ips=""
+        [ "${allowed4:--}" = "-" ] || allowed_ips="$allowed4"
+        if [ "${allowed6:--}" != "-" ]; then
+            [ -n "$allowed_ips" ] && allowed_ips="$allowed_ips, "
+            allowed_ips="${allowed_ips}${allowed6}"
+        fi
+        peer_lines="$peer_lines
+# Peer: $name
+[Peer]
+PublicKey = $public_key
+$psk_line
+AllowedIPs = $allowed_ips
+"
+    done < "$WG_SERVER_PEERS"
+    cat > "$conf_tmp" <<EOF
+[Interface]
+PrivateKey = $private_key
+Address = $addresses
+ListenPort = $WG_LISTEN_PORT
+MTU = $WG_MTU
+PostUp = nft delete table inet $WG_SERVER_NFT_TABLE 2>/dev/null || true; nft -f $WG_SERVER_NFT
+PostDown = nft delete table inet $WG_SERVER_NFT_TABLE 2>/dev/null || true
+$peer_lines
+EOF
+    cat > "$nft_tmp" <<EOF
+table inet $WG_SERVER_NFT_TABLE {
+  chain input {
+    type filter hook input priority filter - 5; policy accept;
+    udp dport $WG_LISTEN_PORT accept
+  }
+  chain forward {
+    type filter hook forward priority filter - 5; policy accept;
+    iifname "$WG_SERVER_IFACE" accept
+    oifname "$WG_SERVER_IFACE" ct state established,related accept
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+$nat4
+$nat6
+  }
+}
+EOF
+    wg-quick strip "$conf_tmp" >/dev/null || { rm -rf "$conf_stage"; rm -f "$nft_tmp" "$nft_check"; die "生成的 WireGuard 服务端配置校验失败。"; }
+    if nft list table inet "$WG_SERVER_NFT_TABLE" >/dev/null 2>&1; then
+        printf 'delete table inet %s\n' "$WG_SERVER_NFT_TABLE" > "$nft_check"
+    fi
+    cat "$nft_tmp" >> "$nft_check"
+    nft -c -f "$nft_check" || { rm -rf "$conf_stage"; rm -f "$nft_tmp" "$nft_check"; die "生成的 WireGuard nftables 配置校验失败。"; }
+    install -m 600 "$conf_tmp" "$WG_SERVER_CONF"
+    install -m 600 "$nft_tmp" "$WG_SERVER_NFT"
+    rm -rf "$conf_stage"
+    rm -f "$nft_tmp" "$nft_check"
+}
+
+wg_server_restart() {
+    local backup_conf="" backup_nft=""
+    [ -f "$WG_SERVER_CONF" ] && { backup_conf="$(mktemp)"; cp -a "$WG_SERVER_CONF" "$backup_conf"; }
+    [ -f "$WG_SERVER_NFT" ] && { backup_nft="$(mktemp)"; cp -a "$WG_SERVER_NFT" "$backup_nft"; }
+    wg_server_render
+    if wg_server_service_enable_start; then
+        rm -f "$backup_conf" "$backup_nft"
+        return 0
+    fi
+    warn "WireGuard 服务端启动失败，正在回滚配置。"
+    [ -n "$backup_conf" ] && install -m 600 "$backup_conf" "$WG_SERVER_CONF"
+    [ -n "$backup_nft" ] && install -m 600 "$backup_nft" "$WG_SERVER_NFT"
+    rm -f "$backup_conf" "$backup_nft"
+    wg_server_service_restart 2>/dev/null || true
+    return 1
+}
+
+wg_server_install() {
+    need_root
+    umask 077
+    install_wg_server_dependencies
+    wg_server_lock
+    local port="${1:-}" address4="${2:-10.66.0.1/24}" address6="${3:--}" mtu="${4:-1380}" wan="${5:-}" tmp
+    if [ -z "$port" ] || [ "$port" = "random" ]; then
+        port="$(wg_random_free_udp_port "${WG_RANDOM_PORT_MIN:-20000}" "${WG_RANDOM_PORT_MAX:-65535}")" \
+            || die "指定随机范围内没有可用 UDP 端口。"
+        info "已随机选择未占用 UDP 端口: $port"
+    fi
+    validate_port "$port" || die "WireGuard UDP 端口无效: $port"
+    valid_wireguard_address 4 "$address4" || die "WireGuard 服务端 IPv4 地址无效: $address4"
+    valid_wireguard_address 6 "$address6" || die "WireGuard 服务端 IPv6 地址无效: $address6"
+    [ "$address4" != "-" ] || [ "$address6" != "-" ] || die "服务端至少需要一个隧道地址。"
+    [[ "$mtu" =~ ^[0-9]+$ ]] && [ "$mtu" -ge 1280 ] && [ "$mtu" -le 9000 ] || die "MTU 必须是 1280-9000 的整数。"
+    wan="${wan:-$(wg_server_detect_wan)}"
+    [ -n "$wan" ] && valid_name "$wan" && ip link show "$wan" >/dev/null 2>&1 || die "无法确定公网出口网卡: $wan"
+    mkdir -p "$WG_SERVER_DIR" /etc/wireguard
+    chmod 700 "$WG_SERVER_DIR" /etc/wireguard
+    [ -s "$WG_SERVER_PRIVATE_KEY" ] || wg genkey > "$WG_SERVER_PRIVATE_KEY"
+    chmod 600 "$WG_SERVER_PRIVATE_KEY"
+    wg pubkey < "$WG_SERVER_PRIVATE_KEY" > "$WG_SERVER_PUBLIC_KEY"
+    chmod 644 "$WG_SERVER_PUBLIC_KEY"
+    [ -f "$WG_SERVER_PEERS" ] || printf '# 名称\t公钥\tIPv4 AllowedIPs\tIPv6 AllowedIPs\tPSK\n' > "$WG_SERVER_PEERS"
+    chmod 600 "$WG_SERVER_PEERS"
+    tmp="$(mktemp)"
+    cat > "$tmp" <<EOF
+WG_LISTEN_PORT=$port
+WG_ADDRESS4=$address4
+WG_ADDRESS6=$address6
+WG_MTU=$mtu
+WG_WAN_IFACE=$wan
+EOF
+    install -m 600 "$tmp" "$WG_SERVER_ENV"
+    rm -f "$tmp"
+    wg_server_write_sysctl
+    if ! wg_server_restart; then
+        wg_server_unlock
+        die "WireGuard 出口服务器部署失败，请查看 systemd journal 或 OpenRC 服务日志。"
+    fi
+    wg_server_unlock
+    info "WireGuard 出口服务器已部署。"
+    printf '接口: %s\nUDP端口: %s\n公网网卡: %s\n服务端公钥: %s\n' "$WG_SERVER_IFACE" "$port" "$wan" "$(cat "$WG_SERVER_PUBLIC_KEY")"
+}
+
+wg_server_add_peer() {
+    need_root
+    wg_server_load || die "请先部署 WireGuard 出口服务器。"
+    wg_server_lock
+    local name="${1:-}" public_key="${2:-}" allowed4="${3:--}" allowed6="${4:--}" psk="${5:--}" tmp peers_backup line_name line_public line4 line6 line_psk rest
+    [ -n "$name" ] && [ -n "$public_key" ] || die "用法: $0 wg-server-add-peer 名称 入口机公钥 IPv4地址 [IPv6地址|-] [PSK|-]"
+    valid_name "$name" || die "Peer 名称只能包含字母、数字、点、下划线和横线。"
+    valid_wireguard_key "$public_key" || die "入口机 WireGuard 公钥无效。"
+    valid_wireguard_key "$psk" || die "PSK 无效；不使用请填 -。"
+    valid_wireguard_address 4 "$allowed4" || die "Peer IPv4 地址无效，应填写如 10.66.0.2/32。"
+    valid_wireguard_address 6 "$allowed6" || die "Peer IPv6 地址无效。"
+    [ "$allowed4" != "-" ] || [ "$allowed6" != "-" ] || die "Peer 至少需要一个隧道地址。"
+    tmp="$(mktemp)"
+    peers_backup="$(mktemp)"
+    cp -a "$WG_SERVER_PEERS" "$peers_backup"
+    printf '# 名称\t公钥\tIPv4 AllowedIPs\tIPv6 AllowedIPs\tPSK\n' > "$tmp"
+    while IFS=$'\t' read -r line_name line_public line4 line6 line_psk rest; do
+        case "${line_name:-}" in ""|\#*) continue ;; esac
+        [ "$line_name" = "$name" ] && continue
+        if [ "$line_public" = "$public_key" ]; then rm -f "$tmp" "$peers_backup"; wg_server_unlock; die "该公钥已被 Peer '$line_name' 使用。"; fi
+        if { [ "$allowed4" != "-" ] && [ "$line4" = "$allowed4" ]; } || { [ "$allowed6" != "-" ] && [ "$line6" = "$allowed6" ]; }; then
+            rm -f "$tmp" "$peers_backup"; wg_server_unlock; die "隧道地址已被 Peer '$line_name' 使用。"
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$line_name" "$line_public" "$line4" "$line6" "$line_psk" >> "$tmp"
+    done < "$WG_SERVER_PEERS"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$public_key" "$allowed4" "$allowed6" "$psk" >> "$tmp"
+    install -m 600 "$tmp" "$WG_SERVER_PEERS"
+    rm -f "$tmp"
+    if ! wg_server_restart; then
+        install -m 600 "$peers_backup" "$WG_SERVER_PEERS"
+        rm -f "$peers_backup"
+        wg_server_unlock
+        die "添加 Peer 后服务重启失败，Peer 清单已回滚。"
+    fi
+    rm -f "$peers_backup"
+    wg_server_unlock
+    info "WireGuard Peer '$name' 已添加或更新。"
+}
+
+wg_server_remove_peer() {
+    need_root
+    wg_server_load || die "WireGuard 出口服务器尚未部署。"
+    wg_server_lock
+    local name="${1:-}" tmp peers_backup found="false" line_name line_public line4 line6 line_psk rest
+    [ -n "$name" ] || die "用法: $0 wg-server-remove-peer Peer名称"
+    tmp="$(mktemp)"
+    peers_backup="$(mktemp)"
+    cp -a "$WG_SERVER_PEERS" "$peers_backup"
+    printf '# 名称\t公钥\tIPv4 AllowedIPs\tIPv6 AllowedIPs\tPSK\n' > "$tmp"
+    while IFS=$'\t' read -r line_name line_public line4 line6 line_psk rest; do
+        case "${line_name:-}" in ""|\#*) continue ;; esac
+        if [ "${line_name:-}" = "$name" ]; then found="true"; continue; fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$line_name" "$line_public" "$line4" "$line6" "$line_psk" >> "$tmp"
+    done < "$WG_SERVER_PEERS"
+    [ "$found" = "true" ] || { rm -f "$tmp" "$peers_backup"; wg_server_unlock; die "未找到 Peer: $name"; }
+    install -m 600 "$tmp" "$WG_SERVER_PEERS"
+    rm -f "$tmp"
+    if ! wg_server_restart; then
+        install -m 600 "$peers_backup" "$WG_SERVER_PEERS"
+        rm -f "$peers_backup"
+        wg_server_unlock
+        die "删除 Peer 后服务重启失败，Peer 清单已回滚。"
+    fi
+    rm -f "$peers_backup"
+    wg_server_unlock
+    info "WireGuard Peer '$name' 已删除。"
+}
+
+wg_server_status() {
+    need_root
+    if ! wg_server_load; then
+        warn "WireGuard 出口服务器尚未部署。"
+        return 1
+    fi
+    printf 'WireGuard 出口服务器\n接口: %s\nUDP端口: %s\n公网网卡: %s\nIPv4隧道: %s\nIPv6隧道: %s\nMTU: %s\n服务端公钥: %s\n\n' \
+        "$WG_SERVER_IFACE" "$WG_LISTEN_PORT" "$WG_WAN_IFACE" "$WG_ADDRESS4" "$WG_ADDRESS6" "$WG_MTU" "$(cat "$WG_SERVER_PUBLIC_KEY")"
+    printf 'Peer 配置:\n'
+    awk -F '\t' '$1 !~ /^#/ && NF {printf "  %s  IPv4=%s  IPv6=%s  PSK=%s\n", $1,$3,$4,($5=="-"?"无":"已设置")}' "$WG_SERVER_PEERS"
+    printf '\n运行状态:\n'
+    wg_server_service_status
+    printf '\n握手与流量:\n'
+    wg show "$WG_SERVER_IFACE" 2>/dev/null || true
+}
+
+wg_server_uninstall() {
+    need_root
+    wg_server_lock
+    wg_server_service_stop_disable
+    nft delete table inet "$WG_SERVER_NFT_TABLE" 2>/dev/null || true
+    rm -f "$WG_SERVER_CONF" "$WG_SERVER_SYSCTL"
+    rm -rf "$WG_SERVER_DIR"
+    wg_server_unlock
+    info "WireGuard 出口服务器组件已卸载；其他 nftables 表、代理服务和运行时转发参数未改动。"
 }
 
 stop_and_remove_exit_service() {
@@ -8454,7 +9175,7 @@ interactive_client_script() {
 }
 
 interactive_add_proxy_exit() {
-    local choice link parsed default_name name server port username password method uuid
+    local choice link parsed default_name name server port username password method uuid endpoint peer_key address4 address6 psk mtu
     need_root
     load_config
     write_default_config
@@ -8465,6 +9186,7 @@ interactive_add_proxy_exit() {
     printf '  4. SK5 手动输入\n'
     printf '  5. VLESS+TCP 链接导入\n'
     printf '  6. VLESS+TCP 手动输入\n'
+    printf '  7. WireGuard 原生隧道\n'
     printf '  0. 返回主菜单\n'
     read -r -p "请输入序号 [1]: " choice
     choice="${choice:-1}"
@@ -8522,6 +9244,18 @@ interactive_add_proxy_exit() {
             uuid="$(prompt_required "用户 ID / UUID")"
             add_vless_exit_values "$name" "$server" "$port" "$uuid"
             ;;
+        7)
+            printf '\n[WireGuard] 入口机将自动生成私钥；现有 sing-box 出口不会被修改。\n'
+            name="$(prompt_exit_name "自定义出口显示名，例如 日本-WG")"
+            endpoint="$(prompt_required "出口服务器 Endpoint，例如 203.0.113.10:51820")"
+            peer_key="$(prompt_required "出口服务器 WireGuard 公钥")"
+            address4="$(prompt_default "入口机 IPv4 隧道地址（含前缀，不启用填 -）" "10.66.0.2/32")"
+            address6="$(prompt_default "入口机 IPv6 隧道地址（含前缀，不启用填 -）" "-")"
+            psk="$(prompt_optional_secret "预共享密钥 PSK（可留空）")"
+            psk="${psk:--}"
+            mtu="$(prompt_default "MTU" "1380")"
+            add_wireguard_exit "$name" "$endpoint" "$peer_key" "$address4" "$address6" "$psk" "$mtu"
+            ;;
         *) warn "无效选择。"; pause_screen; return 0 ;;
     esac
     pause_screen
@@ -8529,6 +9263,94 @@ interactive_add_proxy_exit() {
 
 interactive_add_ss_exit() {
     interactive_add_proxy_exit
+}
+
+interactive_wg_server_install() {
+    local port address4 address6 mtu wan detected range min max
+    detected="$(wg_server_detect_wan)"
+    printf '\n这个功能用于部署“出口服务器”，不会安装 Incus，也不会修改现有 sing-box/realm 配置。\n'
+    read -r -p "WireGuard UDP 监听端口（可自定义，直接回车随机）: " port
+    if [ -z "$port" ]; then
+        range="$(prompt_default "随机端口范围，格式 起始-结束" "20000-65535")"
+        if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            min="${BASH_REMATCH[1]}"
+            max="${BASH_REMATCH[2]}"
+        else
+            warn "随机端口范围格式无效: $range"
+            return 0
+        fi
+        port="$(wg_random_free_udp_port "$min" "$max")" || { warn "范围 $range 内没有可用 UDP 端口。"; return 0; }
+        info "已随机选择未占用 UDP 端口: $port"
+    fi
+    address4="$(prompt_default "服务端 IPv4 隧道地址（含前缀，不启用填 -）" "10.66.0.1/24")"
+    address6="$(prompt_default "服务端 IPv6 隧道地址（含前缀，不启用填 -）" "-")"
+    mtu="$(prompt_default "MTU" "1380")"
+    wan="$(prompt_default "公网出口网卡" "${detected:-eth0}")"
+    wg_server_install "$port" "$address4" "$address6" "$mtu" "$wan"
+}
+
+interactive_wg_server_add_peer() {
+    local name public_key address4 address6 psk
+    wg_server_load || { warn "请先部署 WireGuard 出口服务器。"; return 0; }
+    printf '\n请填写入口母机创建 WG 出口后显示的公钥和隧道地址。\n'
+    name="$(prompt_required "Peer 名称，例如 hk-mother-01")"
+    public_key="$(prompt_required "入口母机 WireGuard 公钥")"
+    address4="$(prompt_default "入口母机 IPv4 隧道地址（建议 /32，不启用填 -）" "10.66.0.2/32")"
+    address6="$(prompt_default "入口母机 IPv6 隧道地址（建议 /128，不启用填 -）" "-")"
+    psk="$(prompt_optional_secret "预共享密钥 PSK（可留空）")"
+    psk="${psk:--}"
+    wg_server_add_peer "$name" "$public_key" "$address4" "$address6" "$psk"
+}
+
+interactive_wg_server_remove_peer() {
+    local name
+    wg_server_load || { warn "WireGuard 出口服务器尚未部署。"; return 0; }
+    printf '\n当前 Peer:\n'
+    awk -F '\t' '$1 !~ /^#/ && NF {print "  - "$1"  IPv4="$3"  IPv6="$4}' "$WG_SERVER_PEERS"
+    name="$(prompt_required "要删除的 Peer 名称")"
+    confirm_yes "确认删除 Peer '$name' 吗" || { info "已取消。"; return 0; }
+    wg_server_remove_peer "$name"
+}
+
+interactive_wg_server_check() {
+    local port
+    port="$(prompt_required "计划使用的 WireGuard UDP 端口")"
+    if ! wg_server_preflight "$port"; then
+        warn "检测存在失败项，暂不建议部署。"
+    fi
+}
+
+interactive_wg_server_menu() {
+    local choice
+    while true; do
+        printf '\n'
+        ui_title "WireGuard 出口服务器管理"
+        printf '  1. 检测当前机器是否满足 WG 出口部署\n'
+        printf '  2. 一键部署 / 重新配置 WG 出口服务器\n'
+        printf '  3. 添加或更新入口母机 Peer\n'
+        printf '  4. 查看服务、Peer、握手和流量\n'
+        printf '  5. 删除入口母机 Peer\n'
+        printf '  6. 卸载 WG 出口服务器组件\n'
+        printf '  0. 返回主菜单\n'
+        read -r -p "请输入选项 [0-6]: " choice
+        case "$choice" in
+            1) interactive_wg_server_check; pause_screen ;;
+            2) interactive_wg_server_install; pause_screen ;;
+            3) interactive_wg_server_add_peer; pause_screen ;;
+            4) wg_server_status || true; pause_screen ;;
+            5) interactive_wg_server_remove_peer; pause_screen ;;
+            6)
+                if confirm_yes "确认卸载本脚本管理的 WG 出口服务和密钥吗"; then
+                    wg_server_uninstall
+                else
+                    info "已取消。"
+                fi
+                pause_screen
+                ;;
+            0|"") return 0 ;;
+            *) warn "无效选项。"; sleep 1 ;;
+        esac
+    done
 }
 
 choose_host_exit() {
@@ -9752,6 +10574,7 @@ interactive_menu() {
         printf '  %s【出口管理】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[3]%s 添加出口                  %s[4]%s 查看出口\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
         printf '    %s[5]%s 删除出口                  %s[6]%s 出口共享限速\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[17]%s WG 出口服务器部署与 Peer 管理\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【容器同步】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[7]%s 同步运行中容器，并选择可切换出口\n' "$UI_GREEN" "$UI_RESET"
@@ -9770,7 +10593,7 @@ interactive_menu() {
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$UI_GREEN" "$UI_RESET"
         ui_line
-        read -r -p "请输入选项 [0-16]: " choice
+        read -r -p "请输入选项 [0-17]: " choice
         case "$choice" in
             1) interactive_install_host ;;
             2) interactive_status ;;
@@ -9788,6 +10611,7 @@ interactive_menu() {
             14) interactive_restore ;;
             15) interactive_uninstall ;;
             16) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
+            17) interactive_wg_server_menu ;;
             0) info "退出。"; exit 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -9919,6 +10743,31 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       添加一个不带 TLS/Reality 的 VLESS+TCP 节点出口。
       手动添加可写: add-vless 自定义名称 地址/DDNS域名 端口 UUID
       添加出口只写入并启动出口信息，不会自动同步容器；需要同步请执行 sync-enable。
+
+  $0 add-wg 出口名 Endpoint 服务端公钥 IPv4隧道地址 [IPv6隧道地址|-] [PSK|-] [MTU]
+      添加原生 WireGuard 出口；入口机私钥自动生成且只保存在该出口的专用配置中。
+      示例: add-wg JP-WG 203.0.113.10:51820 服务端公钥 10.66.0.2/32 - - 1380
+      添加成功后会显示入口机公钥，需把它配置到出口服务器 Peer。
+
+  $0 wg-server-install [UDP端口|random] [服务端IPv4地址] [服务端IPv6地址|-] [MTU] [公网网卡]
+      在出口服务器一键安装或重新配置原生 WireGuard、独立 nftables NAT 和转发参数。
+      交互菜单可自定义端口；直接回车后可填写随机范围。命令行使用 random 时默认从 20000-65535 选择空闲端口，
+      可通过 WG_RANDOM_PORT_MIN / WG_RANDOM_PORT_MAX 限定范围。
+
+  $0 wg-server-check UDP端口
+      检测 WireGuard 内核能力、nftables 权限、转发参数、服务管理器、默认路由和端口绑定条件。
+
+  $0 wg-server-add-peer 名称 入口机公钥 IPv4地址 [IPv6地址|-] [PSK|-]
+      添加或更新一台入口母机 Peer。
+
+  $0 wg-server-status
+      查看服务端公钥、Peer、最新握手和流量。
+
+  $0 wg-server-remove-peer 名称
+      删除一个入口母机 Peer。
+
+  $0 wg-server-uninstall
+      仅卸载 WG 出口服务器组件，不改动其他 nftables 表、sing-box 或 realm。
 
   $0 list-exits
       查看所有已添加的出口信息。
@@ -10111,6 +10960,27 @@ case "$command_name" in
         ;;
     add-vless|add-vless-tcp)
         add_vless_exit "$@"
+        ;;
+    add-wg|add-wireguard)
+        add_wireguard_exit "$@"
+        ;;
+    wg-server-install|wireguard-server-install)
+        wg_server_install "$@"
+        ;;
+    wg-server-check|wireguard-server-check|wg-server-preflight)
+        wg_server_preflight "$@"
+        ;;
+    wg-server-add-peer|wireguard-server-add-peer)
+        wg_server_add_peer "$@"
+        ;;
+    wg-server-status|wireguard-server-status)
+        wg_server_status "$@"
+        ;;
+    wg-server-remove-peer|wireguard-server-remove-peer)
+        wg_server_remove_peer "$@"
+        ;;
+    wg-server-uninstall|wireguard-server-uninstall)
+        wg_server_uninstall "$@"
         ;;
     list-exits|list-exit|exits)
         list_exits "$@"
