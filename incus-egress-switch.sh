@@ -2919,6 +2919,39 @@ print("\t".join([name, parts.hostname, str(parts.port), username, password]))
 PY
 }
 
+parse_vless_tcp_link() {
+    local link="$1"
+    python3 - "$link" <<'PY'
+import sys
+import uuid
+from urllib.parse import parse_qs, unquote, urlsplit
+
+link = sys.argv[1].strip()
+parts = urlsplit(link)
+if parts.scheme.lower() != "vless":
+    raise SystemExit("不是有效的 vless:// 链接")
+if not parts.hostname or not parts.port:
+    raise SystemExit("VLESS 链接缺少地址或端口")
+user_id = unquote(parts.username or "")
+try:
+    user_id = str(uuid.UUID(user_id))
+except (ValueError, AttributeError):
+    raise SystemExit("VLESS 用户 ID 不是有效 UUID")
+query = parse_qs(parts.query, keep_blank_values=True)
+transport = (query.get("type") or ["tcp"])[0].lower()
+encryption = (query.get("encryption") or ["none"])[0].lower()
+security = (query.get("security") or ["none"])[0].lower()
+if transport not in ("", "tcp"):
+    raise SystemExit("目前只支持 VLESS+TCP，不支持 type=%s" % transport)
+if encryption not in ("", "none"):
+    raise SystemExit("VLESS+TCP 仅支持 encryption=none")
+if security not in ("", "none"):
+    raise SystemExit("目前只支持不带 TLS/Reality 的 VLESS+TCP")
+name = unquote(parts.fragment) if parts.fragment else parts.hostname.replace(".", "-")
+print("\t".join([name, parts.hostname, str(parts.port), user_id]))
+PY
+}
+
 singbox_arch() {
     case "$(uname -m)" in
         x86_64|amd64) printf 'amd64\n' ;;
@@ -3042,6 +3075,19 @@ EOF
       "server_port": $port,
       "version": "5",
       "routing_mark": 666$auth_json
+    }
+EOF
+            ;;
+        vless)
+            method_esc=$(json_escape "$method")
+            cat <<EOF
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "$server_esc",
+      "server_port": $port,
+      "uuid": "$method_esc",
+      "routing_mark": 666
     }
 EOF
             ;;
@@ -3175,6 +3221,11 @@ write_ss_exit_files() {
 write_sk5_exit_files() {
     local name="$1" server="$2" port="$3" username="$4" password="$5" table="$6" tun="$7"
     write_proxy_exit_files "socks" "$name" "$server" "$port" "$table" "$tun" "" "$password" "$username"
+}
+
+write_vless_exit_files() {
+    local name="$1" server="$2" port="$3" uuid="$4" table="$5" tun="$6"
+    write_proxy_exit_files "vless" "$name" "$server" "$port" "$table" "$tun" "$uuid" "" ""
 }
 
 wait_for_iface() {
@@ -3317,6 +3368,63 @@ add_sk5_exit() {
     install_singbox_core
     write_sk5_exit_files "$name" "$server" "$port" "$username" "$password" "$table" "$tun"
     start_proxy_exit "SK5" "$name" "$display" "$mark" "$table" "$tun"
+}
+
+add_vless_exit_values() {
+    need_root
+    load_config
+    write_default_config
+    need_cmd python3
+    need_cmd systemctl
+    need_cmd ip
+    state_lock_acquire
+    local display="$1" server="$2" port="$3" uuid="$4" name="${5:-}" idx mark table tun normalized_uuid
+    display="$(normalize_display_name "$display")"
+    server="$(normalize_proxy_host "$server")"
+    valid_proxy_host "$server" || die "VLESS 地址无效，请填写纯 IP 或域名/DDNS，不要带协议、端口或路径: $server"
+    validate_port "$port" || die "VLESS 端口无效: $port"
+    normalized_uuid="$(python3 - "$uuid" <<'PY'
+import sys, uuid
+try:
+    print(uuid.UUID(sys.argv[1]))
+except (ValueError, AttributeError):
+    raise SystemExit(1)
+PY
+)" || die "VLESS 用户 ID 不是有效 UUID。"
+    name="${name:-$(safe_exit_id "vless" "$display" "$server" "$port")}"
+    valid_name "$name" || die "出口内部名称无效: $name"
+    exit_exists "$name" && die "出口已存在: $name"
+    [ -z "$(exit_name_by_display "$display")" ] || die "出口显示名已存在: $display"
+    idx=$(next_exit_index)
+    mark=$(mark_for_index "$idx")
+    table=$(table_for_index "$idx")
+    tun=$(tun_for_exit "$name")
+    install_singbox_core
+    write_vless_exit_files "$name" "$server" "$port" "$normalized_uuid" "$table" "$tun"
+    start_proxy_exit "VLESS+TCP" "$name" "$display" "$mark" "$table" "$tun"
+}
+
+add_vless_exit_link() {
+    local link="$1" parsed display server port uuid name
+    [ -n "$link" ] || die "请提供 VLESS+TCP 节点链接。"
+    parsed=$(parse_vless_tcp_link "$link") || die "VLESS+TCP 链接解析失败。"
+    IFS=$'\t' read -r display server port uuid <<< "$parsed"
+    name="$(safe_exit_id "vless" "$display" "$server" "$port")"
+    add_vless_exit_values "$display" "$server" "$port" "$uuid" "$name"
+}
+
+add_vless_exit() {
+    local first="${1:-}" display server port uuid
+    [ -n "$first" ] || die "用法: $0 add-vless vless://UUID@地址:端口?encryption=none&type=tcp#名称 或 $0 add-vless 出口名 地址 端口 UUID"
+    if [[ "$first" == vless://* ]]; then
+        add_vless_exit_link "$first"
+        return 0
+    fi
+    display="$first"
+    server="${2:-}"
+    port="${3:-}"
+    uuid="${4:-}"
+    add_vless_exit_values "$display" "$server" "$port" "$uuid"
 }
 
 stop_and_remove_exit_service() {
@@ -8346,7 +8454,7 @@ interactive_client_script() {
 }
 
 interactive_add_proxy_exit() {
-    local choice link parsed default_name name server port username password method
+    local choice link parsed default_name name server port username password method uuid
     need_root
     load_config
     write_default_config
@@ -8355,6 +8463,8 @@ interactive_add_proxy_exit() {
     printf '  2. SS 手动输入\n'
     printf '  3. SK5 链接导入\n'
     printf '  4. SK5 手动输入\n'
+    printf '  5. VLESS+TCP 链接导入\n'
+    printf '  6. VLESS+TCP 手动输入\n'
     printf '  0. 返回主菜单\n'
     read -r -p "请输入序号 [1]: " choice
     choice="${choice:-1}"
@@ -8395,6 +8505,22 @@ interactive_add_proxy_exit() {
             read -r -p "用户名，可留空: " username
             password="$(prompt_optional_secret "密码，可留空")"
             add_sk5_exit "$name" "$server" "$port" "$username" "$password"
+            ;;
+        5)
+            printf '\n请粘贴 VLESS+TCP 节点链接，格式类似 vless://UUID@地址:端口?encryption=none&type=tcp#名称。\n'
+            link="$(prompt_required "VLESS+TCP 节点链接")"
+            parsed=$(parse_vless_tcp_link "$link") || { warn "VLESS+TCP 链接解析失败。"; pause_screen; return 0; }
+            default_name=$(printf '%s' "$parsed" | awk -F '\t' '{print $1}')
+            info "将使用节点链接解析出的出口名称: $default_name"
+            add_vless_exit_link "$link"
+            ;;
+        6)
+            printf '\n[VLESS+TCP] 请输入节点信息（仅支持 encryption=none、无 TLS/Reality）:\n'
+            name="$(prompt_exit_name "自定义出口显示名，容器里 out use 会用这个名字")"
+            server="$(prompt_proxy_host "地址 / DDNS 域名")"
+            port="$(prompt_proxy_port "端口")"
+            uuid="$(prompt_required "用户 ID / UUID")"
+            add_vless_exit_values "$name" "$server" "$port" "$uuid"
             ;;
         *) warn "无效选择。"; pause_screen; return 0 ;;
     esac
@@ -9634,10 +9760,10 @@ interactive_menu() {
             10) interactive_clear_container_out ;;
             11) interactive_switch_all_running_containers ;;
             12) interactive_split_menu ;;
-            13) update_from_github; pause_screen ;;
+            13) update_from_github; exec "$INSTALL_BIN" menu ;;
             14) interactive_restore ;;
             15) interactive_uninstall ;;
-            16) upgrade_config_and_components; pause_screen ;;
+            16) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
             0) info "退出。"; exit 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -9763,6 +9889,11 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
   $0 add-sk5 socks5://user:pass@host:port#name
       添加一个 SK5/SOCKS5 节点出口；链接导入会使用 # 后面解析出的节点名称。
       手动添加可写: add-sk5 自定义名称 地址/DDNS域名 端口 [用户名] [密码]
+      添加出口只写入并启动出口信息，不会自动同步容器；需要同步请执行 sync-enable。
+
+  $0 add-vless 'vless://UUID@host:port?encryption=none&type=tcp#name'
+      添加一个不带 TLS/Reality 的 VLESS+TCP 节点出口。
+      手动添加可写: add-vless 自定义名称 地址/DDNS域名 端口 UUID
       添加出口只写入并启动出口信息，不会自动同步容器；需要同步请执行 sync-enable。
 
   $0 list-exits
@@ -9900,6 +10031,7 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
   $0 add-ss 'ss://xxx#jp'
   $0 add-ss us-ss 1.2.3.4 8388 password aes-256-gcm
   $0 add-sk5 socks5://127.0.0.1:1080#local-sk5
+  $0 add-vless 'vless://UUID@127.0.0.1:55555?encryption=none&type=tcp#local-vless'
   $0 list-exits
   $0 limit-exit jp 100Mbps 30Mbps
   $0 remove-exit jp
@@ -9952,6 +10084,9 @@ case "$command_name" in
         ;;
     add-sk5|add-socks)
         add_sk5_exit "$@"
+        ;;
+    add-vless|add-vless-tcp)
+        add_vless_exit "$@"
         ;;
     list-exits|list-exit|exits)
         list_exits "$@"
