@@ -10669,7 +10669,6 @@ interactive_menu() {
         printf '  %s【出口管理】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[3]%s 添加出口                  %s[4]%s 查看出口\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
         printf '    %s[5]%s 删除出口                  %s[6]%s 出口共享限速\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[17]%s WG 出口服务器部署与 Peer 管理\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【容器同步】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[7]%s 同步运行中容器，并选择可切换出口\n' "$UI_GREEN" "$UI_RESET"
@@ -10682,8 +10681,11 @@ interactive_menu() {
         printf '    %s[12]%s 分流管理\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【维护操作】%s\n' "$UI_CYAN" "$UI_RESET"
-        printf '    %s[13]%s 从 GitHub 安全更新          %s[16]%s 使用当前脚本安全更新\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[14]%s 还原初始状态并清空接管     %s[15]%s 彻底卸载\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[13]%s 从 GitHub 安全更新          %s[14]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[15]%s 彻底卸载                    %s[16]%s 使用当前脚本安全更新\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '\n'
+        printf '  %s【WireGuard 服务端】%s\n' "$UI_CYAN" "$UI_RESET"
+        printf '    %s[17]%s WG 出口服务器部署与 Peer 管理\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$UI_GREEN" "$UI_RESET"
