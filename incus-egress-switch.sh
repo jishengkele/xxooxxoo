@@ -3790,6 +3790,100 @@ add_wireguard_exit() {
     info "请把上面的入口机公钥配置到出口服务器 Peer；再通过主菜单 7 同步实例授权。"
 }
 
+wireguard_exit_conf() {
+    local name="$1" route4="${2:-}" route6="${3:-}" iface="" conf=""
+    case "$route4" in dev:cwg-*) iface="${route4#dev:}" ;; esac
+    if [ -z "$iface" ]; then
+        case "$route6" in dev:cwg-*) iface="${route6#dev:}" ;; esac
+    fi
+    if [ -n "$iface" ] && [ -f "$EXIT_DIR/$name/$iface.conf" ]; then
+        printf '%s\n' "$EXIT_DIR/$name/$iface.conf"
+        return 0
+    fi
+    conf="$(find "$EXIT_DIR/$name" -maxdepth 1 -type f -name 'cwg-*.conf' -print -quit 2>/dev/null || true)"
+    [ -n "$conf" ] || return 1
+    printf '%s\n' "$conf"
+}
+
+wireguard_conf_value() {
+    local conf="$1" section="$2" key="$3"
+    awk -F= -v wanted_section="$section" -v wanted_key="$key" '
+        /^[[:space:]]*\[/ {
+            current=$0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", current)
+            next
+        }
+        current == wanted_section {
+            name=$1
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+            if (name == wanted_key) {
+                value=substr($0, index($0, "=") + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                print value
+                exit
+            }
+        }
+    ' "$conf"
+}
+
+wireguard_bytes_label() {
+    local bytes="${1:-0}"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    awk -v n="$bytes" 'BEGIN {
+        split("B KiB MiB GiB TiB", units, " ")
+        i=1
+        while (n >= 1024 && i < 5) { n/=1024; i++ }
+        if (i == 1) printf "%d %s", n, units[i]
+        else printf "%.2f %s", n, units[i]
+    }'
+}
+
+wireguard_handshake_label() {
+    local epoch="${1:-0}" now age
+    [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=0
+    [ "$epoch" -gt 0 ] || { printf '等待首次握手'; return 0; }
+    now="$(date +%s)"
+    age=$((now - epoch))
+    [ "$age" -ge 0 ] || age=0
+    if [ "$age" -lt 60 ]; then
+        printf '已连接（%s 秒前）' "$age"
+    elif [ "$age" -lt 3600 ]; then
+        printf '已连接（%s 分钟前）' "$((age / 60))"
+    elif [ "$age" -lt 86400 ]; then
+        printf '长时间未握手（%s 小时前）' "$((age / 3600))"
+    else
+        printf '长时间未握手（%s 天前）' "$((age / 86400))"
+    fi
+}
+
+print_wireguard_exit_details() {
+    local name="$1" route4="${2:-}" route6="${3:-}" indent="${4:-     }"
+    local conf iface endpoint address peer_public local_public="不可用（接口未启动）"
+    local handshake=0 rx=0 tx=0 runtime_peer="" runtime_line="" connection="接口未启动"
+    conf="$(wireguard_exit_conf "$name" "$route4" "$route6")" || return 0
+    iface="$(basename "$conf" .conf)"
+    endpoint="$(wireguard_conf_value "$conf" Peer Endpoint)"
+    address="$(wireguard_conf_value "$conf" Interface Address)"
+    peer_public="$(wireguard_conf_value "$conf" Peer PublicKey)"
+    if command -v wg >/dev/null 2>&1 && wg show "$iface" >/dev/null 2>&1; then
+        local_public="$(wg show "$iface" public-key 2>/dev/null || true)"
+        runtime_peer="$(wg show "$iface" peers 2>/dev/null | head -1 || true)"
+        [ -n "$runtime_peer" ] || runtime_peer="$peer_public"
+        runtime_line="$(wg show "$iface" latest-handshakes 2>/dev/null | awk 'NR==1 {print $2}')"
+        handshake="${runtime_line:-0}"
+        runtime_line="$(wg show "$iface" transfer 2>/dev/null | awk 'NR==1 {print $2 " " $3}')"
+        read -r rx tx <<< "${runtime_line:-0 0}"
+        connection="$(wireguard_handshake_label "$handshake")"
+    fi
+    printf '%s类型: WireGuard  接口: %s\n' "$indent" "$iface"
+    printf '%s出口服务器: %s\n' "$indent" "${endpoint:--}"
+    printf '%s本机隧道地址: %s\n' "$indent" "${address:--}"
+    printf '%s连接状态: %s  接收/发送: %s / %s\n' "$indent" "$connection" \
+        "$(wireguard_bytes_label "$rx")" "$(wireguard_bytes_label "$tx")"
+    printf '%s入口机公钥: %s\n' "$indent" "${local_public:--}"
+    printf '%s出口机公钥: %s\n' "$indent" "${runtime_peer:-${peer_public:--}}"
+}
+
 wg_server_lock() {
     mkdir -p "$(dirname "$WG_SERVER_LOCK")"
     exec {WG_SERVER_LOCK_FD}>"$WG_SERVER_LOCK"
@@ -9067,6 +9161,7 @@ list_exits() {
         printf '     fwmark: %s  路由表: %s\n' "$mark" "$table"
         printf '     IPv4路由: %s\n' "$route4"
         printf '     IPv6路由: %s\n' "$route6"
+        print_wireguard_exit_details "$name" "$route4" "$route6" '     '
         down="$(exit_limit_down "$name")"
         up="$(exit_limit_up "$name")"
         printf '     共享限速: 下载 %s / 上传 %s\n' "$(limit_rate_label "$down")" "$(limit_rate_label "$up")"
@@ -10640,7 +10735,13 @@ show_status() {
             "$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || printf '?')"
     fi
     printf '\n出口列表:\n'
-    read_exit_rows | awk -F '\t' '{print "  "$6"\tid="$1"\tmark="$2"\ttable="$3"\troute4="$4"\troute6="$5}' || true
+    local exit_name exit_mark exit_table exit_route4 exit_route6 exit_display
+    while IFS=$'\t' read -r exit_name exit_mark exit_table exit_route4 exit_route6 exit_display; do
+        [ -n "$exit_name" ] || continue
+        printf '  %s\tid=%s\tmark=%s\ttable=%s\troute4=%s\troute6=%s\n' \
+            "${exit_display:-$exit_name}" "$exit_name" "$exit_mark" "$exit_table" "$exit_route4" "$exit_route6"
+        print_wireguard_exit_details "$exit_name" "$exit_route4" "$exit_route6" '    '
+    done < <(read_exit_rows)
     printf '\n容器列表:\n'
     read_container_rows | awk -F '\t' '{cur=$5; if (cur=="-") cur="入口机"; print "  "$1"\t"$2"\tallowed="$4"\tcurrent="cur}' || true
     printf '\n应用分流策略:\n'
