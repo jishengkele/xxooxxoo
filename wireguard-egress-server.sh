@@ -462,6 +462,14 @@ uninstall_server() {
     info "WG 出口已卸载；没有改动其他代理或 nftables 表。"
 }
 
+purge_server() {
+    need_root
+    uninstall_server
+    rm -f "$SHORTCUT_BIN" "$INSTALL_BIN" "$LOCK_FILE"
+    info "WG 出口工具已彻底卸载：服务、配置、密钥、状态、wgout 快捷命令和脚本均已删除。"
+    info "WireGuard 系统软件包属于共享组件，已保留，避免影响本机其他 WireGuard 用途。"
+}
+
 interactive_deploy() {
     local port range min max address4 address6 mtu wan
     read -r -p "UDP端口（直接回车随机）: " port
@@ -502,8 +510,9 @@ menu() {
         printf '  4. 查看状态\n'
         printf '  5. 删除入口机\n'
         printf '  6. 卸载 WG 出口\n'
+        printf '  7. 彻底卸载 WG 工具\n'
         printf '  0. 退出\n'
-        read -r -p "请选择 [0-6]: " choice
+        read -r -p "请选择 [0-7]: " choice
         case "$choice" in
             1) port="$(prompt_required "计划使用的 UDP 端口")"; preflight "$port" || true; pause ;;
             2) interactive_deploy; pause ;;
@@ -511,6 +520,12 @@ menu() {
             4) status_server || true; pause ;;
             5) name="$(prompt_required "要删除的入口机名称")"; confirm "确认删除 $name 吗" && remove_peer "$name"; pause ;;
             6) confirm "确认卸载 WG 出口及密钥吗" && uninstall_server; pause ;;
+            7)
+                if confirm "确认彻底卸载 WG 工具吗" && confirm "将删除服务、配置、密钥、wgout 和脚本本体，请再次确认"; then
+                    purge_server
+                    return 0
+                fi
+                ;;
             0|"") return 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -527,8 +542,12 @@ usage() {
   $0 status
   $0 remove-peer 名称
   $0 uninstall
+  $0 purge
 
 安装后可直接输入: wgout
+
+uninstall 只删除已部署的 WG 出口、密钥和配置，保留 wgout 工具。
+purge 会进一步删除 wgout 快捷命令和脚本本体；共享的 WireGuard 系统软件包会保留。
 EOF
 }
 
@@ -545,6 +564,7 @@ case "$command" in
     status) status_server ;;
     remove-peer) remove_peer "$@" ;;
     uninstall) uninstall_server ;;
+    purge) purge_server ;;
     help|-h|--help) usage ;;
     *) usage; exit 1 ;;
 esac

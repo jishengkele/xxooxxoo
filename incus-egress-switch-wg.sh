@@ -8208,7 +8208,13 @@ ip_probe() {
     if have_curl; then
         curl "$flag" -fsS --connect-timeout 8 --max-time 20 "$url" 2>/dev/null || true
     else
-        wget -qO- "$url" 2>/dev/null || true
+        # BusyBox wget 不支持 -4/-6，但 api.ipify/api6.ipify 本身会按地址族解析。
+        # 同时设置 wget 读超时和外层硬超时，避免无 IPv6 的容器永久卡在出口测试。
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 12 wget -qO- -T 8 "$url" 2>/dev/null || true
+        else
+            wget -qO- -T 8 "$url" 2>/dev/null || true
+        fi
     fi
 }
 
@@ -8713,8 +8719,38 @@ interactive_apply() {
 }
 
 interactive_status() {
-    show_status
-    pause_screen
+    local choice
+    while :; do
+        if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ] && command -v clear >/dev/null 2>&1; then
+            clear
+        fi
+        cat <<'EOF'
+============================================================
+                    详细状态
+============================================================
+  1. 系统与同步状态
+  2. 出口状态
+  3. 容器状态
+  4. 分流策略
+  5. 策略路由
+  6. nftables 规则
+  7. 服务状态
+  0. 返回主菜单
+============================================================
+EOF
+        read -r -p "请输入选项 [0-7]: " choice
+        case "$choice" in
+            1) show_status_overview; pause_screen ;;
+            2) show_status_exits; pause_screen ;;
+            3) show_status_containers; pause_screen ;;
+            4) show_status_split; pause_screen ;;
+            5) show_status_routes; pause_screen ;;
+            6) show_status_nft; pause_screen ;;
+            7) show_status_services; pause_screen ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入。"; sleep 1 ;;
+        esac
+    done
 }
 
 interactive_client_script() {
@@ -10083,8 +10119,11 @@ interactive_menu() {
     done
 }
 
-show_status() {
+show_status_overview() {
     load_config
+    printf '============================================================\n'
+    printf '                    系统与同步状态\n'
+    printf '============================================================\n'
     printf '配置文件: %s\n' "$CONFIG_FILE"
     printf 'API 监听: %s:%s  容器访问地址: %s\n' "$API_BIND" "$API_PORT" "$API_PUBLIC_URL"
     printf '容器网桥: %s\n' "$BRIDGE_IFACES"
@@ -10104,45 +10143,105 @@ show_status() {
             "$(sysctl -n net.ipv4.conf.all.src_valid_mark 2>/dev/null || printf '?')" \
             "$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || printf '?')"
     fi
-    printf '\n出口列表:\n'
+}
+
+show_status_exits() {
+    load_config
+    printf '============================================================\n'
+    printf '                       出口状态\n'
+    printf '============================================================\n'
     local exit_name exit_mark exit_table exit_route4 exit_route6 exit_display
+    if [ -z "$(read_exit_rows)" ]; then
+        printf '暂无出口。\n'
+        return 0
+    fi
     while IFS=$'\t' read -r exit_name exit_mark exit_table exit_route4 exit_route6 exit_display; do
         [ -n "$exit_name" ] || continue
         printf '  %s\tid=%s\tmark=%s\ttable=%s\troute4=%s\troute6=%s\n' \
             "${exit_display:-$exit_name}" "$exit_name" "$exit_mark" "$exit_table" "$exit_route4" "$exit_route6"
         print_wireguard_exit_details "$exit_name" "$exit_route4" "$exit_route6" '    '
     done < <(read_exit_rows)
-    printf '\n容器列表:\n'
-    read_container_rows | awk -F '\t' '{cur=$5; if (cur=="-") cur="入口机"; print "  "$1"\t"$2"\tallowed="$4"\tcurrent="cur}' || true
-    printf '\n应用分流策略:\n'
-    if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
-        if [ -n "$(read_split_policies)" ]; then
-            while IFS=$'\t' read -r app target; do
-                printf '  %s -> %s\n' "$(split_app_display "$app")" "$(split_target_list_label "$target")"
-            done < <(read_split_policies)
-        else
-            printf '  暂无，访问按容器当前出口处理。\n'
-        fi
-    else
-        printf '  已禁用。\n'
+}
+
+show_status_containers() {
+    load_config
+    printf '============================================================\n'
+    printf '                       容器状态\n'
+    printf '============================================================\n'
+    if [ -z "$(read_container_rows)" ]; then
+        printf '暂无已接管容器。\n'
+        return 0
     fi
-    printf '\n本脚本管理的策略路由:\n'
+    read_container_rows | awk -F '\t' '{cur=$5; if (cur=="-") cur="入口机"; print "  "$1"\t"$2"\tallowed="$4"\tcurrent="cur}' || true
+}
+
+show_status_split() {
+    load_config
+    printf '============================================================\n'
+    printf '                       分流策略\n'
+    printf '============================================================\n'
+    if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
+        print_split_header
+    else
+        printf '分流功能已禁用。\n'
+    fi
+}
+
+show_status_routes() {
+    load_config
+    printf '============================================================\n'
+    printf '                       策略路由\n'
+    printf '============================================================\n'
     if command -v ip >/dev/null 2>&1; then
         local _name mark table _route4 _route6 _display
         while IFS=$'\t' read -r _name mark table _route4 _route6 _display; do
             ip rule show | grep -F "fwmark $mark lookup $table" || true
             ip -6 rule show 2>/dev/null | grep -F "fwmark $mark lookup $table" || true
         done < <(read_exit_rows)
+    else
+        printf '未安装 ip 命令。\n'
     fi
-    printf '\n本脚本管理的 nftables 表:\n'
+}
+
+show_status_nft() {
+    load_config
+    printf '============================================================\n'
+    printf '                    nftables 规则\n'
+    printf '============================================================\n'
     if command -v nft >/dev/null 2>&1; then
         nft list table inet "${NFT_TABLE:-incus_egress_switch}" 2>/dev/null || true
+    else
+        printf '未安装 nft 命令。\n'
     fi
-    printf '\n服务状态:\n'
+}
+
+show_status_services() {
+    load_config
+    printf '============================================================\n'
+    printf '                       服务状态\n'
+    printf '============================================================\n'
     if command -v systemctl >/dev/null 2>&1; then
         systemctl is-active "$APP_NAME" 2>/dev/null | sed "s/^/  $APP_NAME: /" || true
         systemctl is-active "$APP_NAME-autosync" 2>/dev/null | sed "s/^/  $APP_NAME-autosync: /" || true
+    else
+        printf '当前系统未使用 systemd。\n'
     fi
+}
+
+show_status() {
+    show_status_overview
+    printf '\n'
+    show_status_exits
+    printf '\n'
+    show_status_containers
+    printf '\n'
+    show_status_split
+    printf '\n'
+    show_status_routes
+    printf '\n'
+    show_status_nft
+    printf '\n'
+    show_status_services
 }
 
 uninstall_host() {
