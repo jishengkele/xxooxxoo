@@ -2236,7 +2236,27 @@ build_nft_file() {
     local block_unmanaged6_line=""
     local split_sets="" split_rules="" force_split_rules="" conditional_force_rules="" container_split_rules="" bridge_expr app target policy_targets safe v4file v6file domains_file v4elems v6elems v4elements_line v6elements_line split_mark
     local container cip source category display app_category remote enabled
+    local wg_mss_rules="" wg_name wg_route4 wg_route6 wg_dev wg_conf wg_mtu wg_mss _wg_mark _wg_table _wg_display
     bridge_expr="$(bridge_set_expr)"
+    # 容器网卡通常为 MTU 1500，而 WireGuard 接口更小。若不钳制转发 TCP 的 MSS，
+    # TCP 三次握手和小包可以正常，但 HTTPS/REALITY 会在证书等大包阶段超时。
+    # 同时处理 SYN 与 SYN+ACK；按 WG MTU 减去 IPv6+TCP 头部 60 字节，IPv4 也安全适用。
+    while IFS=$'\t' read -r wg_name _wg_mark _wg_table wg_route4 wg_route6 _wg_display; do
+        wg_dev=""
+        case "$wg_route4" in dev:cwg-*) wg_dev="${wg_route4#dev:}" ;; esac
+        if [ -z "$wg_dev" ]; then
+            case "$wg_route6" in dev:cwg-*) wg_dev="${wg_route6#dev:}" ;; esac
+        fi
+        [ -n "$wg_dev" ] || continue
+        wg_conf="$EXIT_DIR/$wg_name/$wg_dev.conf"
+        wg_mtu="$(awk -F= '/^[[:space:]]*MTU[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$wg_conf" 2>/dev/null || true)"
+        [[ "$wg_mtu" =~ ^[0-9]+$ ]] || wg_mtu=1380
+        [ "$wg_mtu" -ge 1280 ] || wg_mtu=1280
+        wg_mss=$((wg_mtu - 60))
+        wg_mss_rules="$wg_mss_rules    oifname \"$wg_dev\" tcp flags syn tcp option maxseg size set $wg_mss
+    iifname \"$wg_dev\" tcp flags syn tcp option maxseg size set $wg_mss
+"
+    done < <(read_exit_rows)
     while IFS=$'\t' read -r name ip token allowed current; do
         if is_ipv4 "$ip"; then
             comma=""
@@ -2564,6 +2584,10 @@ $force_split_rules$conditional_force_rules$container_split_rules$split_rules    
     iifname { $bridge_expr } ip6 saddr @egress6_keys meta mark set ip6 saddr map @egress6
 $block_unmanaged6_line
   }
+
+  chain forward {
+    type filter hook forward priority mangle; policy accept;
+$wg_mss_rules  }
 }
 EOF
 }
