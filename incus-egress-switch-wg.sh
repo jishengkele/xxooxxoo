@@ -2554,6 +2554,9 @@ $split_sets
   chain prerouting {
     # 晚于常见的 mangle(-150) 链执行，避免宿主机已有回程/默认出口规则覆盖容器自选出口标记。
     type filter hook prerouting priority -140; policy accept;
+    # 容器作为服务器时，外部入站连接的回复必须沿入口机原路径返回。
+    # 这里只跳过 conntrack 的 reply 方向；容器主动建立的代理/下载连接仍会按所选出口标记。
+    iifname { $bridge_expr } ct direction reply return
     iifname { $bridge_expr } ct status dnat return
     iifname { $bridge_expr } ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16 } return
     iifname { $bridge_expr } ip6 daddr { ::1/128, fc00::/7, fe80::/10, ff00::/8 } return
@@ -8201,21 +8204,69 @@ api_latency() {
     echo "不可用"
 }
 
-ip_probe() {
-    family="$1"
+ip_probe_once() {
+    flag="$1"
     url="$2"
-    flag="$3"
     if have_curl; then
-        curl "$flag" -fsS --connect-timeout 8 --max-time 20 "$url" 2>/dev/null || true
+        curl "$flag" -fsS --connect-timeout 3 --max-time 6 "$url" 2>/dev/null || true
     else
-        # BusyBox wget 不支持 -4/-6，但 api.ipify/api6.ipify 本身会按地址族解析。
-        # 同时设置 wget 读超时和外层硬超时，避免无 IPv6 的容器永久卡在出口测试。
+        # BusyBox wget 不支持 -4/-6；检测地址本身按 IPv4/IPv6 分开。
         if command -v timeout >/dev/null 2>&1; then
-            timeout 12 wget -qO- -T 8 "$url" 2>/dev/null || true
+            timeout 7 wget -qO- -T 5 "$url" 2>/dev/null || true
         else
-            wget -qO- -T 8 "$url" 2>/dev/null || true
+            wget -qO- -T 5 "$url" 2>/dev/null || true
         fi
     fi
+}
+
+valid_probe_ip() {
+    family="$1"
+    value="$2"
+    case "$family" in
+        IPv4)
+            printf '%s\n' "$value" | awk -F. '
+                NF != 4 {exit 1}
+                {
+                    for (i = 1; i <= 4; i++) {
+                        if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1
+                    }
+                }
+            '
+            ;;
+        IPv6)
+            case "$value" in
+                *:*) printf '%s\n' "$value" | grep -Eq '^[0-9A-Fa-f:.]+$' ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+ip_probe() {
+    family="$1"
+    flag="$2"
+    shift 2
+    for url in "$@"; do
+        value="$(ip_probe_once "$flag" "$url" | tr -d '\r' | awk 'NF {gsub(/[[:space:]]/, ""); print; exit}')"
+        if [ -n "$value" ] && valid_probe_ip "$family" "$value"; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done
+    return 1
+}
+
+dns_probe() {
+    if command -v getent >/dev/null 2>&1 && getent ahosts api.ipify.org >/dev/null 2>&1; then
+        echo "正常"
+        return 0
+    fi
+    if command -v nslookup >/dev/null 2>&1 && nslookup api.ipify.org >/dev/null 2>&1; then
+        echo "正常"
+        return 0
+    fi
+    echo "未确认"
 }
 
 ping_probe() {
@@ -8275,16 +8326,22 @@ exit_test() {
     echo "容器: $container"
     echo "测试出口: $(display_exit "$target")"
     echo "API 延迟: $(api_latency)"
-    v4="$(ip_probe "IPv4" "https://api.ipify.org" "-4")"
+    v4="$(ip_probe "IPv4" "-4" \
+        "https://api.ipify.org" \
+        "http://ip.sb" \
+        "https://ipv4.icanhazip.com" \
+        "https://ifconfig.me/ip" || true)"
     if [ -n "$v4" ]; then
         echo "IPv4: $v4"
         ping_probe "$v4"
         echo "DNS: 正常"
     else
         echo "IPv4: unavailable"
-        echo "DNS: 未确认"
+        echo "DNS: $(dns_probe)"
     fi
-    v6="$(ip_probe "IPv6" "https://api6.ipify.org" "-6")"
+    v6="$(ip_probe "IPv6" "-6" \
+        "https://api6.ipify.org" \
+        "https://ipv6.icanhazip.com" || true)"
     if [ -n "$v6" ]; then
         echo "IPv6: $v6"
     else
