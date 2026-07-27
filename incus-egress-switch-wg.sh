@@ -51,6 +51,7 @@ AUTOSYNC_SERVICE="$SYSTEMD_DIR/$APP_NAME-autosync.service"
 EXIT_SERVICE_PREFIX="incus-egress-switch-exit"
 UPDATE_BACKUP_ROOT="${EGRESS_UPDATE_BACKUP_ROOT:-/var/backups/$APP_NAME}"
 DEFAULT_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch-wg.sh"
+PROXY_TUN_MTU=1400
 UPDATE_BACKUP_PATH=""
 UPDATE_BACKUP_ARCHIVE=""
 
@@ -2236,26 +2237,43 @@ build_nft_file() {
     local block_unmanaged6_line=""
     local split_sets="" split_rules="" force_split_rules="" conditional_force_rules="" container_split_rules="" bridge_expr app target policy_targets safe v4file v6file domains_file v4elems v6elems v4elements_line v6elements_line split_mark
     local container cip source category display app_category remote enabled
-    local wg_mss_rules="" wg_name wg_route4 wg_route6 wg_dev wg_conf wg_mtu wg_mss _wg_mark _wg_table _wg_display
+    local tunnel_mss_rules="" tunnel_mss_seen=$'\n' exit_name exit_route4 exit_route6 exit_route exit_dev exit_conf tunnel_mtu tunnel_mtu_default tunnel_mss _exit_mark _exit_table _exit_display
     bridge_expr="$(bridge_set_expr)"
-    # 容器网卡通常为 MTU 1500，而 WireGuard 接口更小。若不钳制转发 TCP 的 MSS，
-    # TCP 三次握手和小包可以正常，但 HTTPS/REALITY 会在证书等大包阶段超时。
-    # 同时处理 SYN 与 SYN+ACK；按 WG MTU 减去 IPv6+TCP 头部 60 字节，IPv4 也安全适用。
-    while IFS=$'\t' read -r wg_name _wg_mark _wg_table wg_route4 wg_route6 _wg_display; do
-        wg_dev=""
-        case "$wg_route4" in dev:cwg-*) wg_dev="${wg_route4#dev:}" ;; esac
-        if [ -z "$wg_dev" ]; then
-            case "$wg_route6" in dev:cwg-*) wg_dev="${wg_route6#dev:}" ;; esac
-        fi
-        [ -n "$wg_dev" ] || continue
-        wg_conf="$EXIT_DIR/$wg_name/$wg_dev.conf"
-        wg_mtu="$(awk -F= '/^[[:space:]]*MTU[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$wg_conf" 2>/dev/null || true)"
-        [[ "$wg_mtu" =~ ^[0-9]+$ ]] || wg_mtu=1380
-        [ "$wg_mtu" -ge 1280 ] || wg_mtu=1280
-        wg_mss=$((wg_mtu - 60))
-        wg_mss_rules="$wg_mss_rules    oifname \"$wg_dev\" tcp flags syn tcp option maxseg size set $wg_mss
-    iifname \"$wg_dev\" tcp flags syn tcp option maxseg size set $wg_mss
+    # 容器网卡通常为 MTU 1500，而 sing-box/WireGuard 隧道接口更小。若不钳制转发 TCP 的 MSS，
+    # TCP 三次握手和小包可以正常，但 HTTPS/REALITY 或大流量会在较大报文阶段超时、断流。
+    # 同时处理 SYN 与 SYN+ACK；按隧道 MTU 减去 IPv6+TCP 头部 60 字节，IPv4 也安全适用。
+    while IFS=$'\t' read -r exit_name _exit_mark _exit_table exit_route4 exit_route6 _exit_display; do
+        for exit_route in "$exit_route4" "$exit_route6"; do
+            case "$exit_route" in
+                dev:cwg-*|dev:csh-*) exit_dev="${exit_route#dev:}" ;;
+                *) continue ;;
+            esac
+            case "$tunnel_mss_seen" in
+                *$'\n'"$exit_dev"$'\n'*) continue ;;
+            esac
+            tunnel_mss_seen="${tunnel_mss_seen}${exit_dev}"$'\n'
+
+            tunnel_mtu=""
+            case "$exit_dev" in
+                cwg-*)
+                    exit_conf="$EXIT_DIR/$exit_name/$exit_dev.conf"
+                    tunnel_mtu="$(awk -F= '/^[[:space:]]*MTU[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$exit_conf" 2>/dev/null || true)"
+                    tunnel_mtu_default=1380
+                    ;;
+                csh-*)
+                    exit_conf="$EXIT_DIR/$exit_name/config.json"
+                    tunnel_mtu="$(awk -F: '/"mtu"[[:space:]]*:/ {gsub(/[^0-9]/, "", $2); print $2; exit}' "$exit_conf" 2>/dev/null || true)"
+                    tunnel_mtu_default="$PROXY_TUN_MTU"
+                    ;;
+            esac
+            if ! [[ "$tunnel_mtu" =~ ^[0-9]+$ ]] || [ "$tunnel_mtu" -lt 1280 ] || [ "$tunnel_mtu" -gt 9000 ]; then
+                tunnel_mtu="$tunnel_mtu_default"
+            fi
+            tunnel_mss=$((tunnel_mtu - 60))
+            tunnel_mss_rules="$tunnel_mss_rules    oifname \"$exit_dev\" tcp flags syn tcp option maxseg size gt $tunnel_mss tcp option maxseg size set $tunnel_mss
+    iifname \"$exit_dev\" tcp flags syn tcp option maxseg size gt $tunnel_mss tcp option maxseg size set $tunnel_mss
 "
+        done
     done < <(read_exit_rows)
     while IFS=$'\t' read -r name ip token allowed current; do
         if is_ipv4 "$ip"; then
@@ -2587,7 +2605,7 @@ $block_unmanaged6_line
 
   chain forward {
     type filter hook forward priority mangle; policy accept;
-$wg_mss_rules  }
+$tunnel_mss_rules  }
 }
 EOF
 }
@@ -3179,7 +3197,7 @@ write_proxy_exit_files() {
       "tag": "tun-in",
       "interface_name": "$tun",
       "address": ["172.31.${v4_octet}.1/30", "fd7a:636c:7368:${v6_suffix}::1/126"],
-      "mtu": 1400,
+      "mtu": $PROXY_TUN_MTU,
       "stack": "mixed",
       "auto_route": false,
       "strict_route": false,
