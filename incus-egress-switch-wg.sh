@@ -23,7 +23,7 @@ SPLIT_RESOLVED_DIR="$SPLIT_CACHE_DIR/resolved"
 SPLIT_LAST_SYNC_FILE="$SPLIT_DIR/last-sync"
 SPLIT_CATALOG_FILE="$SPLIT_DIR/catalog-sync"
 SPLIT_README_FILE="$SPLIT_CACHE_DIR/README.md"
-SPLIT_BUNDLE_FILE="$SPLIT_CACHE_DIR/Scam-Abuse-Core.list"
+SPLIT_BUNDLE_FILE="$SPLIT_CACHE_DIR/Egress-Application-Rules.list"
 SPLIT_DNSMASQ_DIR="$SPLIT_DIR/dnsmasq"
 INCUS_NETWORKS_DIR="${EGRESS_INCUS_NETWORKS_DIR:-/var/lib/incus/networks}"
 RUN_DIR="/run/$APP_NAME"
@@ -51,7 +51,7 @@ AUTOSYNC_SERVICE="$SYSTEMD_DIR/$APP_NAME-autosync.service"
 EXIT_SERVICE_PREFIX="incus-egress-switch-exit"
 UPDATE_BACKUP_ROOT="${EGRESS_UPDATE_BACKUP_ROOT:-/var/backups/$APP_NAME}"
 DEFAULT_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch-wg.sh"
-DEFAULT_SPLIT_RULE_BUNDLE_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Scam-Abuse-Core.list"
+DEFAULT_SPLIT_RULE_BUNDLE_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Egress-Application-Rules.list"
 PROXY_TUN_MTU=1400
 UPDATE_BACKUP_PATH=""
 UPDATE_BACKUP_ARCHIVE=""
@@ -576,6 +576,11 @@ load_config() {
     BLOCK_UNMANAGED_IPV6="${BLOCK_UNMANAGED_IPV6:-true}"
     ENABLE_SPLIT_RULES="${ENABLE_SPLIT_RULES:-true}"
     SPLIT_RULE_BUNDLE_URL="${SPLIT_RULE_BUNDLE_URL:-$DEFAULT_SPLIT_RULE_BUNDLE_URL}"
+    # 旧安装的 config.env 会覆盖新脚本默认值。即使尚未执行配置升级，
+    # 也要在本次进程中立即改用新的应用规则表，避免继续下载旧版表。
+    if is_legacy_default_split_rule_url "$SPLIT_RULE_BUNDLE_URL"; then
+        SPLIT_RULE_BUNDLE_URL="$DEFAULT_SPLIT_RULE_BUNDLE_URL"
+    fi
     SPLIT_UPDATE_INTERVAL="${SPLIT_UPDATE_INTERVAL:-259200}"
     SPLIT_DNS_REFRESH_INTERVAL="${SPLIT_DNS_REFRESH_INTERVAL:-21600}"
     SPLIT_FETCH_TIMEOUT="${SPLIT_FETCH_TIMEOUT:-10}"
@@ -886,7 +891,7 @@ BLOCK_UNMANAGED_IPV6="true"
 # 是否启用宿主机统一应用分流规则。
 ENABLE_SPLIT_RULES="true"
 
-# 单文件应用分流规则源。一次下载后按文件中的“风险场景/应用”注释拆分分类和应用。
+# 单文件应用分流规则源。一次下载后按文件中的“应用分类/应用”注释拆分分类和应用。
 SPLIT_RULE_BUNDLE_URL="$DEFAULT_SPLIT_RULE_BUNDLE_URL"
 
 # 应用规则自动核对更新间隔秒数。默认 259200 秒，即 3 天。
@@ -1229,6 +1234,20 @@ ensure_config_default() {
     fi
 }
 
+is_legacy_default_split_rule_url() {
+    case "${1:-}" in
+        "https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Scam-Abuse-Risk.list" | \
+        "https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Scam-Abuse-Risk.list" | \
+        "https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Scam-Abuse-Core.list" | \
+        "https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Scam-Abuse-Core.list")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 migrate_default_split_rule_url() {
     local current
     [ -f "$CONFIG_FILE" ] || return 0
@@ -1240,13 +1259,11 @@ migrate_default_split_rule_url() {
             exit
         }
     ' "$CONFIG_FILE")"
-    case "$current" in
-        "https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Scam-Abuse-Risk.list" | \
-        "https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Scam-Abuse-Risk.list")
-            set_config_value SPLIT_RULE_BUNDLE_URL "$DEFAULT_SPLIT_RULE_BUNDLE_URL"
-            info "已把旧版分流规则源迁移为精简核心规则表: Scam-Abuse-Core.list"
-            ;;
-    esac
+    if is_legacy_default_split_rule_url "$current"; then
+        set_config_value SPLIT_RULE_BUNDLE_URL "$DEFAULT_SPLIT_RULE_BUNDLE_URL"
+        SPLIT_RULE_BUNDLE_URL="$DEFAULT_SPLIT_RULE_BUNDLE_URL"
+        info "已把旧版分流规则源迁移为全新应用规则表: Egress-Application-Rules.list"
+    fi
 }
 
 ensure_runtime_config_defaults() {
@@ -4640,10 +4657,12 @@ import unicodedata
 
 bundle, apps_file, raw_dir, resolved_dir, cached_bundle, catalog_file, now, source_url = sys.argv[1:9]
 supported_types = {"DOMAIN", "DOMAIN-SUFFIX", "IP-CIDR", "IP-CIDR6"}
-category_re = re.compile(r"^#\s*(?:风险场景|CATEGORY)\s*[：:]\s*(.+?)(?:（|\(|$)", re.I)
-app_re = re.compile(r"^#\s*(?:应用|APP)\s*[：:]\s*(.+?)(?:（|\(|$)", re.I)
+category_re = re.compile(r"^#\s*(?:风险场景|应用分类|CATEGORY)\s*[：:]\s*(.+?)\s*$", re.I)
+app_re = re.compile(r"^#\s*(?:应用|APP)\s*[：:]\s*(.+?)\s*$", re.I)
+category_count_re = re.compile(r"\s*[（(]\s*\d+\s*个应用/规则集\s*[,，]\s*\d+\s*条\s*[）)]\s*$")
+app_count_re = re.compile(r"\s*[（(]\s*\d+\s*条\s*[）)]\s*$")
 rules_declared_re = re.compile(r"\bRules\s*:\s*(\d+)", re.I)
-scenarios_declared_re = re.compile(r"\bscenarios\s*:\s*(\d+)", re.I)
+scenarios_declared_re = re.compile(r"\b(?:scenarios|categories)\s*:\s*(\d+)", re.I)
 
 
 def clean_field(value):
@@ -4741,16 +4760,16 @@ with open(bundle, "r", encoding="utf-8-sig", errors="strict") as fh:
             declared_scenarios = int(match.group(1))
         match = category_re.match(line)
         if match:
-            current_category = clean_field(match.group(1))
+            current_category = clean_field(category_count_re.sub("", match.group(1)))
             if current_category and current_category not in categories:
                 categories.append(current_category)
             current_app = None
             continue
         match = app_re.match(line)
         if match:
-            display = clean_field(match.group(1))
+            display = clean_field(app_count_re.sub("", match.group(1)))
             if not current_category or not display:
-                raise SystemExit("第 %s 行应用缺少所属风险场景。" % lineno)
+                raise SystemExit("第 %s 行应用缺少所属应用分类。" % lineno)
             key = display.casefold()
             if key in apps_by_name:
                 current_app = apps_by_name[key]
@@ -4842,6 +4861,15 @@ try:
             out.write("%s#%s\n" % (source_url, item["display"]))
     os.replace(apps_tmp, apps_file)
     os.replace(bundle_tmp, cached_bundle)
+    # 新表导入成功后才删除旧版合集缓存；导入失败时仍保留原有可用状态。
+    for legacy_name in ("Scam-Abuse-Core.list", "Scam-Abuse-Risk.list"):
+        legacy_path = os.path.join(os.path.dirname(cached_bundle), legacy_name)
+        if os.path.abspath(legacy_path) == os.path.abspath(cached_bundle):
+            continue
+        try:
+            os.unlink(legacy_path)
+        except FileNotFoundError:
+            pass
     with open(catalog_file + ".tmp", "w", encoding="utf-8") as out:
         out.write("%s\n" % now)
     os.replace(catalog_file + ".tmp", catalog_file)
@@ -4876,6 +4904,9 @@ split_fetch_all_rules() {
     need_root
     load_config
     write_default_config
+    # 加载时已在内存中改用新地址；这里再把旧默认地址写回配置文件，
+    # 确保后续服务重启、自动同步和菜单操作都保持一致。
+    migrate_default_split_rule_url
     need_cmd python3
     local mode="${1:-catalog}" now tmp size
     case "$mode" in
@@ -10490,7 +10521,7 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       查看应用分流目录、当前策略和本地解析出的 IPv4/IPv6 数量。
 
   $0 split-fetch
-      只下载一次 Scam-Abuse-Core.list，并按文件中的风险场景和应用拆分本地目录/缓存。
+      只下载一次 Egress-Application-Rules.list，并按文件中的应用分类和应用拆分本地目录/缓存。
       未执行前不能设置分流策略。
 
   $0 split-fetch-all
