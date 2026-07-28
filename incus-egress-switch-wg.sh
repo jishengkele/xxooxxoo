@@ -51,7 +51,7 @@ AUTOSYNC_SERVICE="$SYSTEMD_DIR/$APP_NAME-autosync.service"
 EXIT_SERVICE_PREFIX="incus-egress-switch-exit"
 UPDATE_BACKUP_ROOT="${EGRESS_UPDATE_BACKUP_ROOT:-/var/backups/$APP_NAME}"
 DEFAULT_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch-wg.sh"
-DEFAULT_SPLIT_RULE_BUNDLE_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Egress-Application-Rules.list"
+DEFAULT_SPLIT_RULE_BUNDLE_URL="https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Egress-Application-Rules.list"
 PROXY_TUN_MTU=1400
 UPDATE_BACKUP_PATH=""
 UPDATE_BACKUP_ARCHIVE=""
@@ -1239,7 +1239,8 @@ is_legacy_default_split_rule_url() {
         "https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Scam-Abuse-Risk.list" | \
         "https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Scam-Abuse-Risk.list" | \
         "https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Scam-Abuse-Core.list" | \
-        "https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Scam-Abuse-Core.list")
+        "https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Scam-Abuse-Core.list" | \
+        "https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Egress-Application-Rules.list")
             return 0
             ;;
         *)
@@ -1262,7 +1263,7 @@ migrate_default_split_rule_url() {
     if is_legacy_default_split_rule_url "$current"; then
         set_config_value SPLIT_RULE_BUNDLE_URL "$DEFAULT_SPLIT_RULE_BUNDLE_URL"
         SPLIT_RULE_BUNDLE_URL="$DEFAULT_SPLIT_RULE_BUNDLE_URL"
-        info "已把旧版分流规则源迁移为全新应用规则表: Egress-Application-Rules.list"
+        info "已把分流规则源迁移到当前 GitHub 地址: Egress-Application-Rules.list"
     fi
 }
 
