@@ -23,7 +23,7 @@ SPLIT_RESOLVED_DIR="$SPLIT_CACHE_DIR/resolved"
 SPLIT_LAST_SYNC_FILE="$SPLIT_DIR/last-sync"
 SPLIT_CATALOG_FILE="$SPLIT_DIR/catalog-sync"
 SPLIT_README_FILE="$SPLIT_CACHE_DIR/README.md"
-SPLIT_BUNDLE_FILE="$SPLIT_CACHE_DIR/Scam-Abuse-Risk.list"
+SPLIT_BUNDLE_FILE="$SPLIT_CACHE_DIR/Scam-Abuse-Core.list"
 SPLIT_DNSMASQ_DIR="$SPLIT_DIR/dnsmasq"
 INCUS_NETWORKS_DIR="${EGRESS_INCUS_NETWORKS_DIR:-/var/lib/incus/networks}"
 RUN_DIR="/run/$APP_NAME"
@@ -51,6 +51,7 @@ AUTOSYNC_SERVICE="$SYSTEMD_DIR/$APP_NAME-autosync.service"
 EXIT_SERVICE_PREFIX="incus-egress-switch-exit"
 UPDATE_BACKUP_ROOT="${EGRESS_UPDATE_BACKUP_ROOT:-/var/backups/$APP_NAME}"
 DEFAULT_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch-wg.sh"
+DEFAULT_SPLIT_RULE_BUNDLE_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Scam-Abuse-Core.list"
 PROXY_TUN_MTU=1400
 UPDATE_BACKUP_PATH=""
 UPDATE_BACKUP_ARCHIVE=""
@@ -574,7 +575,7 @@ load_config() {
     SWITCH_CLEAR_CONNTRACK="${SWITCH_CLEAR_CONNTRACK:-true}"
     BLOCK_UNMANAGED_IPV6="${BLOCK_UNMANAGED_IPV6:-true}"
     ENABLE_SPLIT_RULES="${ENABLE_SPLIT_RULES:-true}"
-    SPLIT_RULE_BUNDLE_URL="${SPLIT_RULE_BUNDLE_URL:-https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Scam-Abuse-Risk.list}"
+    SPLIT_RULE_BUNDLE_URL="${SPLIT_RULE_BUNDLE_URL:-$DEFAULT_SPLIT_RULE_BUNDLE_URL}"
     SPLIT_UPDATE_INTERVAL="${SPLIT_UPDATE_INTERVAL:-259200}"
     SPLIT_DNS_REFRESH_INTERVAL="${SPLIT_DNS_REFRESH_INTERVAL:-21600}"
     SPLIT_FETCH_TIMEOUT="${SPLIT_FETCH_TIMEOUT:-10}"
@@ -886,7 +887,7 @@ BLOCK_UNMANAGED_IPV6="true"
 ENABLE_SPLIT_RULES="true"
 
 # 单文件应用分流规则源。一次下载后按文件中的“风险场景/应用”注释拆分分类和应用。
-SPLIT_RULE_BUNDLE_URL="https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Scam-Abuse-Risk.list"
+SPLIT_RULE_BUNDLE_URL="$DEFAULT_SPLIT_RULE_BUNDLE_URL"
 
 # 应用规则自动核对更新间隔秒数。默认 259200 秒，即 3 天。
 SPLIT_UPDATE_INTERVAL="259200"
@@ -1228,6 +1229,26 @@ ensure_config_default() {
     fi
 }
 
+migrate_default_split_rule_url() {
+    local current
+    [ -f "$CONFIG_FILE" ] || return 0
+    current="$(awk -F '=' '
+        $1 == "SPLIT_RULE_BUNDLE_URL" {
+            value = substr($0, index($0, "=") + 1)
+            gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", value)
+            print value
+            exit
+        }
+    ' "$CONFIG_FILE")"
+    case "$current" in
+        "https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Scam-Abuse-Risk.list" | \
+        "https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Scam-Abuse-Risk.list")
+            set_config_value SPLIT_RULE_BUNDLE_URL "$DEFAULT_SPLIT_RULE_BUNDLE_URL"
+            info "已把旧版分流规则源迁移为精简核心规则表: Scam-Abuse-Core.list"
+            ;;
+    esac
+}
+
 ensure_runtime_config_defaults() {
     ensure_config_default BRIDGE_IFACES "incusbr0 lxdbr0"
     ensure_config_default API_BIND "0.0.0.0"
@@ -1244,7 +1265,8 @@ ensure_runtime_config_defaults() {
     ensure_config_default SWITCH_CLEAR_CONNTRACK true
     ensure_config_default BLOCK_UNMANAGED_IPV6 true
     ensure_config_default ENABLE_SPLIT_RULES true
-    ensure_config_default SPLIT_RULE_BUNDLE_URL "https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Scam-Abuse-Risk.list"
+    ensure_config_default SPLIT_RULE_BUNDLE_URL "$DEFAULT_SPLIT_RULE_BUNDLE_URL"
+    migrate_default_split_rule_url
     ensure_config_default SPLIT_UPDATE_INTERVAL 259200
     ensure_config_default SPLIT_DNS_REFRESH_INTERVAL 21600
     ensure_config_default SPLIT_FETCH_TIMEOUT 10
@@ -4798,7 +4820,7 @@ try:
     with open(apps_tmp, "w", encoding="utf-8", newline="\n") as out:
         for row in rows:
             out.write("\t".join(clean_field(value) for value in row) + "\n")
-    bundle_tmp = os.path.join(stage, "Scam-Abuse-Risk.list")
+    bundle_tmp = os.path.join(stage, os.path.basename(cached_bundle))
     shutil.copyfile(bundle, bundle_tmp)
 
     new_source_ids = {item["id"] for item in usable_apps}
@@ -10468,7 +10490,7 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       查看应用分流目录、当前策略和本地解析出的 IPv4/IPv6 数量。
 
   $0 split-fetch
-      只下载一次 Scam-Abuse-Risk.list，并按文件中的风险场景和应用拆分本地目录/缓存。
+      只下载一次 Scam-Abuse-Core.list，并按文件中的风险场景和应用拆分本地目录/缓存。
       未执行前不能设置分流策略。
 
   $0 split-fetch-all
