@@ -579,6 +579,9 @@ load_config() {
     PROXY_TUN_STACK="${PROXY_TUN_STACK:-mixed}"
     PROXY_ENDPOINT_INDEPENDENT_NAT="${PROXY_ENDPOINT_INDEPENDENT_NAT:-true}"
     PROXY_KERNEL_DIRECT_BYPASS="${PROXY_KERNEL_DIRECT_BYPASS:-true}"
+    ENTRY_DIRECT_SOFTWARE="${ENTRY_DIRECT_SOFTWARE:-true}"
+    ENTRY_DIRECT_BT_PT="${ENTRY_DIRECT_BT_PT:-true}"
+    ENTRY_DIRECT_SPEEDTEST="${ENTRY_DIRECT_SPEEDTEST:-true}"
     PROXY_DIRECT_DEFAULT_MIGRATED="${PROXY_DIRECT_DEFAULT_MIGRATED:-false}"
     CONCURRENCY_WARN_PERCENT="${CONCURRENCY_WARN_PERCENT:-80}"
     ENABLE_SPLIT_RULES="${ENABLE_SPLIT_RULES:-true}"
@@ -922,9 +925,14 @@ PROXY_LOG_LEVEL="warn"
 PROXY_TUN_STACK="mixed"
 PROXY_ENDPOINT_INDEPENDENT_NAT="true"
 
-# GitHub、Docker 和常用系统软件源默认由 nftables 提前识别并从入口机直出。
-# 特殊入口机无法直连这些软件源时，可在 config.env 高级设置中改为 false。
+# 默认入口机直连规则优先在 nftables 内核层执行，减少 sing-box 用户态负载。
+# PROXY_KERNEL_DIRECT_BYPASS 只控制内核提前直连的实现方式；日常开关请使用主菜单“入口机直连”。
 PROXY_KERNEL_DIRECT_BYPASS="true"
+
+# 三组内置入口机直连规则。关闭某组后，该组流量会继续匹配容器当前出口。
+ENTRY_DIRECT_SOFTWARE="true"
+ENTRY_DIRECT_BT_PT="true"
+ENTRY_DIRECT_SPEEDTEST="true"
 
 # 新默认值的一次性迁移标记。请勿手工删除，否则下次安全更新会再次恢复默认直出。
 PROXY_DIRECT_DEFAULT_MIGRATED="true"
@@ -1236,16 +1244,18 @@ read_force_category_on_exit_policies() {
 read_enabled_split_app_ids() {
     local category source target app display app_category remote enabled
     {
-        if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ]; then
+        if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ] && proxy_direct_any_enabled; then
             printf '%s\n' "$PROXY_DIRECT_APP_ID"
         fi
-        read_split_policies | awk -F '\t' '{print $1}'
-        read_force_on_exit_policies | awk -F '\t' '{print $1}'
-        while IFS=$'\t' read -r category source target; do
-            while IFS=$'\t' read -r app display app_category remote enabled; do
-                [ "$app_category" = "$category" ] && printf '%s\n' "$app"
-            done < <(read_split_apps)
-        done < <(read_force_category_on_exit_policies)
+        if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
+            read_split_policies | awk -F '\t' '{print $1}'
+            read_force_on_exit_policies | awk -F '\t' '{print $1}'
+            while IFS=$'\t' read -r category source target; do
+                while IFS=$'\t' read -r app display app_category remote enabled; do
+                    [ "$app_category" = "$category" ] && printf '%s\n' "$app"
+                done < <(read_split_apps)
+            done < <(read_force_category_on_exit_policies)
+        fi
     } | awk 'NF && !seen[$0]++'
 }
 
@@ -1321,7 +1331,7 @@ migrate_proxy_direct_default() {
         set_config_value PROXY_DIRECT_DEFAULT_MIGRATED true
         PROXY_KERNEL_DIRECT_BYPASS=true
         PROXY_DIRECT_DEFAULT_MIGRATED=true
-        info "软件源流量已迁移为默认从入口机直出；特殊环境仍可在 config.env 高级关闭。"
+        info "默认入口机直连已迁移为 nftables 内核提前处理；各分组可在主菜单独立开关。"
     fi
 }
 
@@ -1344,6 +1354,9 @@ ensure_runtime_config_defaults() {
     ensure_config_default PROXY_TUN_STACK mixed
     ensure_config_default PROXY_ENDPOINT_INDEPENDENT_NAT true
     ensure_config_default PROXY_KERNEL_DIRECT_BYPASS true
+    ensure_config_default ENTRY_DIRECT_SOFTWARE true
+    ensure_config_default ENTRY_DIRECT_BT_PT true
+    ensure_config_default ENTRY_DIRECT_SPEEDTEST true
     migrate_proxy_direct_default
     ensure_config_default PROXY_DIRECT_DEFAULT_MIGRATED true
     ensure_config_default CONCURRENCY_WARN_PERCENT 80
@@ -1865,6 +1878,9 @@ validate_runtime_config() {
     valid_proxy_tun_stack "$PROXY_TUN_STACK" || die "sing-box TUN 栈无效: $PROXY_TUN_STACK"
     valid_bool_value "$PROXY_ENDPOINT_INDEPENDENT_NAT" || die "PROXY_ENDPOINT_INDEPENDENT_NAT 必须是 true 或 false"
     valid_bool_value "$PROXY_KERNEL_DIRECT_BYPASS" || die "PROXY_KERNEL_DIRECT_BYPASS 必须是 true 或 false"
+    valid_bool_value "$ENTRY_DIRECT_SOFTWARE" || die "ENTRY_DIRECT_SOFTWARE 必须是 true 或 false"
+    valid_bool_value "$ENTRY_DIRECT_BT_PT" || die "ENTRY_DIRECT_BT_PT 必须是 true 或 false"
+    valid_bool_value "$ENTRY_DIRECT_SPEEDTEST" || die "ENTRY_DIRECT_SPEEDTEST 必须是 true 或 false"
     valid_bool_value "$PROXY_DIRECT_DEFAULT_MIGRATED" || die "PROXY_DIRECT_DEFAULT_MIGRATED 必须是 true 或 false"
     [[ "$CONCURRENCY_WARN_PERCENT" =~ ^[0-9]+$ ]] && [ "$CONCURRENCY_WARN_PERCENT" -ge 50 ] && [ "$CONCURRENCY_WARN_PERCENT" -le 99 ] || die "并发健康告警阈值必须是 50-99: $CONCURRENCY_WARN_PERCENT"
     bridge_set_expr >/dev/null
@@ -2103,7 +2119,6 @@ nft_elements_from_file() {
 build_split_dnsmasq_file() {
     local out="$1" app raw safe kind domain
     : > "$out"
-    [ "${ENABLE_SPLIT_RULES:-true}" = "true" ] || return 0
     while IFS=$'\t' read -r app _target; do
         [ -n "$app" ] || continue
         raw="$(split_raw_file "$app")"
@@ -2435,39 +2450,39 @@ build_nft_file() {
     [ -n "$managed6" ] && managed6_line="    elements = { $managed6 }"
     [ -n "$split4" ] && split4_line="    elements = { $split4 }"
     [ -n "$split6" ] && split6_line="    elements = { $split6 }"
-    if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
-        while IFS= read -r app; do
-            split_nft_name_into safe "$app"
-            [ -n "$safe" ] || continue
-            v4file="$(split_resolved_v4_file "$app")"
-            v6file="$(split_resolved_v6_file "$app")"
-            domains_file="$SPLIT_RESOLVED_DIR/$app.domains"
-            v4elems="$(nft_elements_from_file "$v4file")"
-            v6elems="$(nft_elements_from_file "$v6file")"
-            if [ -n "$v4elems" ] || [ -s "$domains_file" ]; then
-                v4elements_line=""
-                [ -n "$v4elems" ] && v4elements_line="    elements = { $v4elems }"
-                split_sets="$split_sets
+    while IFS= read -r app; do
+        split_nft_name_into safe "$app"
+        [ -n "$safe" ] || continue
+        v4file="$(split_resolved_v4_file "$app")"
+        v6file="$(split_resolved_v6_file "$app")"
+        domains_file="$SPLIT_RESOLVED_DIR/$app.domains"
+        v4elems="$(nft_elements_from_file "$v4file")"
+        v6elems="$(nft_elements_from_file "$v6file")"
+        if [ -n "$v4elems" ] || [ -s "$domains_file" ]; then
+            v4elements_line=""
+            [ -n "$v4elems" ] && v4elements_line="    elements = { $v4elems }"
+            split_sets="$split_sets
   set split4_$safe {
     type ipv4_addr
     flags interval
 $v4elements_line
   }
 "
-            fi
-            if [ -n "$v6elems" ] || [ -s "$domains_file" ]; then
-                v6elements_line=""
-                [ -n "$v6elems" ] && v6elements_line="    elements = { $v6elems }"
-                split_sets="$split_sets
+        fi
+        if [ -n "$v6elems" ] || [ -s "$domains_file" ]; then
+            v6elements_line=""
+            [ -n "$v6elems" ] && v6elements_line="    elements = { $v6elems }"
+            split_sets="$split_sets
   set split6_$safe {
     type ipv6_addr
     flags interval
 $v6elements_line
   }
 "
-            fi
-        done < <(read_enabled_split_app_ids)
+        fi
+    done < <(read_enabled_split_app_ids)
 
+    if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
         while IFS=$'\t' read -r app target; do
             split_app_is_forced "$app" || continue
             target="$(split_target_list_default "$target")"
@@ -2654,7 +2669,8 @@ $v6elements_line
             fi
         done < <(read_split_policies)
     fi
-    if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ] && [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ]; then
+    if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ] &&
+        proxy_direct_any_enabled; then
         split_nft_name_into safe "$PROXY_DIRECT_APP_ID"
         v4file="$(split_resolved_v4_file "$PROXY_DIRECT_APP_ID")"
         v6file="$(split_resolved_v6_file "$PROXY_DIRECT_APP_ID")"
@@ -3200,13 +3216,9 @@ EOF
     chmod 755 "$resolved_guard"
 }
 
-ensure_proxy_direct_rule_source() {
-    local raw tmp
-    raw="$(split_raw_file "$PROXY_DIRECT_APP_ID")"
-    tmp="$(mktemp)"
-    mkdir -p "$SPLIT_RAW_DIR" "$SPLIT_RESOLVED_DIR"
-    cat > "$tmp" <<'EOF'
-# sing-box 高并发模式：由 nftables 提前直连的软件源与开发平台。
+proxy_direct_software_rule_lines() {
+    cat <<'EOF'
+# 软件源与开发平台
 DOMAIN-SUFFIX,github.com
 DOMAIN-SUFFIX,githubusercontent.com
 DOMAIN-SUFFIX,githubassets.com
@@ -3239,13 +3251,299 @@ DOMAIN-SUFFIX,cloudflare.com
 DOMAIN-SUFFIX,fastly.net
 DOMAIN-SUFFIX,akamai.net
 EOF
+}
+
+proxy_direct_bt_pt_rule_lines() {
+    cat <<'EOF'
+# BT 客户端与公共 Tracker
+DOMAIN-SUFFIX,bittorrent.com
+DOMAIN-SUFFIX,utorrent.com
+DOMAIN-SUFFIX,qbittorrent.org
+DOMAIN-SUFFIX,transmissionbt.com
+DOMAIN-SUFFIX,deluge-torrent.org
+DOMAIN-SUFFIX,biglybt.com
+DOMAIN-SUFFIX,libtorrent.org
+DOMAIN,open.demonii.com
+DOMAIN,tracker.publictracker.xyz
+DOMAIN,tracker.opentrackr.org
+DOMAIN,open.stealth.si
+DOMAIN,tracker.wildkat.net
+DOMAIN,tracker.tryhackx.org
+DOMAIN,tracker.qu.ax
+DOMAIN,tracker.peerfect.org
+DOMAIN,tracker.opentrackr.com
+DOMAIN,tracker.opentorrent.top
+DOMAIN,tracker.ilibr.org
+DOMAIN,tracker.ducks.party
+DOMAIN,tracker.dler.org
+DOMAIN,tracker.bittor.pw
+DOMAIN,tracker.auctor.tv
+DOMAIN,tracker-udp.gbitt.info
+DOMAIN,tr4ck3r.duckdns.org
+DOMAIN,torrentclub.online
+DOMAIN,t.overflow.biz
+
+# PT 站点；来源为 v2fly/domain-list-community 的 category-pt 快照。
+DOMAIN-SUFFIX,1ptba.com
+DOMAIN-SUFFIX,52pt.site
+DOMAIN-SUFFIX,audiences.me
+DOMAIN-SUFFIX,animebytes.tv
+DOMAIN-SUFFIX,avistaz.to
+DOMAIN-SUFFIX,beitai.pt
+DOMAIN-SUFFIX,beyond-hd.me
+DOMAIN-SUFFIX,bibliotik.me
+DOMAIN-SUFFIX,bitpt.cn
+DOMAIN-SUFFIX,blutopia.cc
+DOMAIN-SUFFIX,broadcasthe.net
+DOMAIN-SUFFIX,bt.byr.cn
+DOMAIN-SUFFIX,byr.pt
+DOMAIN-SUFFIX,carpt.net
+DOMAIN-SUFFIX,ccfbits.org
+DOMAIN-SUFFIX,chdbits.co
+DOMAIN-SUFFIX,chdbits.xyz
+DOMAIN-SUFFIX,chddiy.xyz
+DOMAIN-SUFFIX,cinemaz.to
+DOMAIN-SUFFIX,cyanbug.net
+DOMAIN-SUFFIX,dicmusic.com
+DOMAIN-SUFFIX,digitalcore.club
+DOMAIN-SUFFIX,dmhy.best
+DOMAIN-SUFFIX,dmhy.org
+DOMAIN-SUFFIX,eastgame.org
+DOMAIN-SUFFIX,et8.org
+DOMAIN-SUFFIX,exoticaz.to
+DOMAIN-SUFFIX,filelist.io
+DOMAIN-SUFFIX,gazellegames.net
+DOMAIN-SUFFIX,greatposterwall.com
+DOMAIN-SUFFIX,haidan.video
+DOMAIN-SUFFIX,hdarea.club
+DOMAIN-SUFFIX,hdatmos.club
+DOMAIN-SUFFIX,hdbits.org
+DOMAIN-SUFFIX,hdchina.org
+DOMAIN-SUFFIX,hdcity.city
+DOMAIN-SUFFIX,hdcmct.org
+DOMAIN-SUFFIX,hddolby.com
+DOMAIN-SUFFIX,hdfans.org
+DOMAIN-SUFFIX,hdhome.org
+DOMAIN-SUFFIX,hdkyl.in
+DOMAIN-SUFFIX,hdkylin.top
+DOMAIN-SUFFIX,hdkylin.work
+DOMAIN-SUFFIX,hdmayi.com
+DOMAIN-SUFFIX,hdpt.xyz
+DOMAIN-SUFFIX,hdsky.me
+DOMAIN-SUFFIX,hdtime.org
+DOMAIN-SUFFIX,hdvideo.one
+DOMAIN-SUFFIX,hdzone.me
+DOMAIN-SUFFIX,hhan.club
+DOMAIN-SUFFIX,hhanclub.top
+DOMAIN-SUFFIX,hitpt.com
+DOMAIN-SUFFIX,hudbt.hust.edu.cn
+DOMAIN-SUFFIX,ianon.app
+DOMAIN-SUFFIX,icc2022.com
+DOMAIN-SUFFIX,ilovelemonhd.me
+DOMAIN-SUFFIX,iptorrents.com
+DOMAIN-SUFFIX,jpopsuki.eu
+DOMAIN-SUFFIX,jptv.club
+DOMAIN-SUFFIX,keepfrds.com
+DOMAIN-SUFFIX,kufei.com
+DOMAIN-SUFFIX,kufei.org
+DOMAIN-SUFFIX,leaves.red
+DOMAIN-SUFFIX,lemonhd.club
+DOMAIN-SUFFIX,lemonhd.net
+DOMAIN-SUFFIX,lemonhd.org
+DOMAIN-SUFFIX,m-team.cc
+DOMAIN-SUFFIX,m-team.io
+DOMAIN-SUFFIX,morethantv.me
+DOMAIN-SUFFIX,mt.cc
+DOMAIN-SUFFIX,myanonamouse.net
+DOMAIN-SUFFIX,nanyangpt.com
+DOMAIN-SUFFIX,nebulance.io
+DOMAIN-SUFFIX,neu6.edu.cn
+DOMAIN-SUFFIX,nexushd.org
+DOMAIN-SUFFIX,nicept.net
+DOMAIN-SUFFIX,npupt.com
+DOMAIN-SUFFIX,open.cd
+DOMAIN-SUFFIX,orpheus.network
+DOMAIN-SUFFIX,ourbits.club
+DOMAIN-SUFFIX,pandapt.net
+DOMAIN-SUFFIX,passthepopcorn.me
+DOMAIN-SUFFIX,piggo.me
+DOMAIN-SUFFIX,privatehd.to
+DOMAIN-SUFFIX,pt.0ff.cc
+DOMAIN-SUFFIX,pt.btschool.club
+DOMAIN-SUFFIX,pt.eastgame.org
+DOMAIN-SUFFIX,pt.hd4fans.org
+DOMAIN-SUFFIX,pt.hdupt.com
+DOMAIN-SUFFIX,pt.nwsuaf6.edu.cn
+DOMAIN-SUFFIX,pt.sjtu.edu.cn
+DOMAIN-SUFFIX,pt.soulvoice.club
+DOMAIN-SUFFIX,pt.upxin.net
+DOMAIN-SUFFIX,pt.xauat.edu.cn
+DOMAIN-SUFFIX,ptcafe.club
+DOMAIN-SUFFIX,ptchdbits.co
+DOMAIN-SUFFIX,ptchina.org
+DOMAIN-SUFFIX,pterclub.com
+DOMAIN-SUFFIX,pthome.net
+DOMAIN-SUFFIX,ptsbao.club
+DOMAIN-SUFFIX,pttime.org
+DOMAIN-SUFFIX,pttime.top
+DOMAIN-SUFFIX,rainbowisland.co
+DOMAIN-SUFFIX,redacted.sh
+DOMAIN-SUFFIX,rousi.zip
+DOMAIN-SUFFIX,share.ilolicon.com
+DOMAIN-SUFFIX,sharkpt.net
+DOMAIN-SUFFIX,skyey2.com
+DOMAIN-SUFFIX,skyeysnow.com
+DOMAIN-SUFFIX,sportscult.org
+DOMAIN-SUFFIX,springsunday.net
+DOMAIN-SUFFIX,superbits.org
+DOMAIN-SUFFIX,tju.pt
+DOMAIN-SUFFIX,tjupt.org
+DOMAIN-SUFFIX,torrentleech.cc
+DOMAIN-SUFFIX,torrentleech.org
+DOMAIN-SUFFIX,totheglory.im
+DOMAIN-SUFFIX,ubits.club
+DOMAIN-SUFFIX,uhdbits.org
+DOMAIN-SUFFIX,ultrahd.net
+DOMAIN-SUFFIX,wintersakura.net
+DOMAIN-SUFFIX,zhuque.in
+DOMAIN-SUFFIX,zmpt.cc
+EOF
+}
+
+proxy_direct_speedtest_rule_lines() {
+    cat <<'EOF'
+# 测速网站与常见测试端点；主体来源为 v2fly/domain-list-community
+# 的 category-speedtest、ookla-speedtest 和 openspeedtest 快照。
+DOMAIN-SUFFIX,cdnst.net
+DOMAIN-SUFFIX,cellmaps.com
+DOMAIN-SUFFIX,ekahau.cloud
+DOMAIN-SUFFIX,ekahau.com
+DOMAIN-SUFFIX,ookla.com
+DOMAIN-SUFFIX,ooklaserver.net
+DOMAIN-SUFFIX,pingtest.net
+DOMAIN-SUFFIX,speedtest.co
+DOMAIN-SUFFIX,speedtest.net
+DOMAIN-SUFFIX,speedtestcustom.com
+DOMAIN-SUFFIX,webtest.net
+DOMAIN,www.speedtest.net.cdn.cloudflare.net
+DOMAIN,ookla-speedtest-central.hgconair.hgc.com.hk
+DOMAIN-SUFFIX,open.cachefly.net
+DOMAIN-SUFFIX,openspeedtest.com
+DOMAIN-SUFFIX,cnspeedtest.cn
+DOMAIN-SUFFIX,fast.com
+DOMAIN-SUFFIX,fastspeedtest.com
+DOMAIN-SUFFIX,linkmeter.net
+DOMAIN-SUFFIX,measurementlab.net
+DOMAIN-SUFFIX,meter.net
+DOMAIN,speed.cloudflare.com
+DOMAIN-SUFFIX,librespeed.org
+DOMAIN-SUFFIX,nperf.com
+DOMAIN-SUFFIX,openspeedtest.ru
+DOMAIN-SUFFIX,speed.dler.io
+DOMAIN-SUFFIX,speed.ee
+DOMAIN-SUFFIX,speed.hinet.net
+DOMAIN-SUFFIX,speed.nccu.edu.tw
+DOMAIN-SUFFIX,speed.neu6.edu.cn
+DOMAIN-SUFFIX,speed.nju.edu.cn
+DOMAIN-SUFFIX,speed.nuaa.edu.cn
+DOMAIN-SUFFIX,speed.qlu.edu.cn
+DOMAIN-SUFFIX,speed.ujs.edu.cn
+DOMAIN-SUFFIX,speed2.hinet.net
+DOMAIN-SUFFIX,speed5.ntu.edu.tw
+DOMAIN-SUFFIX,speed6.ujs.edu.cn
+DOMAIN-SUFFIX,speedcheck.org
+DOMAIN-SUFFIX,speedgeo.net
+DOMAIN-SUFFIX,speedof.me
+DOMAIN-SUFFIX,speedtest.cesnet.cz
+DOMAIN-SUFFIX,speedtest.ch
+DOMAIN-SUFFIX,speedtest.citylink.pro
+DOMAIN-SUFFIX,speedtest.cn
+DOMAIN-SUFFIX,speedtest.co.za
+DOMAIN-SUFFIX,speedtest.de
+DOMAIN-SUFFIX,speedtest.dno-it.ru
+DOMAIN-SUFFIX,speedtest.frontier.com
+DOMAIN-SUFFIX,speedtest.im
+DOMAIN-SUFFIX,speedtest.mail.ru
+DOMAIN-SUFFIX,speedtest.mfcyun.com
+DOMAIN-SUFFIX,speedtest.net.in
+DOMAIN-SUFFIX,speedtest.net.ua
+DOMAIN-SUFFIX,speedtest.net.uk
+DOMAIN-SUFFIX,speedtest.org
+DOMAIN-SUFFIX,speedtest.rt.ru
+DOMAIN-SUFFIX,speedtest.ru
+DOMAIN-SUFFIX,speedtest.shaw.ca
+DOMAIN-SUFFIX,speedtest.shu.edu.cn
+DOMAIN-SUFFIX,speedtest.su
+DOMAIN-SUFFIX,speedtest.uz
+DOMAIN-SUFFIX,speedtest.volia.com
+DOMAIN-SUFFIX,speedtest.xaut.edu.cn
+DOMAIN-SUFFIX,speedtest.xfinity.com
+DOMAIN-SUFFIX,speedtest.xyz
+DOMAIN-SUFFIX,speedtest24.ru
+DOMAIN-SUFFIX,speedtest6.shu.edu.cn
+DOMAIN-SUFFIX,test.nju.edu.cn
+DOMAIN-SUFFIX,test.ustc.edu.cn
+DOMAIN-SUFFIX,test6.nju.edu.cn
+DOMAIN-SUFFIX,test6.ustc.edu.cn
+DOMAIN-SUFFIX,testmy.net
+DOMAIN-SUFFIX,testmyspeed.com
+DOMAIN-SUFFIX,testskorosti.ru
+DOMAIN-SUFFIX,xnfz.seu.edu.cn
+DOMAIN,hk-global-bgp.hkg.speedtest.yecaoyun.com
+DOMAIN-SUFFIX,speedsmart.net
+DOMAIN,speedtest.googlefiber.net
+EOF
+}
+
+proxy_direct_any_enabled() {
+    [ "${ENTRY_DIRECT_SOFTWARE:-true}" = "true" ] ||
+        [ "${ENTRY_DIRECT_BT_PT:-true}" = "true" ] ||
+        [ "${ENTRY_DIRECT_SPEEDTEST:-true}" = "true" ]
+}
+
+proxy_direct_enabled_rule_lines() {
+    [ "${ENTRY_DIRECT_SOFTWARE:-true}" = "true" ] && proxy_direct_software_rule_lines
+    [ "${ENTRY_DIRECT_BT_PT:-true}" = "true" ] && proxy_direct_bt_pt_rule_lines
+    [ "${ENTRY_DIRECT_SPEEDTEST:-true}" = "true" ] && proxy_direct_speedtest_rule_lines
+    return 0
+}
+
+proxy_direct_all_rule_lines() {
+    proxy_direct_software_rule_lines
+    proxy_direct_bt_pt_rule_lines
+    proxy_direct_speedtest_rule_lines
+}
+
+clear_proxy_direct_resolved_cache() {
+    rm -f "$(split_resolved_v4_file "$PROXY_DIRECT_APP_ID")" \
+        "$(split_resolved_v6_file "$PROXY_DIRECT_APP_ID")" \
+        "$SPLIT_RESOLVED_DIR/$PROXY_DIRECT_APP_ID.domains" \
+        "$SPLIT_RESOLVED_DIR/$PROXY_DIRECT_APP_ID.unsupported" \
+        "$SPLIT_RESOLVED_DIR/$PROXY_DIRECT_APP_ID.stats"
+}
+
+split_parse_proxy_direct_rules() {
+    local workers="${SPLIT_DNS_WORKERS:-4}"
+    [[ "$workers" =~ ^[0-9]+$ ]] || workers=4
+    [ "$workers" -ge 12 ] || workers=12
+    # 内置直连三组共用一个缓存，数量明显大于单个应用；提高专用上限，
+    # 确保不支持 dnsmasq nftset 的入口机也能获得完整静态解析结果。
+    SPLIT_DOMAIN_RESOLVE_LIMIT=600 SPLIT_DNS_WORKERS="$workers" \
+        split_parse_app_rules "$PROXY_DIRECT_APP_ID"
+}
+
+ensure_proxy_direct_rule_source() {
+    local raw tmp
+    raw="$(split_raw_file "$PROXY_DIRECT_APP_ID")"
+    tmp="$(mktemp)"
+    mkdir -p "$SPLIT_RAW_DIR" "$SPLIT_RESOLVED_DIR"
+    {
+        printf '# 内置入口机直连规则；由主菜单“入口机直连”管理，请勿手工修改。\n'
+        proxy_direct_enabled_rule_lines
+    } > "$tmp"
     if [ ! -f "$raw" ] || ! cmp -s "$tmp" "$raw"; then
         install -m 0600 "$tmp" "$raw"
-        rm -f "$(split_resolved_v4_file "$PROXY_DIRECT_APP_ID")" \
-            "$(split_resolved_v6_file "$PROXY_DIRECT_APP_ID")" \
-            "$SPLIT_RESOLVED_DIR/$PROXY_DIRECT_APP_ID.domains" \
-            "$SPLIT_RESOLVED_DIR/$PROXY_DIRECT_APP_ID.unsupported" \
-            "$SPLIT_RESOLVED_DIR/$PROXY_DIRECT_APP_ID.stats"
+        clear_proxy_direct_resolved_cache
     fi
     rm -f "$tmp"
 }
@@ -3253,7 +3551,12 @@ EOF
 prepare_proxy_direct_rule_cache() {
     split_cache_lock_acquire
     ensure_proxy_direct_rule_source
-    if ! split_parse_app_rules "$PROXY_DIRECT_APP_ID"; then
+    if ! proxy_direct_any_enabled; then
+        clear_proxy_direct_resolved_cache
+        split_cache_lock_release
+        return 0
+    fi
+    if ! split_parse_proxy_direct_rules; then
         split_cache_lock_release
         return 1
     fi
@@ -3263,26 +3566,42 @@ prepare_proxy_direct_rule_cache() {
 prepare_default_proxy_direct_bypass() {
     [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ] || return 0
     if ! prepare_proxy_direct_rule_cache; then
-        warn "软件源入口机直连缓存暂未准备完成；已保留配置，后续规则刷新会再次尝试。"
+        warn "入口机直连缓存暂未准备完成；已保留配置，后续规则刷新会再次尝试。"
     fi
 }
 
 proxy_split_rules() {
-    [ "${ENABLE_SPLIT_RULES:-true}" = "true" ] || return 0
     [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" != "true" ] || return 0
-    cat <<'EOF'
-      { "domain_suffix": ["github.com", "githubusercontent.com", "githubassets.com", "github.io"], "action": "route", "outbound": "direct" },
-      { "domain_suffix": ["docker.io", "docker.com", "dockerhub.com"], "action": "route", "outbound": "direct" },
-      { "domain_suffix": ["debian.org", "ubuntu.com", "canonical.com"], "action": "route", "outbound": "direct" },
-      { "domain_suffix": ["centos.org", "fedoraproject.org", "redhat.com"], "action": "route", "outbound": "direct" },
-      { "domain_suffix": ["alpinelinux.org", "archlinux.org"], "action": "route", "outbound": "direct" },
-      { "domain_suffix": ["npmjs.org", "npmjs.com", "yarnpkg.com"], "action": "route", "outbound": "direct" },
-      { "domain_suffix": ["pypi.org", "pythonhosted.org"], "action": "route", "outbound": "direct" },
-      { "domain_suffix": ["golang.org", "go.dev", "proxy.golang.org"], "action": "route", "outbound": "direct" },
-      { "domain_suffix": ["maven.org", "mvnrepository.com"], "action": "route", "outbound": "direct" },
-      { "domain_suffix": ["rubygems.org", "crates.io", "packagist.org"], "action": "route", "outbound": "direct" },
-      { "domain_suffix": ["cloudflare.com", "fastly.net", "akamai.net"], "action": "route", "outbound": "direct" },
-EOF
+    proxy_direct_any_enabled || return 0
+    proxy_direct_enabled_rule_lines | python3 -c '
+import json
+import sys
+
+values = {"domain_suffix": [], "domain": [], "ip_cidr": []}
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line or line.startswith("#") or "," not in line:
+        continue
+    kind, value = line.split(",", 1)
+    field = {
+        "DOMAIN-SUFFIX": "domain_suffix",
+        "DOMAIN": "domain",
+        "IP-CIDR": "ip_cidr",
+        "IP-CIDR6": "ip_cidr",
+    }.get(kind.upper())
+    if field and value not in values[field]:
+        values[field].append(value)
+
+for field in ("domain_suffix", "domain", "ip_cidr"):
+    items = values[field]
+    for offset in range(0, len(items), 128):
+        rule = {
+            field: items[offset:offset + 128],
+            "action": "route",
+            "outbound": "direct",
+        }
+        print("      " + json.dumps(rule, ensure_ascii=False) + ",")
+'
 }
 
 proxy_outbound_json() {
@@ -3509,21 +3828,25 @@ is_proxy_exit() {
 
 patch_proxy_exit_config() {
     local name="$1" new_level="${2:--}" new_stack="${3:--}" new_eim="${4:--}" kernel_bypass="${5:-${PROXY_KERNEL_DIRECT_BYPASS:-true}}"
-    local conf="$EXIT_DIR/$name/config.json" backup service iface was_active="false"
+    local conf="$EXIT_DIR/$name/config.json" backup enabled_rules all_rules service iface was_active="false"
     [ -s "$conf" ] || die "出口 $name 不是脚本托管的 sing-box 出口。"
     [ "$new_level" = "-" ] || valid_proxy_log_level "$new_level" || die "sing-box 日志等级无效: $new_level"
     [ "$new_stack" = "-" ] || valid_proxy_tun_stack "$new_stack" || die "sing-box TUN 栈无效: $new_stack"
     [ "$new_eim" = "-" ] || valid_bool_value "$new_eim" || die "独立 UDP NAT 参数必须是 true 或 false。"
     valid_bool_value "$kernel_bypass" || die "内核直连参数必须是 true 或 false。"
     backup="$(mktemp)"
+    enabled_rules="$(mktemp)"
+    all_rules="$(mktemp)"
     cp "$conf" "$backup"
-    if ! python3 - "$conf" "$new_level" "$new_stack" "$new_eim" "$kernel_bypass" <<'PY'
+    proxy_direct_enabled_rule_lines > "$enabled_rules"
+    proxy_direct_all_rule_lines > "$all_rules"
+    if ! python3 - "$conf" "$new_level" "$new_stack" "$new_eim" "$kernel_bypass" "$enabled_rules" "$all_rules" <<'PY'
 import json
 import os
 import sys
 import tempfile
 
-path, level, stack, eim, kernel_bypass = sys.argv[1:6]
+path, level, stack, eim, kernel_bypass, enabled_path, all_path = sys.argv[1:8]
 with open(path, "r", encoding="utf-8") as fh:
     data = json.load(fh)
 
@@ -3538,30 +3861,44 @@ if stack != "-":
 if eim != "-":
     tun["endpoint_independent_nat"] = eim == "true"
 
-groups = [
-    ["github.com", "githubusercontent.com", "githubassets.com", "github.io"],
-    ["docker.io", "docker.com", "dockerhub.com"],
-    ["debian.org", "ubuntu.com", "canonical.com"],
-    ["centos.org", "fedoraproject.org", "redhat.com"],
-    ["alpinelinux.org", "archlinux.org"],
-    ["npmjs.org", "npmjs.com", "yarnpkg.com"],
-    ["pypi.org", "pythonhosted.org"],
-    ["golang.org", "go.dev", "proxy.golang.org"],
-    ["maven.org", "mvnrepository.com"],
-    ["rubygems.org", "crates.io", "packagist.org"],
-    ["cloudflare.com", "fastly.net", "akamai.net"],
-]
+def parse_rules(rule_path):
+    parsed = {"domain_suffix": [], "domain": [], "ip_cidr": []}
+    with open(rule_path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or "," not in line:
+                continue
+            kind, value = line.split(",", 1)
+            field = {
+                "DOMAIN-SUFFIX": "domain_suffix",
+                "DOMAIN": "domain",
+                "IP-CIDR": "ip_cidr",
+                "IP-CIDR6": "ip_cidr",
+            }.get(kind.upper())
+            if field and value not in parsed[field]:
+                parsed[field].append(value)
+    return parsed
+
+enabled = parse_rules(enabled_path)
+managed = parse_rules(all_path)
+managed_values = {value for values in managed.values() for value in values}
 route = data.setdefault("route", {})
 rules = route.setdefault("rules", [])
+proxy = next((item for item in data.get("outbounds", []) if item.get("tag") == "proxy"), {})
+proxy_server = str(proxy.get("server", ""))
 
 def is_builtin_direct(rule):
-    suffixes = rule.get("domain_suffix")
-    return (
-        isinstance(suffixes, list)
-        and rule.get("action") == "route"
-        and rule.get("outbound") == "direct"
-        and any(set(suffixes) == set(group) for group in groups)
-    )
+    if rule.get("action") != "route" or rule.get("outbound") != "direct":
+        return False
+    for field in ("domain_suffix", "domain", "ip_cidr"):
+        values = rule.get(field)
+        if not isinstance(values, list) or not values:
+            continue
+        if field == "domain" and len(values) == 1 and str(values[0]) == proxy_server:
+            return False
+        if all(str(value) in managed_values for value in values):
+            return True
+    return False
 
 def is_tun_sniff(rule):
     return (
@@ -3571,11 +3908,20 @@ def is_tun_sniff(rule):
     )
 
 rules = [rule for rule in rules if not is_builtin_direct(rule) and not is_tun_sniff(rule)]
-if kernel_bypass != "true":
+if kernel_bypass != "true" and any(enabled.values()):
     rules.insert(0, {"inbound": ["tun-in"], "action": "sniff"})
     insert_at = 2 if len(rules) > 1 and rules[1].get("protocol") == "dns" else 1
-    for group in reversed(groups):
-        rules.insert(insert_at, {"domain_suffix": group, "action": "route", "outbound": "direct"})
+    generated = []
+    for field in ("domain_suffix", "domain", "ip_cidr"):
+        values = enabled[field]
+        for offset in range(0, len(values), 128):
+            generated.append({
+                field: values[offset:offset + 128],
+                "action": "route",
+                "outbound": "direct",
+            })
+    for rule in reversed(generated):
+        rules.insert(insert_at, rule)
 route["rules"] = rules
 
 directory = os.path.dirname(path)
@@ -3596,13 +3942,18 @@ finally:
 PY
     then
         install -m 0600 "$backup" "$conf"
-        rm -f "$backup"
+        rm -f "$backup" "$enabled_rules" "$all_rules"
         die "修改 sing-box 出口 $name 的运行参数失败，已保留原配置。"
     fi
+    rm -f "$enabled_rules" "$all_rules"
     if ! "$SINGBOX_BIN" check -c "$conf" >/dev/null 2>&1; then
         install -m 0600 "$backup" "$conf"
         rm -f "$backup"
         die "修改后的 sing-box 配置校验失败，已恢复出口 $name。"
+    fi
+    if cmp -s "$backup" "$conf"; then
+        rm -f "$backup"
+        return 0
     fi
 
     service="${EXIT_SERVICE_PREFIX}-${name}"
@@ -3639,8 +3990,8 @@ apply_recommended_proxy_profile() {
     load_config
     write_default_config
     local result changed failed
-    info "正在准备软件源入口机直出缓存..."
-    prepare_proxy_direct_rule_cache || die "软件源域名缓存准备失败，未修改出口运行模式。"
+    info "正在准备入口机直连缓存..."
+    prepare_proxy_direct_rule_cache || die "入口机直连域名缓存准备失败，未修改出口运行模式。"
     set_config_value PROXY_LOG_LEVEL warn
     set_config_value PROXY_TUN_STACK system
     set_config_value PROXY_ENDPOINT_INDEPENDENT_NAT false
@@ -3652,7 +4003,7 @@ apply_recommended_proxy_profile() {
     do_apply_nftables
     result="$(apply_proxy_profile_all warn system false true)"
     IFS=$'\t' read -r changed failed <<< "$result"
-    info "推荐低负载模式已应用：日志 warn、TUN system；软件源继续默认从入口机直出。成功 ${changed:-0} 个，失败 ${failed:-0} 个。"
+    info "推荐低负载模式已应用：日志 warn、TUN system；入口机直连分组设置保持不变。成功 ${changed:-0} 个，失败 ${failed:-0} 个。"
     [ "${failed:-0}" -eq 0 ] || warn "部分出口保留原配置，请在健康检测中查看服务状态。"
 }
 
@@ -3660,7 +4011,7 @@ restore_compatible_proxy_profile() {
     need_root
     load_config
     write_default_config
-    local result changed failed kernel_bypass="${PROXY_KERNEL_DIRECT_BYPASS:-true}" direct_note
+    local result changed failed kernel_bypass="${PROXY_KERNEL_DIRECT_BYPASS:-true}"
     set_config_value PROXY_LOG_LEVEL warn
     set_config_value PROXY_TUN_STACK mixed
     set_config_value PROXY_ENDPOINT_INDEPENDENT_NAT true
@@ -3671,9 +4022,7 @@ restore_compatible_proxy_profile() {
     result="$(apply_proxy_profile_all warn mixed true "$kernel_bypass")"
     do_apply_nftables
     IFS=$'\t' read -r changed failed <<< "$result"
-    direct_note="软件源仍按默认从入口机直出"
-    [ "$kernel_bypass" = "true" ] || direct_note="软件源遵循 config.env 高级关闭设置"
-    info "兼容模式已恢复：日志 warn、TUN mixed、独立 UDP NAT 开启；${direct_note}。成功 ${changed:-0} 个，失败 ${failed:-0} 个。"
+    info "兼容模式已恢复：日志 warn、TUN mixed、独立 UDP NAT 开启；入口机直连分组设置保持不变。成功 ${changed:-0} 个，失败 ${failed:-0} 个。"
 }
 
 write_ss_exit_files() {
@@ -6195,7 +6544,11 @@ EOF
     find "$SPLIT_RESOLVED_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
     if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ]; then
         ensure_proxy_direct_rule_source
-        split_parse_app_rules "$PROXY_DIRECT_APP_ID" || warn "内核直连缓存重建失败，软件源流量将暂时继续通过代理。"
+        if proxy_direct_any_enabled; then
+            split_parse_proxy_direct_rules || warn "入口机直连缓存重建失败，相关流量将暂时继续通过当前出口。"
+        else
+            clear_proxy_direct_resolved_cache
+        fi
     fi
     rm -f "$SPLIT_LAST_SYNC_FILE"
     do_apply_nftables
@@ -6250,6 +6603,12 @@ split_refresh_cached_dns() {
         [ -n "$app" ] || continue
         if [ "$app" = "$PROXY_DIRECT_APP_ID" ]; then
             ensure_proxy_direct_rule_source
+            if [ -s "$(split_raw_file "$app")" ] && split_parse_proxy_direct_rules; then
+                parsed=$((parsed + 1))
+            else
+                failed=$((failed + 1))
+            fi
+            continue
         fi
         if [ -s "$(split_raw_file "$app")" ] && split_parse_app_rules "$app"; then
             parsed=$((parsed + 1))
@@ -9487,20 +9846,18 @@ interactive_configure_proxy_exit() {
 }
 
 interactive_proxy_optimization_menu() {
-    local choice direct_status
+    local choice
     while :; do
         if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ] && command -v clear >/dev/null 2>&1; then
             clear
         fi
         load_config
-        direct_status="默认启用"
-        [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ] || direct_status="高级配置已关闭"
         cat <<EOF
 ============================================================
                  sing-box 多实例并发优化
 ============================================================
 当前默认: log=$PROXY_LOG_LEVEL  stack=$PROXY_TUN_STACK
-软件源默认入口机直出: $direct_status
+入口机直连: $(entry_direct_summary)
 
   1. 查看入口机与各出口并发健康
   2. 设置单个 sing-box 出口运行模式
@@ -9531,6 +9888,135 @@ EOF
                 pause_screen
                 ;;
             5) show_concurrency_capacity_advice; pause_screen ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入。"; sleep 1 ;;
+        esac
+    done
+}
+
+entry_direct_value_label() {
+    [ "${1:-false}" = "true" ] && printf '已开启' || printf '已关闭'
+}
+
+entry_direct_summary() {
+    printf '软件源=%s  BT/PT=%s  测速=%s\n' \
+        "$(entry_direct_value_label "${ENTRY_DIRECT_SOFTWARE:-true}")" \
+        "$(entry_direct_value_label "${ENTRY_DIRECT_BT_PT:-true}")" \
+        "$(entry_direct_value_label "${ENTRY_DIRECT_SPEEDTEST:-true}")"
+}
+
+set_entry_direct_group() {
+    need_root
+    load_config
+    write_default_config
+    local group="${1:-}" desired="${2:-}" key label result changed failed
+    case "$group" in
+        software) key="ENTRY_DIRECT_SOFTWARE"; label="软件源与开发平台" ;;
+        btpt) key="ENTRY_DIRECT_BT_PT"; label="BT/PT 站点与公共 Tracker" ;;
+        speedtest) key="ENTRY_DIRECT_SPEEDTEST"; label="测速网站" ;;
+        *) die "未知入口机直连分组: $group" ;;
+    esac
+    valid_bool_value "$desired" || die "入口机直连开关必须是 true 或 false。"
+
+    set_config_value "$key" "$desired"
+    case "$key" in
+        ENTRY_DIRECT_SOFTWARE) ENTRY_DIRECT_SOFTWARE="$desired" ;;
+        ENTRY_DIRECT_BT_PT) ENTRY_DIRECT_BT_PT="$desired" ;;
+        ENTRY_DIRECT_SPEEDTEST) ENTRY_DIRECT_SPEEDTEST="$desired" ;;
+    esac
+
+    mark_nft_pending
+    prepare_proxy_direct_rule_cache || die "入口机直连域名缓存生成失败，配置已保存；请稍后重新进入菜单应用。"
+    result="$(apply_proxy_profile_all "-" "-" "-" "${PROXY_KERNEL_DIRECT_BYPASS:-true}")"
+    IFS=$'\t' read -r changed failed <<< "$result"
+    do_apply_nftables
+
+    if [ "$desired" = "true" ]; then
+        info "$label 已开启，匹配流量默认从入口机直出。"
+    else
+        info "$label 已关闭，匹配流量将跟随容器当前出口。"
+    fi
+    [ "${failed:-0}" -eq 0 ] || warn "有 ${failed:-0} 个 sing-box 出口配置未能同步更新，请在并发健康页检查。"
+}
+
+set_all_entry_direct_groups() {
+    need_root
+    load_config
+    write_default_config
+    local desired="${1:-}" result changed failed
+    valid_bool_value "$desired" || die "入口机直连开关必须是 true 或 false。"
+    set_config_value ENTRY_DIRECT_SOFTWARE "$desired"
+    set_config_value ENTRY_DIRECT_BT_PT "$desired"
+    set_config_value ENTRY_DIRECT_SPEEDTEST "$desired"
+    ENTRY_DIRECT_SOFTWARE="$desired"
+    ENTRY_DIRECT_BT_PT="$desired"
+    ENTRY_DIRECT_SPEEDTEST="$desired"
+    mark_nft_pending
+    prepare_proxy_direct_rule_cache || die "入口机直连域名缓存生成失败，配置已保存；请稍后重新进入菜单应用。"
+    result="$(apply_proxy_profile_all "-" "-" "-" "${PROXY_KERNEL_DIRECT_BYPASS:-true}")"
+    IFS=$'\t' read -r changed failed <<< "$result"
+    do_apply_nftables
+    if [ "$desired" = "true" ]; then
+        info "三组默认入口机直连均已开启。"
+    else
+        info "三组默认入口机直连均已关闭，相关流量将跟随容器当前出口。"
+    fi
+    [ "${failed:-0}" -eq 0 ] || warn "有 ${failed:-0} 个 sing-box 出口配置未能同步更新，请在并发健康页检查。"
+}
+
+interactive_entry_direct_menu() {
+    local choice current
+    while :; do
+        if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ] && command -v clear >/dev/null 2>&1; then
+            clear
+        fi
+        load_config
+        cat <<EOF
+============================================================
+                     入口机直连
+============================================================
+关闭某组后，该组不再绕过出口，会跟随容器当前出口。
+管理员在“分流管理”中明确设置的入口机策略不受这里影响。
+
+  1. 软件源与开发平台       [$(entry_direct_value_label "$ENTRY_DIRECT_SOFTWARE")]
+  2. BT/PT 站点与 Tracker   [$(entry_direct_value_label "$ENTRY_DIRECT_BT_PT")]
+  3. 测速网站               [$(entry_direct_value_label "$ENTRY_DIRECT_SPEEDTEST")]
+  4. 全部开启
+  5. 全部关闭
+  0. 返回主菜单
+============================================================
+提示：BT/PT 网址和 Tracker 可以识别；DHT、磁力 Peer 的直接
+IP/随机端口流量无法仅靠域名规则完整识别，仍可能跟随当前出口。
+EOF
+        read -r -p "请输入选项 [0-5]: " choice
+        case "$choice" in
+            1)
+                current=true
+                [ "$ENTRY_DIRECT_SOFTWARE" = "true" ] && current=false
+                set_entry_direct_group software "$current"
+                pause_screen
+                ;;
+            2)
+                current=true
+                [ "$ENTRY_DIRECT_BT_PT" = "true" ] && current=false
+                set_entry_direct_group btpt "$current"
+                pause_screen
+                ;;
+            3)
+                current=true
+                [ "$ENTRY_DIRECT_SPEEDTEST" = "true" ] && current=false
+                set_entry_direct_group speedtest "$current"
+                pause_screen
+                ;;
+            4) set_all_entry_direct_groups true; pause_screen ;;
+            5)
+                if confirm_yes "确认关闭全部默认入口机直连吗？相关流量会改走容器当前出口"; then
+                    set_all_entry_direct_groups false
+                else
+                    info "已取消。"
+                fi
+                pause_screen
+                ;;
             0) return 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -10740,16 +11226,17 @@ interactive_menu() {
         printf '\n'
         printf '  %s【分流管理】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[12]%s 分流管理\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[13]%s 入口机直连\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【维护操作】%s\n' "$UI_CYAN" "$UI_RESET"
-        printf '    %s[13]%s 从 GitHub 安全更新          %s[14]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[15]%s 彻底卸载                    %s[16]%s 使用当前脚本安全更新\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[17]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[14]%s 从 GitHub 安全更新          %s[15]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[16]%s 彻底卸载                    %s[17]%s 使用当前脚本安全更新\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[18]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$UI_GREEN" "$UI_RESET"
         ui_line
-        read -r -p "请输入选项 [0-17]: " choice
+        read -r -p "请输入选项 [0-18]: " choice
         case "$choice" in
             1) interactive_install_host ;;
             2) interactive_status ;;
@@ -10763,11 +11250,12 @@ interactive_menu() {
             10) interactive_clear_container_out ;;
             11) interactive_switch_all_running_containers ;;
             12) interactive_split_menu ;;
-            13) update_from_github; exec "$INSTALL_BIN" menu ;;
-            14) interactive_restore ;;
-            15) interactive_uninstall ;;
-            16) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
-            17) interactive_proxy_optimization_menu ;;
+            13) interactive_entry_direct_menu ;;
+            14) update_from_github; exec "$INSTALL_BIN" menu ;;
+            15) interactive_restore ;;
+            16) interactive_uninstall ;;
+            17) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
+            18) interactive_proxy_optimization_menu ;;
             0) info "退出。"; exit 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -10786,8 +11274,9 @@ show_status_overview() {
     printf '自动授权出口: %s  默认出口: %s  自动注入: %s  客户端巡检: %ss\n' "$(allowed_exits_label "$AUTO_ALLOW_EXITS")" "$(display_exit_name "${AUTO_DEFAULT_EXIT:--}")" "$AUTO_INSTALL_CLIENT" "$AUTO_CLIENT_VERIFY_INTERVAL"
     printf '运行中容器: %s  查询并发: %s  注入并发: %s  事件去抖: %ss\n' "$AUTO_RUNNING_ONLY" "$AUTO_SYNC_WORKERS" "$AUTO_INJECT_WORKERS" "$AUTO_EVENT_DEBOUNCE"
     printf 'IP 完整复核: %ss  删除保护: %s 轮  最小同步间隔: %ss  命令超时: %ss\n' "$AUTO_STATE_REFRESH_INTERVAL" "$AUTO_DELETE_GRACE_SCANS" "$AUTO_RECONCILE_MIN_INTERVAL" "$AUTO_COMMAND_TIMEOUT"
-    printf 'sing-box 新出口默认: log=%s stack=%s EIM-NAT=%s  软件源入口机直出=%s\n' \
-        "$PROXY_LOG_LEVEL" "$PROXY_TUN_STACK" "$PROXY_ENDPOINT_INDEPENDENT_NAT" "$PROXY_KERNEL_DIRECT_BYPASS"
+    printf 'sing-box 新出口默认: log=%s stack=%s EIM-NAT=%s\n' \
+        "$PROXY_LOG_LEVEL" "$PROXY_TUN_STACK" "$PROXY_ENDPOINT_INDEPENDENT_NAT"
+    printf '入口机直连: %s\n' "$(entry_direct_summary)"
     if [ -e "$PENDING_NFT_FILE" ]; then
         printf '数据面状态: 待应用（服务重启或下一轮自动同步会重试）\n'
     else
@@ -10960,7 +11449,7 @@ show_concurrency_health() {
         printf 'Socket 摘要:\n'
         ss -s 2>/dev/null | sed -n '1,3p' | sed 's/^/  /' || true
     fi
-    printf '软件源入口机直出: %s\n' "${PROXY_KERNEL_DIRECT_BYPASS:-true}"
+    printf '入口机直连: %s\n' "$(entry_direct_summary)"
 
     printf '\n各 sing-box 出口:\n'
     while IFS=$'\t' read -r name mark table route4 route6 display; do
@@ -11242,10 +11731,10 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       修改单个 sing-box 出口，例如: proxy-profile jp warn system false
 
   $0 proxy-optimize
-      依次为所有 sing-box 出口应用推荐低负载模式；软件源继续默认从入口机直出。
+      依次为所有 sing-box 出口应用推荐低负载模式；入口机直连分组设置保持不变。
 
   $0 proxy-compatible
-      依次恢复兼容模式：warn、mixed、独立 UDP NAT；软件源仍默认从入口机直出。
+      依次恢复兼容模式：warn、mixed、独立 UDP NAT；入口机直连分组设置保持不变。
 
   $0 restore
       还原初始状态，停止并清空所有出口、分流、容器接管记录和容器内 out/token，但保留脚本与基础配置。
