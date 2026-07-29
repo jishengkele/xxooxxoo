@@ -165,7 +165,7 @@ need_cmd() {
 
 install_host_dependencies() {
     need_root
-    local missing="" cmd
+    local missing="" still_missing="" cmd
     for cmd in install python3 systemctl ip tc nft incus curl tar gzip awk mktemp flock sysctl conntrack sha256sum; do
         command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
     done
@@ -186,6 +186,22 @@ install_host_dependencies() {
     else
         warn "未识别包管理器，请手动安装缺失命令后重试:$missing"
     fi
+
+    for cmd in install python3 systemctl ip tc nft incus curl tar gzip awk mktemp flock sysctl conntrack sha256sum; do
+        command -v "$cmd" >/dev/null 2>&1 || still_missing="$still_missing $cmd"
+    done
+    [ -z "$still_missing" ] || die "依赖安装后仍缺少命令:$still_missing"
+}
+
+entry_direct_python_ready() {
+    command -v python3 >/dev/null 2>&1
+}
+
+ensure_entry_direct_dependencies() {
+    entry_direct_python_ready && return 0
+    info "入口机直连规则需要 python3，正在自动补齐基础依赖..."
+    install_host_dependencies
+    entry_direct_python_ready || die "python3 自动安装失败，请手动安装后重试。"
 }
 
 # 持久化转发所需内核参数，避免宿主机重启后 fwmark 路由因转发/rp_filter 失效。
@@ -9917,6 +9933,8 @@ set_entry_direct_group() {
         *) die "未知入口机直连分组: $group" ;;
     esac
     valid_bool_value "$desired" || die "入口机直连开关必须是 true 或 false。"
+    # 依赖必须在写配置之前准备完成，避免安装失败后出现“状态已切换、规则未应用”。
+    ensure_entry_direct_dependencies || die "入口机直连依赖准备失败，原开关状态保持不变。"
 
     set_config_value "$key" "$desired"
     case "$key" in
@@ -9945,6 +9963,7 @@ set_all_entry_direct_groups() {
     write_default_config
     local desired="${1:-}" result changed failed
     valid_bool_value "$desired" || die "入口机直连开关必须是 true 或 false。"
+    ensure_entry_direct_dependencies || die "入口机直连依赖准备失败，原开关状态保持不变。"
     set_config_value ENTRY_DIRECT_SOFTWARE "$desired"
     set_config_value ENTRY_DIRECT_BT_PT "$desired"
     set_config_value ENTRY_DIRECT_SPEEDTEST "$desired"
