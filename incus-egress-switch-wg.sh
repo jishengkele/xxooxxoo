@@ -53,6 +53,7 @@ UPDATE_BACKUP_ROOT="${EGRESS_UPDATE_BACKUP_ROOT:-/var/backups/$APP_NAME}"
 DEFAULT_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch-wg.sh"
 DEFAULT_SPLIT_RULE_BUNDLE_URL="https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Egress-Application-Rules.list"
 PROXY_TUN_MTU=1400
+PROXY_DIRECT_APP_ID="__proxy_direct"
 UPDATE_BACKUP_PATH=""
 UPDATE_BACKUP_ARCHIVE=""
 
@@ -574,6 +575,12 @@ load_config() {
     LIMIT_LATENCY="${LIMIT_LATENCY:-50ms}"
     SWITCH_CLEAR_CONNTRACK="${SWITCH_CLEAR_CONNTRACK:-true}"
     BLOCK_UNMANAGED_IPV6="${BLOCK_UNMANAGED_IPV6:-true}"
+    PROXY_LOG_LEVEL="${PROXY_LOG_LEVEL:-warn}"
+    PROXY_TUN_STACK="${PROXY_TUN_STACK:-mixed}"
+    PROXY_ENDPOINT_INDEPENDENT_NAT="${PROXY_ENDPOINT_INDEPENDENT_NAT:-true}"
+    PROXY_KERNEL_DIRECT_BYPASS="${PROXY_KERNEL_DIRECT_BYPASS:-true}"
+    PROXY_DIRECT_DEFAULT_MIGRATED="${PROXY_DIRECT_DEFAULT_MIGRATED:-false}"
+    CONCURRENCY_WARN_PERCENT="${CONCURRENCY_WARN_PERCENT:-80}"
     ENABLE_SPLIT_RULES="${ENABLE_SPLIT_RULES:-true}"
     SPLIT_RULE_BUNDLE_URL="${SPLIT_RULE_BUNDLE_URL:-$DEFAULT_SPLIT_RULE_BUNDLE_URL}"
     # 旧安装的 config.env 会覆盖新脚本默认值。即使尚未执行配置升级，
@@ -614,6 +621,27 @@ load_config() {
 
 valid_name() {
     [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]]
+}
+
+valid_bool_value() {
+    case "${1:-}" in
+        true|false) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+valid_proxy_log_level() {
+    case "${1:-}" in
+        trace|debug|info|warn|error|fatal|panic) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+valid_proxy_tun_stack() {
+    case "${1:-}" in
+        system|mixed|gvisor) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 valid_mark() {
@@ -887,6 +915,22 @@ SWITCH_CLEAR_CONNTRACK="true"
 # 是否阻止未纳入出口规则的公网 IPv6。
 # 默认开启，避免容器 IPv6 绕过 SS/TUN 出口直接暴露宿主机 IPv6。
 BLOCK_UNMANAGED_IPV6="true"
+
+# 新增 sing-box 出口的默认运行参数。已有出口不会在更新时被强制重启或改写，
+# 可在主菜单“sing-box 并发优化”中按出口应用。
+PROXY_LOG_LEVEL="warn"
+PROXY_TUN_STACK="mixed"
+PROXY_ENDPOINT_INDEPENDENT_NAT="true"
+
+# GitHub、Docker 和常用系统软件源默认由 nftables 提前识别并从入口机直出。
+# 特殊入口机无法直连这些软件源时，可在 config.env 高级设置中改为 false。
+PROXY_KERNEL_DIRECT_BYPASS="true"
+
+# 新默认值的一次性迁移标记。请勿手工删除，否则下次安全更新会再次恢复默认直出。
+PROXY_DIRECT_DEFAULT_MIGRATED="true"
+
+# 并发健康检查的告警阈值，只在手动查看时读取计数，不启动常驻扫描。
+CONCURRENCY_WARN_PERCENT="80"
 
 # 是否启用宿主机统一应用分流规则。
 ENABLE_SPLIT_RULES="true"
@@ -1192,6 +1236,9 @@ read_force_category_on_exit_policies() {
 read_enabled_split_app_ids() {
     local category source target app display app_category remote enabled
     {
+        if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ]; then
+            printf '%s\n' "$PROXY_DIRECT_APP_ID"
+        fi
         read_split_policies | awk -F '\t' '{print $1}'
         read_force_on_exit_policies | awk -F '\t' '{print $1}'
         while IFS=$'\t' read -r category source target; do
@@ -1267,6 +1314,17 @@ migrate_default_split_rule_url() {
     fi
 }
 
+migrate_proxy_direct_default() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    if ! grep -q '^PROXY_DIRECT_DEFAULT_MIGRATED=' "$CONFIG_FILE" 2>/dev/null; then
+        set_config_value PROXY_KERNEL_DIRECT_BYPASS true
+        set_config_value PROXY_DIRECT_DEFAULT_MIGRATED true
+        PROXY_KERNEL_DIRECT_BYPASS=true
+        PROXY_DIRECT_DEFAULT_MIGRATED=true
+        info "软件源流量已迁移为默认从入口机直出；特殊环境仍可在 config.env 高级关闭。"
+    fi
+}
+
 ensure_runtime_config_defaults() {
     ensure_config_default BRIDGE_IFACES "incusbr0 lxdbr0"
     ensure_config_default API_BIND "0.0.0.0"
@@ -1282,6 +1340,13 @@ ensure_runtime_config_defaults() {
     ensure_config_default LIMIT_LATENCY 50ms
     ensure_config_default SWITCH_CLEAR_CONNTRACK true
     ensure_config_default BLOCK_UNMANAGED_IPV6 true
+    ensure_config_default PROXY_LOG_LEVEL warn
+    ensure_config_default PROXY_TUN_STACK mixed
+    ensure_config_default PROXY_ENDPOINT_INDEPENDENT_NAT true
+    ensure_config_default PROXY_KERNEL_DIRECT_BYPASS true
+    migrate_proxy_direct_default
+    ensure_config_default PROXY_DIRECT_DEFAULT_MIGRATED true
+    ensure_config_default CONCURRENCY_WARN_PERCENT 80
     ensure_config_default ENABLE_SPLIT_RULES true
     ensure_config_default SPLIT_RULE_BUNDLE_URL "$DEFAULT_SPLIT_RULE_BUNDLE_URL"
     migrate_default_split_rule_url
@@ -1358,6 +1423,7 @@ upgrade_config_and_components() {
         ensure_runtime_config_defaults
         install_runtime_sysctls
         load_config
+        prepare_default_proxy_direct_bypass
         preflight_update_runtime
         do_apply
         mkdir -p "$LIB_DIR" "$RUN_DIR"
@@ -1795,6 +1861,12 @@ validate_runtime_config() {
     [ "$RULE_PRIORITY" -ge 1 ] && [ "$RULE_PRIORITY" -lt 4294967295 ] || die "策略路由优先级超出范围: $RULE_PRIORITY"
     [[ "$UPDATE_BACKUP_KEEP" =~ ^[0-9]+$ ]] && [ "$UPDATE_BACKUP_KEEP" -ge 1 ] && [ "$UPDATE_BACKUP_KEEP" -le 100 ] || die "更新备份保留数量必须是 1-100: $UPDATE_BACKUP_KEEP"
     [[ "$UPDATE_HEALTH_TIMEOUT" =~ ^[0-9]+$ ]] && [ "$UPDATE_HEALTH_TIMEOUT" -ge 5 ] && [ "$UPDATE_HEALTH_TIMEOUT" -le 600 ] || die "更新健康检查超时必须是 5-600 秒: $UPDATE_HEALTH_TIMEOUT"
+    valid_proxy_log_level "$PROXY_LOG_LEVEL" || die "sing-box 日志等级无效: $PROXY_LOG_LEVEL"
+    valid_proxy_tun_stack "$PROXY_TUN_STACK" || die "sing-box TUN 栈无效: $PROXY_TUN_STACK"
+    valid_bool_value "$PROXY_ENDPOINT_INDEPENDENT_NAT" || die "PROXY_ENDPOINT_INDEPENDENT_NAT 必须是 true 或 false"
+    valid_bool_value "$PROXY_KERNEL_DIRECT_BYPASS" || die "PROXY_KERNEL_DIRECT_BYPASS 必须是 true 或 false"
+    valid_bool_value "$PROXY_DIRECT_DEFAULT_MIGRATED" || die "PROXY_DIRECT_DEFAULT_MIGRATED 必须是 true 或 false"
+    [[ "$CONCURRENCY_WARN_PERCENT" =~ ^[0-9]+$ ]] && [ "$CONCURRENCY_WARN_PERCENT" -ge 50 ] && [ "$CONCURRENCY_WARN_PERCENT" -le 99 ] || die "并发健康告警阈值必须是 50-99: $CONCURRENCY_WARN_PERCENT"
     bridge_set_expr >/dev/null
 }
 
@@ -2275,7 +2347,7 @@ build_nft_file() {
     local keys4_line="" keys6_line="" elems4_line="" elems6_line="" managed4_line="" managed6_line=""
     local split4="" split6="" split4_line="" split6_line=""
     local block_unmanaged6_line=""
-    local split_sets="" split_rules="" force_split_rules="" conditional_force_rules="" container_split_rules="" bridge_expr app target policy_targets safe v4file v6file domains_file v4elems v6elems v4elements_line v6elements_line split_mark
+    local split_sets="" split_rules="" force_split_rules="" conditional_force_rules="" container_split_rules="" proxy_direct_rules="" bridge_expr app target policy_targets safe v4file v6file domains_file v4elems v6elems v4elements_line v6elements_line split_mark
     local container cip source category display app_category remote enabled
     local tunnel_mss_rules="" tunnel_mss_seen=$'\n' exit_name exit_route4 exit_route6 exit_route exit_dev exit_conf tunnel_mtu tunnel_mtu_default tunnel_mss _exit_mark _exit_table _exit_display
     bridge_expr="$(bridge_set_expr)"
@@ -2582,6 +2654,20 @@ $v6elements_line
             fi
         done < <(read_split_policies)
     fi
+    if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ] && [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ]; then
+        split_nft_name_into safe "$PROXY_DIRECT_APP_ID"
+        v4file="$(split_resolved_v4_file "$PROXY_DIRECT_APP_ID")"
+        v6file="$(split_resolved_v6_file "$PROXY_DIRECT_APP_ID")"
+        domains_file="$SPLIT_RESOLVED_DIR/$PROXY_DIRECT_APP_ID.domains"
+        if [ -s "$v4file" ] || [ -s "$domains_file" ]; then
+            proxy_direct_rules="$proxy_direct_rules    iifname { $bridge_expr } ip saddr @managed4_keys ip daddr @split4_$safe return
+"
+        fi
+        if [ -s "$v6file" ] || [ -s "$domains_file" ]; then
+            proxy_direct_rules="$proxy_direct_rules    iifname { $bridge_expr } ip6 saddr @managed6_keys ip6 daddr @split6_$safe return
+"
+        fi
+    fi
     if [ "${BLOCK_UNMANAGED_IPV6:-true}" = "true" ]; then
         block_unmanaged6_line="    iifname { $bridge_expr } ip6 saddr != @managed6_keys drop"
     fi
@@ -2638,7 +2724,7 @@ $split_sets
     iifname { $bridge_expr } ct status dnat return
     iifname { $bridge_expr } ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16 } return
     iifname { $bridge_expr } ip6 daddr { ::1/128, fc00::/7, fe80::/10, ff00::/8 } return
-$force_split_rules$conditional_force_rules$container_split_rules$split_rules    iifname { $bridge_expr } ip saddr @egress4_keys meta mark set ip saddr map @egress4
+$force_split_rules$conditional_force_rules$container_split_rules$split_rules$proxy_direct_rules    iifname { $bridge_expr } ip saddr @egress4_keys meta mark set ip saddr map @egress4
     iifname { $bridge_expr } ip6 saddr @egress6_keys meta mark set ip6 saddr map @egress6
 $block_unmanaged6_line
   }
@@ -3114,8 +3200,76 @@ EOF
     chmod 755 "$resolved_guard"
 }
 
+ensure_proxy_direct_rule_source() {
+    local raw tmp
+    raw="$(split_raw_file "$PROXY_DIRECT_APP_ID")"
+    tmp="$(mktemp)"
+    mkdir -p "$SPLIT_RAW_DIR" "$SPLIT_RESOLVED_DIR"
+    cat > "$tmp" <<'EOF'
+# sing-box 高并发模式：由 nftables 提前直连的软件源与开发平台。
+DOMAIN-SUFFIX,github.com
+DOMAIN-SUFFIX,githubusercontent.com
+DOMAIN-SUFFIX,githubassets.com
+DOMAIN-SUFFIX,github.io
+DOMAIN-SUFFIX,docker.io
+DOMAIN-SUFFIX,docker.com
+DOMAIN-SUFFIX,dockerhub.com
+DOMAIN-SUFFIX,debian.org
+DOMAIN-SUFFIX,ubuntu.com
+DOMAIN-SUFFIX,canonical.com
+DOMAIN-SUFFIX,centos.org
+DOMAIN-SUFFIX,fedoraproject.org
+DOMAIN-SUFFIX,redhat.com
+DOMAIN-SUFFIX,alpinelinux.org
+DOMAIN-SUFFIX,archlinux.org
+DOMAIN-SUFFIX,npmjs.org
+DOMAIN-SUFFIX,npmjs.com
+DOMAIN-SUFFIX,yarnpkg.com
+DOMAIN-SUFFIX,pypi.org
+DOMAIN-SUFFIX,pythonhosted.org
+DOMAIN-SUFFIX,golang.org
+DOMAIN-SUFFIX,go.dev
+DOMAIN,proxy.golang.org
+DOMAIN-SUFFIX,maven.org
+DOMAIN-SUFFIX,mvnrepository.com
+DOMAIN-SUFFIX,rubygems.org
+DOMAIN-SUFFIX,crates.io
+DOMAIN-SUFFIX,packagist.org
+DOMAIN-SUFFIX,cloudflare.com
+DOMAIN-SUFFIX,fastly.net
+DOMAIN-SUFFIX,akamai.net
+EOF
+    if [ ! -f "$raw" ] || ! cmp -s "$tmp" "$raw"; then
+        install -m 0600 "$tmp" "$raw"
+        rm -f "$(split_resolved_v4_file "$PROXY_DIRECT_APP_ID")" \
+            "$(split_resolved_v6_file "$PROXY_DIRECT_APP_ID")" \
+            "$SPLIT_RESOLVED_DIR/$PROXY_DIRECT_APP_ID.domains" \
+            "$SPLIT_RESOLVED_DIR/$PROXY_DIRECT_APP_ID.unsupported" \
+            "$SPLIT_RESOLVED_DIR/$PROXY_DIRECT_APP_ID.stats"
+    fi
+    rm -f "$tmp"
+}
+
+prepare_proxy_direct_rule_cache() {
+    split_cache_lock_acquire
+    ensure_proxy_direct_rule_source
+    if ! split_parse_app_rules "$PROXY_DIRECT_APP_ID"; then
+        split_cache_lock_release
+        return 1
+    fi
+    split_cache_lock_release
+}
+
+prepare_default_proxy_direct_bypass() {
+    [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ] || return 0
+    if ! prepare_proxy_direct_rule_cache; then
+        warn "软件源入口机直连缓存暂未准备完成；已保留配置，后续规则刷新会再次尝试。"
+    fi
+}
+
 proxy_split_rules() {
     [ "${ENABLE_SPLIT_RULES:-true}" = "true" ] || return 0
+    [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" != "true" ] || return 0
     cat <<'EOF'
       { "domain_suffix": ["github.com", "githubusercontent.com", "githubassets.com", "github.io"], "action": "route", "outbound": "direct" },
       { "domain_suffix": ["docker.io", "docker.com", "dockerhub.com"], "action": "route", "outbound": "direct" },
@@ -3192,7 +3346,11 @@ EOF
 
 write_proxy_exit_files() {
     local protocol="$1" name="$2" server="$3" port="$4" table="$5" tun="$6" method="${7:-}" password="${8:-}" username="${9:-}"
-    local conf_dir conf service resolved_guard server_esc outbound_json split_rules domain_route proxy_direct_rule v4_octet v6_suffix
+    local conf_dir conf service resolved_guard server_esc outbound_json split_rules sniff_rule domain_route proxy_direct_rule v4_octet v6_suffix
+    local proxy_log_level="${PROXY_LOG_LEVEL:-warn}" proxy_tun_stack="${PROXY_TUN_STACK:-mixed}" proxy_eim="${PROXY_ENDPOINT_INDEPENDENT_NAT:-true}"
+    valid_proxy_log_level "$proxy_log_level" || proxy_log_level="warn"
+    valid_proxy_tun_stack "$proxy_tun_stack" || proxy_tun_stack="mixed"
+    valid_bool_value "$proxy_eim" || proxy_eim="true"
     conf_dir="$EXIT_DIR/$name"
     conf="$conf_dir/config.json"
     service="$SYSTEMD_DIR/${EXIT_SERVICE_PREFIX}-${name}.service"
@@ -3200,6 +3358,10 @@ write_proxy_exit_files() {
     server_esc=$(json_escape "$server")
     outbound_json=$(proxy_outbound_json "$protocol" "$server" "$port" "$method" "$password" "$username")
     split_rules=$(proxy_split_rules)
+    sniff_rule=""
+    if [ -n "$split_rules" ]; then
+        sniff_rule='      { "inbound": ["tun-in"], "action": "sniff" },'
+    fi
     domain_route=""
     proxy_direct_rule=""
     if is_ipv4 "$server"; then
@@ -3216,7 +3378,7 @@ write_proxy_exit_files() {
     cat > "$conf" <<EOF
 {
   "log": {
-    "level": "info",
+    "level": "$proxy_log_level",
     "timestamp": true
   },
   "dns": {
@@ -3238,10 +3400,10 @@ write_proxy_exit_files() {
       "interface_name": "$tun",
       "address": ["172.31.${v4_octet}.1/30", "fd7a:636c:7368:${v6_suffix}::1/126"],
       "mtu": $PROXY_TUN_MTU,
-      "stack": "mixed",
+      "stack": "$proxy_tun_stack",
       "auto_route": false,
       "strict_route": false,
-      "endpoint_independent_nat": true
+      "endpoint_independent_nat": $proxy_eim
     }
   ],
   "outbounds": [
@@ -3256,7 +3418,7 @@ $outbound_json,
     "auto_detect_interface": true,
     "default_domain_resolver": { "server": "cf_v4", "strategy": "prefer_ipv4" },
     "rules": [
-      { "inbound": ["tun-in"], "action": "sniff" },
+$sniff_rule
       { "protocol": "dns", "action": "hijack-dns" },
 $proxy_direct_rule
 $domain_route
@@ -3306,6 +3468,212 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+proxy_config_runtime_values() {
+    local name="$1" conf="$EXIT_DIR/$name/config.json"
+    [ -s "$conf" ] || return 1
+    python3 - "$conf" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+level = str(data.get("log", {}).get("level", "info"))
+tun = next((item for item in data.get("inbounds", []) if item.get("type") == "tun"), {})
+proxy = next((item for item in data.get("outbounds", []) if item.get("tag") == "proxy"), {})
+stack = str(tun.get("stack", "mixed"))
+eim = "true" if bool(tun.get("endpoint_independent_nat", True)) else "false"
+mtu = str(tun.get("mtu", ""))
+protocol = str(proxy.get("type", "unknown"))
+server = str(proxy.get("server", ""))
+port = str(proxy.get("server_port", ""))
+print("\t".join((level, stack, eim, mtu, protocol, server, port)))
+PY
+}
+
+proxy_exit_interface() {
+    local name="$1" row route4 route6
+    row="$(exit_row "$name")"
+    [ -n "$row" ] || return 1
+    IFS=$'\t' read -r _name _mark _table route4 route6 _display <<< "$row"
+    case "$route4" in dev:csh-*) printf '%s\n' "${route4#dev:}"; return 0 ;; esac
+    case "$route6" in dev:csh-*) printf '%s\n' "${route6#dev:}"; return 0 ;; esac
+    return 1
+}
+
+is_proxy_exit() {
+    local name="$1"
+    [ -s "$EXIT_DIR/$name/config.json" ] && proxy_exit_interface "$name" >/dev/null 2>&1
+}
+
+patch_proxy_exit_config() {
+    local name="$1" new_level="${2:--}" new_stack="${3:--}" new_eim="${4:--}" kernel_bypass="${5:-${PROXY_KERNEL_DIRECT_BYPASS:-true}}"
+    local conf="$EXIT_DIR/$name/config.json" backup service iface was_active="false"
+    [ -s "$conf" ] || die "出口 $name 不是脚本托管的 sing-box 出口。"
+    [ "$new_level" = "-" ] || valid_proxy_log_level "$new_level" || die "sing-box 日志等级无效: $new_level"
+    [ "$new_stack" = "-" ] || valid_proxy_tun_stack "$new_stack" || die "sing-box TUN 栈无效: $new_stack"
+    [ "$new_eim" = "-" ] || valid_bool_value "$new_eim" || die "独立 UDP NAT 参数必须是 true 或 false。"
+    valid_bool_value "$kernel_bypass" || die "内核直连参数必须是 true 或 false。"
+    backup="$(mktemp)"
+    cp "$conf" "$backup"
+    if ! python3 - "$conf" "$new_level" "$new_stack" "$new_eim" "$kernel_bypass" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+path, level, stack, eim, kernel_bypass = sys.argv[1:6]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+
+if level != "-":
+    data.setdefault("log", {})["level"] = level
+
+tun = next((item for item in data.get("inbounds", []) if item.get("type") == "tun"), None)
+if tun is None:
+    raise SystemExit("配置中没有 TUN 入站")
+if stack != "-":
+    tun["stack"] = stack
+if eim != "-":
+    tun["endpoint_independent_nat"] = eim == "true"
+
+groups = [
+    ["github.com", "githubusercontent.com", "githubassets.com", "github.io"],
+    ["docker.io", "docker.com", "dockerhub.com"],
+    ["debian.org", "ubuntu.com", "canonical.com"],
+    ["centos.org", "fedoraproject.org", "redhat.com"],
+    ["alpinelinux.org", "archlinux.org"],
+    ["npmjs.org", "npmjs.com", "yarnpkg.com"],
+    ["pypi.org", "pythonhosted.org"],
+    ["golang.org", "go.dev", "proxy.golang.org"],
+    ["maven.org", "mvnrepository.com"],
+    ["rubygems.org", "crates.io", "packagist.org"],
+    ["cloudflare.com", "fastly.net", "akamai.net"],
+]
+route = data.setdefault("route", {})
+rules = route.setdefault("rules", [])
+
+def is_builtin_direct(rule):
+    suffixes = rule.get("domain_suffix")
+    return (
+        isinstance(suffixes, list)
+        and rule.get("action") == "route"
+        and rule.get("outbound") == "direct"
+        and any(set(suffixes) == set(group) for group in groups)
+    )
+
+def is_tun_sniff(rule):
+    return (
+        rule.get("action") == "sniff"
+        and isinstance(rule.get("inbound"), list)
+        and "tun-in" in rule["inbound"]
+    )
+
+rules = [rule for rule in rules if not is_builtin_direct(rule) and not is_tun_sniff(rule)]
+if kernel_bypass != "true":
+    rules.insert(0, {"inbound": ["tun-in"], "action": "sniff"})
+    insert_at = 2 if len(rules) > 1 and rules[1].get("protocol") == "dns" else 1
+    for group in reversed(groups):
+        rules.insert(insert_at, {"domain_suffix": group, "action": "route", "outbound": "direct"})
+route["rules"] = rules
+
+directory = os.path.dirname(path)
+fd, staged = tempfile.mkstemp(prefix=".config.", suffix=".json", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(staged, 0o600)
+    os.replace(staged, path)
+finally:
+    try:
+        os.unlink(staged)
+    except FileNotFoundError:
+        pass
+PY
+    then
+        install -m 0600 "$backup" "$conf"
+        rm -f "$backup"
+        die "修改 sing-box 出口 $name 的运行参数失败，已保留原配置。"
+    fi
+    if ! "$SINGBOX_BIN" check -c "$conf" >/dev/null 2>&1; then
+        install -m 0600 "$backup" "$conf"
+        rm -f "$backup"
+        die "修改后的 sing-box 配置校验失败，已恢复出口 $name。"
+    fi
+
+    service="${EXIT_SERVICE_PREFIX}-${name}"
+    iface="$(proxy_exit_interface "$name" || true)"
+    systemctl is-active --quiet "$service" 2>/dev/null && was_active="true"
+    if [ "$was_active" = "true" ]; then
+        if ! systemctl restart "$service" || { [ -n "$iface" ] && ! wait_for_iface "$iface"; }; then
+            install -m 0600 "$backup" "$conf"
+            systemctl restart "$service" >/dev/null 2>&1 || true
+            rm -f "$backup"
+            die "出口 $name 重启失败，已恢复原配置。"
+        fi
+    fi
+    rm -f "$backup"
+}
+
+apply_proxy_profile_all() {
+    local level="$1" stack="$2" eim="$3" kernel_bypass="$4"
+    local name _mark _table _route4 _route6 display changed=0 failed=0
+    while IFS=$'\t' read -r name _mark _table _route4 _route6 display; do
+        is_proxy_exit "$name" || continue
+        if (patch_proxy_exit_config "$name" "$level" "$stack" "$eim" "$kernel_bypass"); then
+            changed=$((changed + 1))
+        else
+            failed=$((failed + 1))
+            warn "出口 ${display:-$name} 的运行模式更新失败，其他出口继续处理。"
+        fi
+    done < <(read_exit_rows)
+    printf '%s\t%s\n' "$changed" "$failed"
+}
+
+apply_recommended_proxy_profile() {
+    need_root
+    load_config
+    write_default_config
+    local result changed failed
+    info "正在准备软件源入口机直出缓存..."
+    prepare_proxy_direct_rule_cache || die "软件源域名缓存准备失败，未修改出口运行模式。"
+    set_config_value PROXY_LOG_LEVEL warn
+    set_config_value PROXY_TUN_STACK system
+    set_config_value PROXY_ENDPOINT_INDEPENDENT_NAT false
+    set_config_value PROXY_KERNEL_DIRECT_BYPASS true
+    PROXY_LOG_LEVEL=warn
+    PROXY_TUN_STACK=system
+    PROXY_ENDPOINT_INDEPENDENT_NAT=false
+    PROXY_KERNEL_DIRECT_BYPASS=true
+    do_apply_nftables
+    result="$(apply_proxy_profile_all warn system false true)"
+    IFS=$'\t' read -r changed failed <<< "$result"
+    info "推荐低负载模式已应用：日志 warn、TUN system；软件源继续默认从入口机直出。成功 ${changed:-0} 个，失败 ${failed:-0} 个。"
+    [ "${failed:-0}" -eq 0 ] || warn "部分出口保留原配置，请在健康检测中查看服务状态。"
+}
+
+restore_compatible_proxy_profile() {
+    need_root
+    load_config
+    write_default_config
+    local result changed failed kernel_bypass="${PROXY_KERNEL_DIRECT_BYPASS:-true}" direct_note
+    set_config_value PROXY_LOG_LEVEL warn
+    set_config_value PROXY_TUN_STACK mixed
+    set_config_value PROXY_ENDPOINT_INDEPENDENT_NAT true
+    PROXY_LOG_LEVEL=warn
+    PROXY_TUN_STACK=mixed
+    PROXY_ENDPOINT_INDEPENDENT_NAT=true
+    prepare_default_proxy_direct_bypass
+    result="$(apply_proxy_profile_all warn mixed true "$kernel_bypass")"
+    do_apply_nftables
+    IFS=$'\t' read -r changed failed <<< "$result"
+    direct_note="软件源仍按默认从入口机直出"
+    [ "$kernel_bypass" = "true" ] || direct_note="软件源遵循 config.env 高级关闭设置"
+    info "兼容模式已恢复：日志 warn、TUN mixed、独立 UDP NAT 开启；${direct_note}。成功 ${changed:-0} 个，失败 ${failed:-0} 个。"
 }
 
 write_ss_exit_files() {
@@ -5825,6 +6193,10 @@ EOF
     mkdir -p "$SPLIT_RAW_DIR" "$SPLIT_RESOLVED_DIR"
     find "$SPLIT_RAW_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
     find "$SPLIT_RESOLVED_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+    if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ]; then
+        ensure_proxy_direct_rule_source
+        split_parse_app_rules "$PROXY_DIRECT_APP_ID" || warn "内核直连缓存重建失败，软件源流量将暂时继续通过代理。"
+    fi
     rm -f "$SPLIT_LAST_SYNC_FILE"
     do_apply_nftables
     state_lock_release
@@ -5876,6 +6248,9 @@ split_refresh_cached_dns() {
     split_cache_lock_acquire
     while IFS= read -r app; do
         [ -n "$app" ] || continue
+        if [ "$app" = "$PROXY_DIRECT_APP_ID" ]; then
+            ensure_proxy_direct_rule_source
+        fi
         if [ -s "$(split_raw_file "$app")" ] && split_parse_app_rules "$app"; then
             parsed=$((parsed + 1))
         else
@@ -7864,6 +8239,7 @@ install_host() {
     write_default_config
     ensure_runtime_config_defaults
     load_config
+    prepare_default_proxy_direct_bypass
     if command -v systemctl >/dev/null 2>&1; then
         systemctl is-active --quiet "$APP_NAME-autosync" && autosync_was_active="true"
         systemctl stop "$APP_NAME-autosync" "$APP_NAME" 2>/dev/null || true
@@ -8764,7 +9140,7 @@ print_exit_summary() {
 
 list_exits() {
     load_config
-    local name mark table route4 route6 display status down up count=0
+    local name mark table route4 route6 display status down up count=0 values level stack eim mtu protocol server port
     printf '\n已添加出口信息:\n'
     while IFS=$'\t' read -r name mark table route4 route6 display; do
         [ -n "$name" ] || continue
@@ -8779,6 +9155,12 @@ list_exits() {
         printf '     fwmark: %s  路由表: %s\n' "$mark" "$table"
         printf '     IPv4路由: %s\n' "$route4"
         printf '     IPv6路由: %s\n' "$route6"
+        if is_proxy_exit "$name"; then
+            values="$(proxy_config_runtime_values "$name" 2>/dev/null || true)"
+            IFS=$'\t' read -r level stack eim mtu protocol server port <<< "$values"
+            printf '     sing-box: %s %s:%s  log=%s stack=%s EIM-NAT=%s MTU=%s\n' \
+                "$protocol" "$server" "$port" "$level" "$stack" "$eim" "$mtu"
+        fi
         print_wireguard_exit_details "$name" "$route4" "$route6" '     '
         down="$(exit_limit_down "$name")"
         up="$(exit_limit_up "$name")"
@@ -8888,10 +9270,11 @@ interactive_status() {
   5. 策略路由
   6. nftables 规则
   7. 服务状态
+  8. 入口机与 sing-box 并发健康
   0. 返回主菜单
 ============================================================
 EOF
-        read -r -p "请输入选项 [0-7]: " choice
+        read -r -p "请输入选项 [0-8]: " choice
         case "$choice" in
             1) show_status_overview; pause_screen ;;
             2) show_status_exits; pause_screen ;;
@@ -8900,6 +9283,7 @@ EOF
             5) show_status_routes; pause_screen ;;
             6) show_status_nft; pause_screen ;;
             7) show_status_services; pause_screen ;;
+            8) show_concurrency_health; pause_screen ;;
             0) return 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -9035,6 +9419,122 @@ choose_host_exit() {
     rm -f "$tmp"
     [ -n "$target" ] || return 1
     printf '%s\n' "$target" > "$out_file"
+}
+
+choose_proxy_exit() {
+    local out_file="$1" tmp pick target i=1 name mark table route4 route6 display
+    [ -n "$out_file" ] || return 1
+    tmp="$(mktemp)"
+    while IFS=$'\t' read -r name mark table route4 route6 display; do
+        is_proxy_exit "$name" || continue
+        printf '%s\t%s\n' "$name" "${display:-$name}" >> "$tmp"
+    done < <(read_exit_rows)
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        warn "暂无脚本托管的 sing-box 出口。"
+        return 1
+    fi
+    printf '\n请选择 sing-box 出口:\n'
+    printf '  0. 返回上一步\n'
+    while IFS=$'\t' read -r name display; do
+        printf '  %s. %s\n' "$i" "$display"
+        i=$((i + 1))
+    done < "$tmp"
+    read -r -p "请输入序号或出口名: " pick
+    case "$pick" in
+        ""|0) target="" ;;
+        *[!0-9]*) target="$(awk -F '\t' -v p="$pick" '$1 == p || $2 == p {print $1; exit}' "$tmp")" ;;
+        *) target="$(sed -n "${pick}p" "$tmp" | awk -F '\t' '{print $1}')" ;;
+    esac
+    rm -f "$tmp"
+    [ -n "$target" ] || return 1
+    printf '%s\n' "$target" > "$out_file"
+}
+
+interactive_configure_proxy_exit() {
+    local choice_file name values level stack eim mtu protocol server port mode new_level new_stack new_eim
+    choice_file="/tmp/incus-egress-proxy-choice.$$"
+    if ! choose_proxy_exit "$choice_file"; then
+        rm -f "$choice_file"
+        return 0
+    fi
+    name="$(cat "$choice_file")"
+    rm -f "$choice_file"
+    values="$(proxy_config_runtime_values "$name")"
+    IFS=$'\t' read -r level stack eim mtu protocol server port <<< "$values"
+    printf '\n当前出口: %s\n' "$(display_exit_name "$name")"
+    printf '协议/节点: %s %s:%s\n' "$protocol" "$server" "$port"
+    printf '当前参数: log=%s stack=%s endpoint-independent-nat=%s MTU=%s\n\n' "$level" "$stack" "$eim" "$mtu"
+    printf '  1. 低负载模式（warn + system；适合 TCP/网页/下载为主）\n'
+    printf '  2. 兼容模式（warn + mixed + 独立 UDP NAT）\n'
+    printf '  3. 自定义参数\n'
+    printf '  0. 返回\n'
+    read -r -p "请选择 [1]: " mode
+    mode="${mode:-1}"
+    case "$mode" in
+        0) return 0 ;;
+        1) new_level="warn"; new_stack="system"; new_eim="false" ;;
+        2) new_level="warn"; new_stack="mixed"; new_eim="true" ;;
+        3)
+            new_level="$(prompt_default "日志等级 trace/debug/info/warn/error" "$level")"
+            new_stack="$(prompt_default "TUN 栈 system/mixed/gvisor" "$stack")"
+            new_eim="$(prompt_default "独立 UDP NAT true/false" "$eim")"
+            ;;
+        *) warn "无效选择。"; return 0 ;;
+    esac
+    patch_proxy_exit_config "$name" "$new_level" "$new_stack" "$new_eim" "${PROXY_KERNEL_DIRECT_BYPASS:-true}"
+    info "出口 $(display_exit_name "$name") 已更新并完成配置校验。"
+}
+
+interactive_proxy_optimization_menu() {
+    local choice direct_status
+    while :; do
+        if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ] && command -v clear >/dev/null 2>&1; then
+            clear
+        fi
+        load_config
+        direct_status="默认启用"
+        [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ] || direct_status="高级配置已关闭"
+        cat <<EOF
+============================================================
+                 sing-box 多实例并发优化
+============================================================
+当前默认: log=$PROXY_LOG_LEVEL  stack=$PROXY_TUN_STACK
+软件源默认入口机直出: $direct_status
+
+  1. 查看入口机与各出口并发健康
+  2. 设置单个 sing-box 出口运行模式
+  3. 全部应用推荐低负载模式
+  4. 全部恢复兼容模式
+  5. 查看 conntrack 与临时端口容量建议
+  0. 返回主菜单
+============================================================
+EOF
+        read -r -p "请输入选项 [0-5]: " choice
+        case "$choice" in
+            1) show_concurrency_health; pause_screen ;;
+            2) interactive_configure_proxy_exit; pause_screen ;;
+            3)
+                if confirm_yes "确认依次重启全部 sing-box 出口并应用推荐低负载模式吗"; then
+                    apply_recommended_proxy_profile
+                else
+                    info "已取消。"
+                fi
+                pause_screen
+                ;;
+            4)
+                if confirm_yes "确认依次重启全部 sing-box 出口并恢复兼容模式吗"; then
+                    restore_compatible_proxy_profile
+                else
+                    info "已取消。"
+                fi
+                pause_screen
+                ;;
+            5) show_concurrency_capacity_advice; pause_screen ;;
+            0) return 0 ;;
+            *) warn "无效选项，请重新输入。"; sleep 1 ;;
+        esac
+    done
 }
 
 interactive_set_exit_limit() {
@@ -10244,11 +10744,12 @@ interactive_menu() {
         printf '  %s【维护操作】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[13]%s 从 GitHub 安全更新          %s[14]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
         printf '    %s[15]%s 彻底卸载                    %s[16]%s 使用当前脚本安全更新\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[17]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$UI_GREEN" "$UI_RESET"
         ui_line
-        read -r -p "请输入选项 [0-16]: " choice
+        read -r -p "请输入选项 [0-17]: " choice
         case "$choice" in
             1) interactive_install_host ;;
             2) interactive_status ;;
@@ -10266,6 +10767,7 @@ interactive_menu() {
             14) interactive_restore ;;
             15) interactive_uninstall ;;
             16) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
+            17) interactive_proxy_optimization_menu ;;
             0) info "退出。"; exit 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -10284,6 +10786,8 @@ show_status_overview() {
     printf '自动授权出口: %s  默认出口: %s  自动注入: %s  客户端巡检: %ss\n' "$(allowed_exits_label "$AUTO_ALLOW_EXITS")" "$(display_exit_name "${AUTO_DEFAULT_EXIT:--}")" "$AUTO_INSTALL_CLIENT" "$AUTO_CLIENT_VERIFY_INTERVAL"
     printf '运行中容器: %s  查询并发: %s  注入并发: %s  事件去抖: %ss\n' "$AUTO_RUNNING_ONLY" "$AUTO_SYNC_WORKERS" "$AUTO_INJECT_WORKERS" "$AUTO_EVENT_DEBOUNCE"
     printf 'IP 完整复核: %ss  删除保护: %s 轮  最小同步间隔: %ss  命令超时: %ss\n' "$AUTO_STATE_REFRESH_INTERVAL" "$AUTO_DELETE_GRACE_SCANS" "$AUTO_RECONCILE_MIN_INTERVAL" "$AUTO_COMMAND_TIMEOUT"
+    printf 'sing-box 新出口默认: log=%s stack=%s EIM-NAT=%s  软件源入口机直出=%s\n' \
+        "$PROXY_LOG_LEVEL" "$PROXY_TUN_STACK" "$PROXY_ENDPOINT_INDEPENDENT_NAT" "$PROXY_KERNEL_DIRECT_BYPASS"
     if [ -e "$PENDING_NFT_FILE" ]; then
         printf '数据面状态: 待应用（服务重启或下一轮自动同步会重试）\n'
     else
@@ -10303,7 +10807,7 @@ show_status_exits() {
     printf '============================================================\n'
     printf '                       出口状态\n'
     printf '============================================================\n'
-    local exit_name exit_mark exit_table exit_route4 exit_route6 exit_display
+    local exit_name exit_mark exit_table exit_route4 exit_route6 exit_display values level stack eim mtu protocol server port
     if [ -z "$(read_exit_rows)" ]; then
         printf '暂无出口。\n'
         return 0
@@ -10312,6 +10816,12 @@ show_status_exits() {
         [ -n "$exit_name" ] || continue
         printf '  %s\tid=%s\tmark=%s\ttable=%s\troute4=%s\troute6=%s\n' \
             "${exit_display:-$exit_name}" "$exit_name" "$exit_mark" "$exit_table" "$exit_route4" "$exit_route6"
+        if is_proxy_exit "$exit_name"; then
+            values="$(proxy_config_runtime_values "$exit_name" 2>/dev/null || true)"
+            IFS=$'\t' read -r level stack eim mtu protocol server port <<< "$values"
+            printf '    sing-box: %s %s:%s  log=%s stack=%s EIM-NAT=%s MTU=%s\n' \
+                "$protocol" "$server" "$port" "$level" "$stack" "$eim" "$mtu"
+        fi
         print_wireguard_exit_details "$exit_name" "$exit_route4" "$exit_route6" '    '
     done < <(read_exit_rows)
 }
@@ -10379,6 +10889,150 @@ show_status_services() {
     else
         printf '当前系统未使用 systemd。\n'
     fi
+}
+
+percent_value() {
+    local used="${1:-0}" total="${2:-0}"
+    if [[ "$used" =~ ^[0-9]+$ ]] && [[ "$total" =~ ^[0-9]+$ ]] && [ "$total" -gt 0 ]; then
+        awk -v used="$used" -v total="$total" 'BEGIN {printf "%.1f", used * 100 / total}'
+    else
+        printf '0.0'
+    fi
+}
+
+read_counter_file() {
+    local path="$1"
+    if [ -r "$path" ]; then
+        tr -dc '0-9' < "$path"
+    else
+        printf '0'
+    fi
+}
+
+show_concurrency_health() {
+    load_config
+    local warn_percent="${CONCURRENCY_WARN_PERCENT:-80}" ct_count=0 ct_max=0 ct_pct port_start=0 port_end=0 port_span=0
+    local mem_total=0 mem_available=0 loadavg="?" cores="?" warnings=0
+    local name mark table route4 route6 display values level stack eim mtu protocol server port iface service pid restarts
+    local cpu_mem rss fd_count fd_max fd_pct rx_drop tx_drop rx_packets tx_packets
+    printf '============================================================\n'
+    printf '               入口机与 sing-box 并发健康\n'
+    printf '============================================================\n'
+    printf '检测方式: 手动按需读取计数，不启动常驻连接扫描。\n'
+    printf '告警阈值: %s%%\n\n' "$warn_percent"
+
+    [ -r /proc/loadavg ] && loadavg="$(awk '{print $1" "$2" "$3}' /proc/loadavg)"
+    command -v nproc >/dev/null 2>&1 && cores="$(nproc 2>/dev/null || printf '?')"
+    if [ -r /proc/meminfo ]; then
+        mem_total="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
+        mem_available="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo)"
+    fi
+    printf '系统负载: %s  CPU核心: %s\n' "$loadavg" "$cores"
+    if [[ "$mem_total" =~ ^[0-9]+$ ]] && [ "$mem_total" -gt 0 ]; then
+        printf '内存: 可用 %s MiB / 总计 %s MiB\n' "$((mem_available / 1024))" "$((mem_total / 1024))"
+    fi
+
+    ct_count="$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || printf 0)"
+    ct_max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || printf 0)"
+    ct_pct="$(percent_value "$ct_count" "$ct_max")"
+    printf 'conntrack: %s / %s（%s%%）' "$ct_count" "$ct_max" "$ct_pct"
+    if awk -v p="$ct_pct" -v w="$warn_percent" 'BEGIN {exit !(p >= w)}'; then
+        printf '  [告警]\n'
+        warnings=$((warnings + 1))
+    else
+        printf '\n'
+    fi
+
+    if [ -r /proc/sys/net/ipv4/ip_local_port_range ]; then
+        read -r port_start port_end < /proc/sys/net/ipv4/ip_local_port_range || true
+        if [[ "$port_start" =~ ^[0-9]+$ ]] && [[ "$port_end" =~ ^[0-9]+$ ]] && [ "$port_end" -ge "$port_start" ]; then
+            port_span=$((port_end - port_start + 1))
+        fi
+    fi
+    printf 'IPv4 临时端口: %s-%s（共 %s 个）' "$port_start" "$port_end" "$port_span"
+    if [ "$port_span" -gt 0 ] && [ "$port_span" -lt 40000 ]; then
+        printf '  [容量偏小]\n'
+        warnings=$((warnings + 1))
+    else
+        printf '\n'
+    fi
+    if command -v ss >/dev/null 2>&1; then
+        printf 'Socket 摘要:\n'
+        ss -s 2>/dev/null | sed -n '1,3p' | sed 's/^/  /' || true
+    fi
+    printf '软件源入口机直出: %s\n' "${PROXY_KERNEL_DIRECT_BYPASS:-true}"
+
+    printf '\n各 sing-box 出口:\n'
+    while IFS=$'\t' read -r name mark table route4 route6 display; do
+        is_proxy_exit "$name" || continue
+        values="$(proxy_config_runtime_values "$name" 2>/dev/null || true)"
+        IFS=$'\t' read -r level stack eim mtu protocol server port <<< "$values"
+        iface="$(proxy_exit_interface "$name" || true)"
+        service="${EXIT_SERVICE_PREFIX}-${name}"
+        pid="$(systemctl show "$service" -p MainPID --value 2>/dev/null || printf 0)"
+        restarts="$(systemctl show "$service" -p NRestarts --value 2>/dev/null || printf 0)"
+        [[ "$pid" =~ ^[0-9]+$ ]] || pid=0
+        [[ "$restarts" =~ ^[0-9]+$ ]] || restarts=0
+        cpu_mem="-"
+        rss=0
+        fd_count=0
+        fd_max=0
+        fd_pct="0.0"
+        if [ "$pid" -gt 0 ] && [ -d "/proc/$pid" ]; then
+            cpu_mem="$(ps -p "$pid" -o %cpu=,%mem= 2>/dev/null | awk '{$1=$1; print}' || printf '-')"
+            rss="$(ps -p "$pid" -o rss= 2>/dev/null | awk '{$1=$1; print $1 + 0}' || printf 0)"
+            fd_count="$(find "/proc/$pid/fd" -mindepth 1 -maxdepth 1 2>/dev/null | awk 'END {print NR + 0}')"
+            fd_max="$(awk '/^Max open files/ {print $4; exit}' "/proc/$pid/limits" 2>/dev/null || printf 0)"
+            fd_pct="$(percent_value "$fd_count" "$fd_max")"
+        fi
+        rx_drop="$(read_counter_file "/sys/class/net/$iface/statistics/rx_dropped")"
+        tx_drop="$(read_counter_file "/sys/class/net/$iface/statistics/tx_dropped")"
+        rx_packets="$(read_counter_file "/sys/class/net/$iface/statistics/rx_packets")"
+        tx_packets="$(read_counter_file "/sys/class/net/$iface/statistics/tx_packets")"
+        printf '  - %s（%s）\n' "${display:-$name}" "$protocol"
+        printf '    节点: %s:%s  接口: %s  MTU: %s\n' "$server" "$port" "$iface" "$mtu"
+        printf '    模式: log=%s stack=%s endpoint-independent-nat=%s\n' "$level" "$stack" "$eim"
+        printf '    服务: %s  PID=%s  重启=%s  CPU/MEM=%s  RSS=%s MiB\n' \
+            "$(service_state "$service")" "$pid" "$restarts" "$cpu_mem" "$((rss / 1024))"
+        printf '    FD: %s/%s（%s%%）  TUN包: RX=%s TX=%s  丢包: RX=%s TX=%s' \
+            "$fd_count" "$fd_max" "$fd_pct" "$rx_packets" "$tx_packets" "$rx_drop" "$tx_drop"
+        if { [ "$rx_drop" -gt 0 ] || [ "$tx_drop" -gt 0 ] || [ "$restarts" -gt 0 ]; } 2>/dev/null; then
+            printf '  [请检查]\n'
+            warnings=$((warnings + 1))
+        elif awk -v p="$fd_pct" -v w="$warn_percent" 'BEGIN {exit !(p >= w)}'; then
+            printf '  [FD告警]\n'
+            warnings=$((warnings + 1))
+        else
+            printf '\n'
+        fi
+    done < <(read_exit_rows)
+
+    printf '\n结论: '
+    if [ "$warnings" -eq 0 ]; then
+        printf '未发现达到阈值的入口机并发指标。\n'
+    else
+        printf '发现 %s 项容量或运行告警，请优先处理后再增加实例并发。\n' "$warnings"
+    fi
+}
+
+show_concurrency_capacity_advice() {
+    local ct_count ct_max port_start port_end port_span mem_total
+    ct_count="$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || printf 0)"
+    ct_max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || printf 0)"
+    read -r port_start port_end < /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || { port_start=0; port_end=0; }
+    port_span=$((port_end >= port_start ? port_end - port_start + 1 : 0))
+    mem_total="$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo 2>/dev/null || printf 0)"
+    printf '============================================================\n'
+    printf '                    并发容量建议\n'
+    printf '============================================================\n'
+    printf '内存总量: %s MiB\n' "$mem_total"
+    printf 'conntrack: %s / %s\n' "$ct_count" "$ct_max"
+    printf '临时端口: %s-%s（%s 个）\n\n' "$port_start" "$port_end" "$port_span"
+    printf '建议原则:\n'
+    printf '  1. conntrack 峰值长期低于上限的 70%%；只在确实接近上限时扩容。\n'
+    printf '  2. 临时端口少于 40000 时，先核对本机监听/保留端口，再考虑扩大。\n'
+    printf '  3. 单一节点端口连接过多时，优先增加节点监听端口并分摊实例。\n'
+    printf '  4. 不自动写入 sysctl，避免覆盖面板端口和在小内存机器上预留过高容量。\n'
 }
 
 show_status() {
@@ -10580,6 +11234,19 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       先同步 Incus 状态，再把全部正常运行且已接管的容器批量切换到指定出口。
       可填写出口内部 ID、显示名、入口机或 -；停止容器和虚拟机不会修改。
 
+  $0 concurrency-health
+      按需显示 conntrack、临时端口、各 sing-box 进程、FD、TUN 丢包和重启次数。
+      只读取计数，不启动常驻或逐连接扫描。
+
+  $0 proxy-profile 出口名 日志等级 TUN栈 独立UDP-NAT
+      修改单个 sing-box 出口，例如: proxy-profile jp warn system false
+
+  $0 proxy-optimize
+      依次为所有 sing-box 出口应用推荐低负载模式；软件源继续默认从入口机直出。
+
+  $0 proxy-compatible
+      依次恢复兼容模式：warn、mixed、独立 UDP NAT；软件源仍默认从入口机直出。
+
   $0 restore
       还原初始状态，停止并清空所有出口、分流、容器接管记录和容器内 out/token，但保留脚本与基础配置。
 
@@ -10732,6 +11399,22 @@ case "$command_name" in
         ;;
     status)
         show_status "$@"
+        ;;
+    concurrency-health|proxy-health)
+        show_concurrency_health "$@"
+        ;;
+    concurrency-advice|proxy-capacity)
+        show_concurrency_capacity_advice "$@"
+        ;;
+    proxy-profile)
+        [ "$#" -ge 4 ] || die "用法: $0 proxy-profile 出口名 日志等级 TUN栈 独立UDP-NAT"
+        patch_proxy_exit_config "$1" "$2" "$3" "$4" "${PROXY_KERNEL_DIRECT_BYPASS:-true}"
+        ;;
+    proxy-optimize)
+        apply_recommended_proxy_profile "$@"
+        ;;
+    proxy-compatible|proxy-compat)
+        restore_compatible_proxy_profile "$@"
         ;;
     upgrade-config|upgrade|update-script)
         upgrade_config_and_components "$@"
