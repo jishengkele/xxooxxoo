@@ -43,6 +43,10 @@ CONTROLLER_FILE="$LIB_DIR/controller.py"
 AUTOSYNC_FILE="$LIB_DIR/autosync.py"
 OUT_CLIENT_FILE="$LIB_DIR/out"
 SINGBOX_BIN="$LIB_DIR/cloudshlii-sing-box"
+SPLIT_DNS_BUNDLED_BIN="$LIB_DIR/cloudshlii-dnsmasq-nftset"
+SPLIT_DNS_BUNDLED_VERSION="2.93"
+SPLIT_DNS_BUNDLED_URL="https://thekelleys.org.uk/dnsmasq/dnsmasq-${SPLIT_DNS_BUNDLED_VERSION}.tar.xz"
+SPLIT_DNS_BUNDLED_SHA256="0c00d4e5c97c8306e5fb932b348b34269c9c29a0e7df0e8e82958b407092bc19"
 EXIT_DIR="$CONFIG_DIR/cloudshlii-exits.d"
 LEGACY_SINGBOX_BIN="$LIB_DIR/sing-box"
 LEGACY_EXIT_DIR="$CONFIG_DIR/exits.d"
@@ -197,22 +201,37 @@ install_host_dependencies() {
 
 system_dnsmasq_supports_nftset() {
     local binary
+    [ "${EGRESS_FORCE_BUNDLED_DNSMASQ:-false}" != "true" ] || return 1
     binary="$(command -v dnsmasq 2>/dev/null || true)"
     [ -n "$binary" ] || return 1
     "$binary" --version 2>/dev/null | dnsmasq_version_supports_nftset
 }
 
-install_split_dns_sidecar_dependency() {
-    need_root
-    if split_dnsmasq_supported || system_dnsmasq_supports_nftset; then
-        return 0
+bundled_dnsmasq_supports_nftset() {
+    local version_output
+    [ -x "$SPLIT_DNS_BUNDLED_BIN" ] || return 1
+    version_output="$("$SPLIT_DNS_BUNDLED_BIN" --version 2>/dev/null)" || return 1
+    printf '%s\n' "$version_output" |
+        grep -Fq "Dnsmasq version $SPLIT_DNS_BUNDLED_VERSION "
+    printf '%s\n' "$version_output" | dnsmasq_version_supports_nftset
+}
+
+split_dns_sidecar_binary() {
+    if system_dnsmasq_supports_nftset; then
+        command -v dnsmasq
+    elif bundled_dnsmasq_supports_nftset; then
+        printf '%s\n' "$SPLIT_DNS_BUNDLED_BIN"
+    else
+        return 1
     fi
-    [ "${SPLIT_DNS_SIDECAR_FALLBACK:-true}" = "true" ] || return 0
-    info "Incus 自带 dnsmasq 不支持 nftset，正在准备轻量兼容 DNS 组件..."
+}
+
+install_split_dns_system_candidate() {
+    command -v dnsmasq >/dev/null 2>&1 && return 0
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y --no-install-recommends dnsmasq-base
+        NEEDRESTART_MODE=l apt-get install -y --no-install-recommends dnsmasq-base
     elif command -v apk >/dev/null 2>&1; then
         apk add --no-cache dnsmasq
     elif command -v dnf >/dev/null 2>&1; then
@@ -220,13 +239,91 @@ install_split_dns_sidecar_dependency() {
     elif command -v yum >/dev/null 2>&1; then
         yum install -y dnsmasq
     else
-        warn "未识别包管理器，无法自动安装支持 nftset 的兼容 DNS。"
+        return 1
+    fi
+}
+
+install_split_dns_build_dependencies() {
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
+            gcc make libc6-dev pkg-config libnftables-dev libcap2-bin xz-utils
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache build-base pkgconf nftables-dev libcap-utils xz
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y gcc make glibc-devel pkgconf-pkg-config \
+            nftables-devel libcap xz
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y gcc make glibc-devel pkgconfig nftables-devel libcap xz
+    else
+        return 1
+    fi
+}
+
+build_bundled_dnsmasq_nftset() {
+    local work archive source staged target actual_hash jobs
+    need_cmd curl
+    need_cmd sha256sum
+    work="$(mktemp -d)"
+    archive="$work/dnsmasq.tar.xz"
+    source="$work/dnsmasq-$SPLIT_DNS_BUNDLED_VERSION"
+    staged="$work/cloudshlii-dnsmasq-nftset"
+    if ! (
+        set -e
+        need_cmd make
+        need_cmd cc
+        need_cmd pkg-config
+        need_cmd tar
+        need_cmd setcap
+        curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 \
+            "$SPLIT_DNS_BUNDLED_URL" -o "$archive"
+        actual_hash="$(sha256sum "$archive" | awk '{print $1}')"
+        [ "$actual_hash" = "$SPLIT_DNS_BUNDLED_SHA256" ]
+        tar -xJf "$archive" -C "$work"
+        [ -d "$source" ]
+        jobs=1
+        if command -v nproc >/dev/null 2>&1 && [ "$(nproc)" -gt 1 ]; then
+            jobs=2
+        fi
+        make -C "$source" -j"$jobs" COPTS=-DHAVE_NFTSET >/dev/null
+        install -m 0755 "$source/src/dnsmasq" "$staged"
+        command -v strip >/dev/null 2>&1 && strip "$staged" || true
+        "$staged" --version 2>/dev/null | dnsmasq_version_supports_nftset
+        mkdir -p "$LIB_DIR"
+        target="$(mktemp "$LIB_DIR/.cloudshlii-dnsmasq-nftset.XXXXXX")"
+        install -m 0755 "$staged" "$target"
+        setcap cap_net_admin,cap_net_raw=ep "$target"
+        mv -f "$target" "$SPLIT_DNS_BUNDLED_BIN"
+        bundled_dnsmasq_supports_nftset
+    ); then
+        rm -rf "$work"
+        rm -f "$LIB_DIR"/.cloudshlii-dnsmasq-nftset.* 2>/dev/null || true
+        warn "私有 nftset DNS 组件构建失败；没有替换系统 dnsmasq，将继续使用静态缓存分流。"
+        return 1
+    fi
+    rm -rf "$work"
+    rm -f "$LIB_DIR"/.cloudshlii-dnsmasq-nftset.* 2>/dev/null || true
+    info "私有 nftset DNS 组件已就绪；仅供分流兼容服务使用，不替换系统或 Incus dnsmasq。"
+}
+
+install_split_dns_sidecar_dependency() {
+    need_root
+    if split_dnsmasq_supported || system_dnsmasq_supports_nftset ||
+        bundled_dnsmasq_supports_nftset; then
         return 0
     fi
+    [ "${SPLIT_DNS_SIDECAR_FALLBACK:-true}" = "true" ] || return 0
+    info "Incus 与系统 dnsmasq 均不支持 nftset，正在准备脚本私有兼容组件..."
+    install_split_dns_system_candidate || true
     if system_dnsmasq_supports_nftset; then
         info "兼容 DNS 组件已就绪；仅接管容器普通 53 端口查询。"
+    elif ! install_split_dns_build_dependencies; then
+        warn "无法安装兼容 DNS 构建依赖，将继续使用静态缓存分流。"
+    elif build_bundled_dnsmasq_nftset; then
+        :
     else
-        warn "系统 dnsmasq 仍不支持 nftset，将继续使用静态 DNS 缓存分流。"
+        warn "没有可用的 nftset DNS 组件，将继续使用静态缓存分流。"
     fi
 }
 
@@ -2322,7 +2419,7 @@ split_dns_sidecar_available() {
     [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ] || return 1
     [ "${SPLIT_DNS_SIDECAR_FALLBACK:-true}" = "true" ] || return 1
     command -v systemctl >/dev/null 2>&1 || return 1
-    system_dnsmasq_supports_nftset
+    split_dns_sidecar_binary >/dev/null
 }
 
 split_bridge_dns_address() {
@@ -2417,7 +2514,7 @@ apply_split_dns_sidecar_one() {
         user="nobody"
     fi
     group="$(id -gn "$user" 2>/dev/null || printf '%s' "$user")"
-    binary="$(command -v dnsmasq)"
+    binary="$(split_dns_sidecar_binary)"
     unit="$(split_dns_sidecar_unit_name "$iface")"
     unit_file="$(split_dns_sidecar_unit_file "$iface")"
     config_file="$(split_dns_sidecar_config_file "$iface")"
@@ -3151,6 +3248,7 @@ do_apply() {
     need_cmd nft
     need_cmd awk
     need_cmd mktemp
+    install_split_dns_sidecar_dependency
     state_lock_acquire
     apply_lock_acquire
     validate_runtime_config
@@ -3193,6 +3291,7 @@ do_apply_nftables() {
     need_cmd nft
     need_cmd awk
     need_cmd mktemp
+    install_split_dns_sidecar_dependency
     if nft list table inet "$(apply_guard_table)" >/dev/null 2>&1; then
         warn "检测到上一次全量应用未完成，自动改为执行完整恢复。"
         do_apply
