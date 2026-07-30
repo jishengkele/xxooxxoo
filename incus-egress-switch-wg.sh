@@ -25,6 +25,7 @@ SPLIT_CATALOG_FILE="$SPLIT_DIR/catalog-sync"
 SPLIT_README_FILE="$SPLIT_CACHE_DIR/README.md"
 SPLIT_BUNDLE_FILE="$SPLIT_CACHE_DIR/Egress-Application-Rules.list"
 SPLIT_DNSMASQ_DIR="$SPLIT_DIR/dnsmasq"
+SPLIT_DNS_SIDECAR_DIR="$SPLIT_DIR/dns-sidecar"
 INCUS_NETWORKS_DIR="${EGRESS_INCUS_NETWORKS_DIR:-/var/lib/incus/networks}"
 RUN_DIR="/run/$APP_NAME"
 RULE_STATE_FILE="$RUN_DIR/ip-rules.state"
@@ -49,6 +50,7 @@ SYSTEMD_DIR="${EGRESS_SYSTEMD_DIR:-/etc/systemd/system}"
 SERVICE_FILE="$SYSTEMD_DIR/$APP_NAME.service"
 AUTOSYNC_SERVICE="$SYSTEMD_DIR/$APP_NAME-autosync.service"
 EXIT_SERVICE_PREFIX="incus-egress-switch-exit"
+SPLIT_DNS_SIDECAR_SERVICE_PREFIX="$APP_NAME-dns-sidecar"
 UPDATE_BACKUP_ROOT="${EGRESS_UPDATE_BACKUP_ROOT:-/var/backups/$APP_NAME}"
 DEFAULT_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch-wg.sh"
 DEFAULT_SPLIT_RULE_BUNDLE_URL="https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Egress-Application-Rules.list"
@@ -191,6 +193,41 @@ install_host_dependencies() {
         command -v "$cmd" >/dev/null 2>&1 || still_missing="$still_missing $cmd"
     done
     [ -z "$still_missing" ] || die "依赖安装后仍缺少命令:$still_missing"
+}
+
+system_dnsmasq_supports_nftset() {
+    local binary
+    binary="$(command -v dnsmasq 2>/dev/null || true)"
+    [ -n "$binary" ] || return 1
+    "$binary" --version 2>/dev/null | dnsmasq_version_supports_nftset
+}
+
+install_split_dns_sidecar_dependency() {
+    need_root
+    if split_dnsmasq_supported || system_dnsmasq_supports_nftset; then
+        return 0
+    fi
+    [ "${SPLIT_DNS_SIDECAR_FALLBACK:-true}" = "true" ] || return 0
+    info "Incus 自带 dnsmasq 不支持 nftset，正在准备轻量兼容 DNS 组件..."
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends dnsmasq-base
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache dnsmasq
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y dnsmasq
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y dnsmasq
+    else
+        warn "未识别包管理器，无法自动安装支持 nftset 的兼容 DNS。"
+        return 0
+    fi
+    if system_dnsmasq_supports_nftset; then
+        info "兼容 DNS 组件已就绪；仅接管容器普通 53 端口查询。"
+    else
+        warn "系统 dnsmasq 仍不支持 nftset，将继续使用静态 DNS 缓存分流。"
+    fi
 }
 
 entry_direct_python_ready() {
@@ -387,6 +424,11 @@ create_update_backup() {
             paths+=("${path#/}")
         fi
     done
+    for path in "$service_dir"/${SPLIT_DNS_SIDECAR_SERVICE_PREFIX}-*.service; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            paths+=("${path#/}")
+        fi
+    done
 
     for path in "${paths[@]}"; do
         path_kb="$(du -sk "/$path" 2>/dev/null | awk 'NR == 1 {print $1 + 0}')"
@@ -494,6 +536,7 @@ restore_update_backup() {
         return 1
     fi
     command -v systemctl >/dev/null 2>&1 && systemctl stop "$APP_NAME-autosync" "$APP_NAME" 2>/dev/null || true
+    remove_split_dns_sidecars
     load_config
     current_nft="$NFT_TABLE"
     reset_managed_ip_rules 2>/dev/null || true
@@ -508,6 +551,7 @@ restore_update_backup() {
     rm -f -- "$INSTALL_BIN" "$SHORTCUT_BIN" "$CONTROLLER_FILE" "$AUTOSYNC_FILE" "$OUT_CLIENT_FILE" \
         "$SERVICE_FILE" "$AUTOSYNC_SERVICE" "$SYSCTL_FILE"
     rm -f -- "$service_dir"/${EXIT_SERVICE_PREFIX}-*.service 2>/dev/null || true
+    rm -f -- "$service_dir"/${SPLIT_DNS_SIDECAR_SERVICE_PREFIX}-*.service 2>/dev/null || true
     tar -C / -xzpf "$archive" || return 1
     command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
 
@@ -614,6 +658,9 @@ load_config() {
     SPLIT_DNS_TIMEOUT="${SPLIT_DNS_TIMEOUT:-1}"
     SPLIT_DNS_WORKERS="${SPLIT_DNS_WORKERS:-4}"
     SPLIT_DNSMASQ_NFTSET="${SPLIT_DNSMASQ_NFTSET:-true}"
+    SPLIT_DNS_SIDECAR_FALLBACK="${SPLIT_DNS_SIDECAR_FALLBACK:-true}"
+    SPLIT_DNS_SIDECAR_PORT="${SPLIT_DNS_SIDECAR_PORT:-1053}"
+    SPLIT_DNS_FORCE_SIDECAR="${SPLIT_DNS_FORCE_SIDECAR:-false}"
     STRICT_TOKEN="${STRICT_TOKEN:-true}"
     AUTO_SYNC="${AUTO_SYNC:-true}"
     AUTO_INTERVAL="${AUTO_INTERVAL:-15}"
@@ -982,8 +1029,16 @@ SPLIT_DNS_TIMEOUT="1"
 SPLIT_DNS_WORKERS="4"
 
 # 使用 Incus 网桥 dnsmasq 的 nftset 功能，动态补充域名及其子域名解析出的 IP。
-# 不支持 nftset 的环境会自动退回现有的静态 DNS 解析缓存。
+# 原生 dnsmasq 不支持时优先使用脚本专用兼容 DNS；组件不可用才退回静态缓存。
 SPLIT_DNSMASQ_NFTSET="true"
+
+# Incus 自带 dnsmasq 不支持 nftset 时，自动启用脚本专用兼容 DNS。
+# 兼容服务只监听容器网桥的高位端口，并把查询转发回 Incus DNS。
+SPLIT_DNS_SIDECAR_FALLBACK="true"
+SPLIT_DNS_SIDECAR_PORT="1053"
+
+# 调试或兼容开关：即使 Incus dnsmasq 声称支持 nftset，也强制使用兼容 DNS。
+SPLIT_DNS_FORCE_SIDECAR="false"
 
 # 是否强制每台容器使用独立 token。
 STRICT_TOKEN="true"
@@ -1386,6 +1441,9 @@ ensure_runtime_config_defaults() {
     ensure_config_default SPLIT_DNS_TIMEOUT 1
     ensure_config_default SPLIT_DNS_WORKERS 4
     ensure_config_default SPLIT_DNSMASQ_NFTSET true
+    ensure_config_default SPLIT_DNS_SIDECAR_FALLBACK true
+    ensure_config_default SPLIT_DNS_SIDECAR_PORT 1053
+    ensure_config_default SPLIT_DNS_FORCE_SIDECAR false
     ensure_config_default STRICT_TOKEN true
     ensure_config_default AUTO_SYNC true
     ensure_config_default AUTO_INTERVAL 15
@@ -1452,6 +1510,7 @@ upgrade_config_and_components() {
         ensure_runtime_config_defaults
         install_runtime_sysctls
         load_config
+        install_split_dns_sidecar_dependency
         prepare_default_proxy_direct_bypass
         preflight_update_runtime
         do_apply
@@ -1898,6 +1957,13 @@ validate_runtime_config() {
     valid_bool_value "$ENTRY_DIRECT_BT_PT" || die "ENTRY_DIRECT_BT_PT 必须是 true 或 false"
     valid_bool_value "$ENTRY_DIRECT_SPEEDTEST" || die "ENTRY_DIRECT_SPEEDTEST 必须是 true 或 false"
     valid_bool_value "$PROXY_DIRECT_DEFAULT_MIGRATED" || die "PROXY_DIRECT_DEFAULT_MIGRATED 必须是 true 或 false"
+    valid_bool_value "$SPLIT_DNSMASQ_NFTSET" || die "SPLIT_DNSMASQ_NFTSET 必须是 true 或 false"
+    valid_bool_value "$SPLIT_DNS_SIDECAR_FALLBACK" || die "SPLIT_DNS_SIDECAR_FALLBACK 必须是 true 或 false"
+    valid_bool_value "$SPLIT_DNS_FORCE_SIDECAR" || die "SPLIT_DNS_FORCE_SIDECAR 必须是 true 或 false"
+    [[ "$SPLIT_DNS_SIDECAR_PORT" =~ ^[0-9]+$ ]] &&
+        [ "$SPLIT_DNS_SIDECAR_PORT" -ge 1024 ] &&
+        [ "$SPLIT_DNS_SIDECAR_PORT" -le 65535 ] ||
+        die "SPLIT_DNS_SIDECAR_PORT 必须是 1024-65535 的整数"
     [[ "$CONCURRENCY_WARN_PERCENT" =~ ^[0-9]+$ ]] && [ "$CONCURRENCY_WARN_PERCENT" -ge 50 ] && [ "$CONCURRENCY_WARN_PERCENT" -le 99 ] || die "并发健康告警阈值必须是 50-99: $CONCURRENCY_WARN_PERCENT"
     bridge_set_expr >/dev/null
 }
@@ -2176,12 +2242,32 @@ split_dnsmasq_supported() {
 }
 
 split_dnsmasq_status_label() {
+    local iface total=0 native=0 sidecar=0
     if [ "${SPLIT_DNSMASQ_NFTSET:-true}" != "true" ]; then
         printf '已关闭'
-    elif split_dnsmasq_supported && [ -n "$(split_managed_dns_bridges)" ]; then
+        return 0
+    fi
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        total=$((total + 1))
+        if incus_bridge_dnsmasq_supports_nftset "$iface"; then
+            native=$((native + 1))
+        elif split_dns_sidecar_running "$iface"; then
+            sidecar=$((sidecar + 1))
+        fi
+    done < <(split_managed_dns_bridges)
+    if [ "$total" -gt 0 ] && [ "$native" -eq "$total" ]; then
         printf '已启用（Incus dnsmasq nftset）'
+    elif [ "$sidecar" -gt 0 ] && [ $((native + sidecar)) -eq "$total" ]; then
+        if [ "$native" -gt 0 ]; then
+            printf '已启用（原生/兼容 DNS 混合）'
+        else
+            printf '已启用（兼容 DNS nftset）'
+        fi
+    elif [ "$native" -gt 0 ] || [ "$sidecar" -gt 0 ]; then
+        printf '部分启用（其余网桥使用静态缓存）'
     else
-        printf '静态缓存模式（环境不支持 nftset）'
+        printf '静态缓存模式（动态 DNS 组件不可用）'
     fi
 }
 
@@ -2222,6 +2308,7 @@ incus_bridge_dnsmasq_binary() {
 
 incus_bridge_dnsmasq_supports_nftset() {
     local iface="$1" binary
+    [ "${SPLIT_DNS_FORCE_SIDECAR:-false}" != "true" ] || return 1
     binary="$(incus_bridge_dnsmasq_binary "$iface")" || return 1
     "$binary" --version 2>/dev/null | dnsmasq_version_supports_nftset
 }
@@ -2229,6 +2316,158 @@ incus_bridge_dnsmasq_supports_nftset() {
 dnsmasq_version_supports_nftset() {
     # 必须是独立编译选项；grep -w 会把 no-nftset 中连字符后的 nftset 误判为支持。
     grep -Eq '(^|[[:space:]])nftset([[:space:]]|$)'
+}
+
+split_dns_sidecar_available() {
+    [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ] || return 1
+    [ "${SPLIT_DNS_SIDECAR_FALLBACK:-true}" = "true" ] || return 1
+    command -v systemctl >/dev/null 2>&1 || return 1
+    system_dnsmasq_supports_nftset
+}
+
+split_bridge_dns_address() {
+    local iface="$1" family="$2" value
+    case "$family" in
+        4) value="$(incus network get "$iface" ipv4.address 2>/dev/null || true)" ;;
+        6) value="$(incus network get "$iface" ipv6.address 2>/dev/null || true)" ;;
+        *) return 1 ;;
+    esac
+    case "$value" in ""|none|auto) return 1 ;; esac
+    value="${value%%/*}"
+    if [ "$family" = "4" ]; then
+        is_ipv4 "$value" || return 1
+    else
+        is_ipv6 "$value" || return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+split_dns_sidecar_unit_name() {
+    printf '%s-%s.service\n' "$SPLIT_DNS_SIDECAR_SERVICE_PREFIX" "$1"
+}
+
+split_dns_sidecar_unit_file() {
+    printf '%s/%s\n' "$SYSTEMD_DIR" "$(split_dns_sidecar_unit_name "$1")"
+}
+
+split_dns_sidecar_config_file() {
+    printf '%s/%s.conf\n' "$SPLIT_DNS_SIDECAR_DIR" "$1"
+}
+
+split_dns_sidecar_nftset_file() {
+    printf '%s/%s.nftset.conf\n' "$SPLIT_DNS_SIDECAR_DIR" "$1"
+}
+
+split_dns_sidecar_running() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "$(split_dns_sidecar_unit_name "$1")" 2>/dev/null
+}
+
+remove_split_dns_sidecar_one() {
+    local iface="$1" unit unit_file config_file nftset_file changed="false"
+    valid_name "$iface" || return 0
+    unit="$(split_dns_sidecar_unit_name "$iface")"
+    unit_file="$(split_dns_sidecar_unit_file "$iface")"
+    config_file="$(split_dns_sidecar_config_file "$iface")"
+    nftset_file="$(split_dns_sidecar_nftset_file "$iface")"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    fi
+    if [ -e "$unit_file" ] || [ -e "$config_file" ] || [ -e "$nftset_file" ]; then
+        changed="true"
+    fi
+    rm -f "$unit_file" "$config_file" "$nftset_file"
+    [ "$changed" = "false" ] || systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+remove_split_dns_sidecars() {
+    local unit_file base iface changed=0
+    if command -v systemctl >/dev/null 2>&1; then
+        for unit_file in "$SYSTEMD_DIR"/"$SPLIT_DNS_SIDECAR_SERVICE_PREFIX"-*.service; do
+            [ -e "$unit_file" ] || continue
+            base="$(basename "$unit_file" .service)"
+            iface="${base#"$SPLIT_DNS_SIDECAR_SERVICE_PREFIX"-}"
+            systemctl disable --now "${base}.service" >/dev/null 2>&1 || true
+            rm -f "$unit_file"
+            changed=$((changed + 1))
+        done
+    fi
+    rm -rf "$SPLIT_DNS_SIDECAR_DIR"
+    [ "$changed" -eq 0 ] || systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+apply_split_dns_sidecar_one() {
+    local iface="$1" generated="$2" binary v4 v6 upstream user group unit unit_file config_file nftset_file
+    local tmp_config tmp_unit config_changed="false" unit_changed="false" nftset_changed="false"
+    split_dns_sidecar_available || return 1
+    valid_name "$iface" || return 1
+    v4="$(split_bridge_dns_address "$iface" 4 || true)"
+    v6="$(split_bridge_dns_address "$iface" 6 || true)"
+    [ -n "$v4$v6" ] || return 1
+    if [ -n "$v4" ]; then
+        upstream="$v4"
+    else
+        upstream="[$v6]"
+    fi
+    if id incus >/dev/null 2>&1; then
+        user="incus"
+    elif id dnsmasq >/dev/null 2>&1; then
+        user="dnsmasq"
+    else
+        user="nobody"
+    fi
+    group="$(id -gn "$user" 2>/dev/null || printf '%s' "$user")"
+    binary="$(command -v dnsmasq)"
+    unit="$(split_dns_sidecar_unit_name "$iface")"
+    unit_file="$(split_dns_sidecar_unit_file "$iface")"
+    config_file="$(split_dns_sidecar_config_file "$iface")"
+    nftset_file="$(split_dns_sidecar_nftset_file "$iface")"
+    mkdir -p "$SPLIT_DNS_SIDECAR_DIR"
+    tmp_config="$(mktemp)"
+    tmp_unit="$(mktemp)"
+    {
+        printf 'port=%s\n' "$SPLIT_DNS_SIDECAR_PORT"
+        printf 'bind-interfaces\n'
+        printf 'interface=%s\n' "$iface"
+        [ -z "$v4" ] || printf 'listen-address=%s\n' "$v4"
+        [ -z "$v6" ] || printf 'listen-address=%s\n' "$v6"
+        printf 'no-resolv\n'
+        printf 'server=%s#53\n' "$upstream"
+        printf 'cache-size=1000\n'
+        printf 'no-negcache\n'
+        printf 'user=%s\n' "$user"
+        printf 'group=%s\n' "$group"
+        printf 'conf-file=%s\n' "$nftset_file"
+    } > "$tmp_config"
+    cat > "$tmp_unit" <<EOF
+[Unit]
+Description=cloudshlii nftset compatibility DNS for $iface
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=$binary --test --conf-file=$config_file
+ExecStart=$binary --keep-in-foreground --conf-file=$config_file --pid-file=
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    files_identical "$generated" "$nftset_file" || nftset_changed="true"
+    text_files_identical "$tmp_config" "$config_file" || config_changed="true"
+    text_files_identical "$tmp_unit" "$unit_file" || unit_changed="true"
+    install -m 0644 "$generated" "$nftset_file"
+    install -m 0644 "$tmp_config" "$config_file"
+    install -m 0644 "$tmp_unit" "$unit_file"
+    rm -f "$tmp_config" "$tmp_unit"
+    [ "$unit_changed" = "false" ] || systemctl daemon-reload
+    systemctl enable "$unit" >/dev/null
+    if [ "$nftset_changed" = "true" ] || [ "$config_changed" = "true" ] ||
+        [ "$unit_changed" = "true" ] || ! split_dns_sidecar_running "$iface"; then
+        systemctl restart "$unit"
+    fi
+    split_dns_sidecar_running "$iface"
 }
 
 strip_split_dnsmasq_block() {
@@ -2288,22 +2527,20 @@ remove_split_dnsmasq_integration() {
         fi
         rm -f "$config_file" "$current" "$base"
     done < <(split_managed_dns_bridges)
+    remove_split_dns_sidecars
     [ "$changed" -eq 0 ] || info "已移除 $changed 个 Incus 网桥的 dnsmasq 动态分流配置。"
 }
 
 apply_split_dnsmasq_nftsets() {
-    local generated iface network_dir config_file old_config current base desired file_changed raw_changed changed=0 unsupported=0
+    local generated generated_hash iface network_dir config_file old_config current base desired
+    local file_changed raw_changed changed=0 sidecar_applied=0 static_count=0 sidecar_failed="false"
     if [ "${SPLIT_DNSMASQ_NFTSET:-true}" != "true" ]; then
         remove_split_dnsmasq_integration
         return $?
     fi
-    if ! split_dnsmasq_supported; then
-        remove_split_dnsmasq_integration || return $?
-        warn "Incus 网桥实际使用的 dnsmasq 不支持 nftset，已使用静态 DNS 缓存分流。"
-        return 0
-    fi
     generated="$(mktemp)"
     build_split_dnsmasq_file "$generated"
+    generated_hash="$(sha256sum "$generated" | awk '{print $1}')"
     mkdir -p "$SPLIT_DNSMASQ_DIR"
     while IFS= read -r iface; do
         [ -n "$iface" ] || continue
@@ -2321,19 +2558,43 @@ apply_split_dnsmasq_nftsets() {
         fi
         strip_split_dnsmasq_block "$current" "$base"
         if ! incus_bridge_dnsmasq_supports_nftset "$iface"; then
-            if ! text_files_identical "$current" "$base" && ! set_incus_network_raw_dnsmasq "$iface" "$base"; then
-                rm -f "$old_config" "$current" "$base" "$desired" "$generated"
-                warn "网桥 $iface 使用的 dnsmasq 不支持 nftset，且旧动态配置清理失败。"
-                return 1
+            if [ -s "$generated" ] && split_dns_sidecar_available; then
+                if apply_split_dns_sidecar_one "$iface" "$generated"; then
+                    if ! text_files_identical "$current" "$base" &&
+                        ! set_incus_network_raw_dnsmasq "$iface" "$base"; then
+                        warn "网桥 $iface 的旧原生动态配置清理失败，兼容 DNS 已回退。"
+                        remove_split_dns_sidecar_one "$iface"
+                        sidecar_failed="true"
+                        static_count=$((static_count + 1))
+                    else
+                        sidecar_applied=$((sidecar_applied + 1))
+                    fi
+                else
+                    warn "网桥 $iface 的兼容 DNS 启动失败。"
+                    remove_split_dns_sidecar_one "$iface"
+                    sidecar_failed="true"
+                    static_count=$((static_count + 1))
+                fi
+            else
+                remove_split_dns_sidecar_one "$iface"
+                if ! text_files_identical "$current" "$base" &&
+                    ! set_incus_network_raw_dnsmasq "$iface" "$base"; then
+                    rm -f "$old_config" "$current" "$base" "$desired" "$generated"
+                    warn "网桥 $iface 使用的 dnsmasq 不支持 nftset，且旧动态配置清理失败。"
+                    return 1
+                fi
+                static_count=$((static_count + 1))
             fi
             rm -f "$config_file" "$old_config" "$current" "$base" "$desired"
-            unsupported=$((unsupported + 1))
             continue
         fi
         cp "$base" "$desired"
         if [ -s "$generated" ]; then
             [ ! -s "$desired" ] || printf '\n' >> "$desired"
             printf '# BEGIN %s nftset\n' "$APP_NAME" >> "$desired"
+            # conf-file 路径本身不会变化。把内容哈希写进 raw.dnsmasq，
+            # 让 Incus 只在规则实际变化时重启一次 dnsmasq 并重新读取文件。
+            printf '# rules-sha256=%s\n' "$generated_hash" >> "$desired"
             printf 'conf-file=%s\n' "$config_file" >> "$desired"
             printf '# END %s nftset\n' "$APP_NAME" >> "$desired"
         fi
@@ -2362,11 +2623,46 @@ apply_split_dnsmasq_nftsets() {
             fi
             changed=$((changed + 1))
         fi
+        remove_split_dns_sidecar_one "$iface"
         rm -f "$old_config" "$current" "$base" "$desired"
     done < <(split_managed_dns_bridges)
     rm -f "$generated"
+    if [ "$sidecar_failed" = "true" ]; then
+        nft flush chain inet "$NFT_TABLE" dns_sidecar_prerouting 2>/dev/null || true
+        remove_split_dns_sidecars
+        sidecar_applied=0
+        warn "兼容 DNS 启动或切换失败，已自动取消 DNS 重定向并使用静态缓存。"
+    fi
     [ "$changed" -eq 0 ] || info "已更新 $changed 个 Incus 网桥的 dnsmasq 动态域名分流。"
-    [ "$unsupported" -eq 0 ] || warn "$unsupported 个 Incus 网桥实际使用的 dnsmasq 不支持 nftset，已使用静态 DNS 缓存分流。"
+    [ "$sidecar_applied" -eq 0 ] || info "$sidecar_applied 个网桥已启用兼容 DNS nftset；不修改 Incus DHCP。"
+    [ "$static_count" -eq 0 ] || warn "$static_count 个网桥缺少可用的动态 DNS 组件，已使用静态缓存分流。"
+}
+
+build_split_dns_sidecar_redirect_rules() {
+    local generated iface v4 v6
+    [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ] || return 0
+    split_dns_sidecar_available || return 0
+    generated="$(mktemp)"
+    build_split_dnsmasq_file "$generated"
+    if [ ! -s "$generated" ]; then
+        rm -f "$generated"
+        return 0
+    fi
+    rm -f "$generated"
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        incus_bridge_dnsmasq_supports_nftset "$iface" && continue
+        v4="$(split_bridge_dns_address "$iface" 4 || true)"
+        v6="$(split_bridge_dns_address "$iface" 6 || true)"
+        if [ -n "$v4" ]; then
+            printf '    iifname "%s" ip daddr %s udp dport 53 redirect to :%s\n' "$iface" "$v4" "$SPLIT_DNS_SIDECAR_PORT"
+            printf '    iifname "%s" ip daddr %s tcp dport 53 redirect to :%s\n' "$iface" "$v4" "$SPLIT_DNS_SIDECAR_PORT"
+        fi
+        if [ -n "$v6" ]; then
+            printf '    iifname "%s" ip6 daddr %s udp dport 53 redirect to :%s\n' "$iface" "$v6" "$SPLIT_DNS_SIDECAR_PORT"
+            printf '    iifname "%s" ip6 daddr %s tcp dport 53 redirect to :%s\n' "$iface" "$v6" "$SPLIT_DNS_SIDECAR_PORT"
+        fi
+    done < <(split_managed_dns_bridges)
 }
 
 # 生成 nftables 数据面：
@@ -2378,10 +2674,20 @@ build_nft_file() {
     local keys4_line="" keys6_line="" elems4_line="" elems6_line="" managed4_line="" managed6_line=""
     local split4="" split6="" split4_line="" split6_line=""
     local block_unmanaged6_line=""
+    local dns_sidecar_rules="" dns_sidecar_chain=""
     local split_sets="" split_rules="" force_split_rules="" conditional_force_rules="" container_split_rules="" proxy_direct_rules="" bridge_expr app target policy_targets safe v4file v6file domains_file v4elems v6elems v4elements_line v6elements_line split_mark
     local container cip source category display app_category remote enabled
     local tunnel_mss_rules="" tunnel_mss_seen=$'\n' exit_name exit_route4 exit_route6 exit_route exit_dev exit_conf tunnel_mtu tunnel_mtu_default tunnel_mss _exit_mark _exit_table _exit_display
     bridge_expr="$(bridge_set_expr)"
+    dns_sidecar_rules="$(build_split_dns_sidecar_redirect_rules)"
+    if [ -n "$dns_sidecar_rules" ]; then
+        dns_sidecar_chain="
+  chain dns_sidecar_prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+$dns_sidecar_rules
+  }
+"
+    fi
     # 容器网卡通常为 MTU 1500，而 sing-box/WireGuard 隧道接口更小。若不钳制转发 TCP 的 MSS，
     # TCP 三次握手和小包可以正常，但 HTTPS/REALITY 或大流量会在较大报文阶段超时、断流。
     # 同时处理 SYN 与 SYN+ACK；按隧道 MTU 减去 IPv6+TCP 头部 60 字节，IPv4 也安全适用。
@@ -2746,6 +3052,7 @@ $elems4_line
 $elems6_line
   }
 $split_sets
+$dns_sidecar_chain
 
   chain prerouting {
     # 晚于常见的 mangle(-150) 链执行，避免宿主机已有回程/默认出口规则覆盖容器自选出口标记。
@@ -8614,6 +8921,7 @@ install_host() {
     write_default_config
     ensure_runtime_config_defaults
     load_config
+    install_split_dns_sidecar_dependency
     prepare_default_proxy_direct_bypass
     if command -v systemctl >/dev/null 2>&1; then
         systemctl is-active --quiet "$APP_NAME-autosync" && autosync_was_active="true"
@@ -11388,12 +11696,19 @@ show_status_nft() {
 
 show_status_services() {
     load_config
+    local iface unit
     printf '============================================================\n'
     printf '                       服务状态\n'
     printf '============================================================\n'
     if command -v systemctl >/dev/null 2>&1; then
         systemctl is-active "$APP_NAME" 2>/dev/null | sed "s/^/  $APP_NAME: /" || true
         systemctl is-active "$APP_NAME-autosync" 2>/dev/null | sed "s/^/  $APP_NAME-autosync: /" || true
+        while IFS= read -r iface; do
+            [ -n "$iface" ] || continue
+            unit="$(split_dns_sidecar_unit_name "$iface")"
+            systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q . || continue
+            systemctl is-active "$unit" 2>/dev/null | sed "s/^/  $unit: /" || true
+        done < <(split_managed_dns_bridges)
     else
         printf '当前系统未使用 systemd。\n'
     fi
@@ -11581,9 +11896,12 @@ uninstall_host() {
     rm -f "$SYSTEMD_DIR/multi-user.target.wants/$APP_NAME.service" \
           "$SYSTEMD_DIR/multi-user.target.wants/$APP_NAME-autosync.service" \
           "$SYSTEMD_DIR"/multi-user.target.wants/${EXIT_SERVICE_PREFIX}-*.service \
-          "$SYSTEMD_DIR"/${EXIT_SERVICE_PREFIX}-*.service 2>/dev/null || true
+          "$SYSTEMD_DIR"/multi-user.target.wants/${SPLIT_DNS_SIDECAR_SERVICE_PREFIX}-*.service \
+          "$SYSTEMD_DIR"/${EXIT_SERVICE_PREFIX}-*.service \
+          "$SYSTEMD_DIR"/${SPLIT_DNS_SIDECAR_SERVICE_PREFIX}-*.service 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
-    systemctl reset-failed "$APP_NAME" "$APP_NAME-autosync" "${EXIT_SERVICE_PREFIX}-*" 2>/dev/null || true
+    systemctl reset-failed "$APP_NAME" "$APP_NAME-autosync" "${EXIT_SERVICE_PREFIX}-*" \
+        "${SPLIT_DNS_SIDECAR_SERVICE_PREFIX}-*" 2>/dev/null || true
     rm -rf "$LIB_DIR" "$RUN_DIR" "/run/$APP_NAME"
     rm -f "$SYSCTL_FILE"
     rm -rf "$CONFIG_DIR"
