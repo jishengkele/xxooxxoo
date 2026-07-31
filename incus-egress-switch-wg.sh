@@ -56,12 +56,14 @@ AUTOSYNC_SERVICE="$SYSTEMD_DIR/$APP_NAME-autosync.service"
 EXIT_SERVICE_PREFIX="incus-egress-switch-exit"
 SPLIT_DNS_SIDECAR_SERVICE_PREFIX="$APP_NAME-dns-sidecar"
 UPDATE_BACKUP_ROOT="${EGRESS_UPDATE_BACKUP_ROOT:-/var/backups/$APP_NAME}"
+LAST_UPDATE_FILE="$CONFIG_DIR/last-update.tsv"
 DEFAULT_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch-wg.sh"
 DEFAULT_SPLIT_RULE_BUNDLE_URL="https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Egress-Application-Rules.list"
 PROXY_TUN_MTU=1400
 PROXY_DIRECT_APP_ID="__proxy_direct"
 UPDATE_BACKUP_PATH=""
 UPDATE_BACKUP_ARCHIVE=""
+UPDATE_COMPONENT_SOURCE_HASH=""
 
 info() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -399,6 +401,63 @@ install_self_atomically() {
     mv -f "$staged" "$INSTALL_BIN"
 }
 
+script_sha256() {
+    local path="$1"
+    [ -f "$path" ] || { printf '%s\n' '-'; return 0; }
+    command -v sha256sum >/dev/null 2>&1 || { printf '%s\n' '-'; return 0; }
+    sha256sum "$path" | awk '{print $1}'
+}
+
+write_last_update_record() {
+    local mode="$1" source_ref="$2" before_hash="$3" installed_hash="$4"
+    local tmp main_started autosync_started
+    mkdir -p "$CONFIG_DIR"
+    source_ref="${source_ref//$'\t'/ }"
+    source_ref="${source_ref//$'\n'/ }"
+    main_started="$(systemctl show "$APP_NAME.service" -p ExecMainStartTimestamp --value 2>/dev/null || true)"
+    autosync_started="$(systemctl show "$APP_NAME-autosync.service" -p ExecMainStartTimestamp --value 2>/dev/null || true)"
+    tmp="$(mktemp "$CONFIG_DIR/.last-update.XXXXXX")"
+    {
+        printf 'completed_at\t%s\n' "$(date -Is)"
+        printf 'mode\t%s\n' "$mode"
+        printf 'source\t%s\n' "$source_ref"
+        printf 'before_sha256\t%s\n' "$before_hash"
+        printf 'installed_sha256\t%s\n' "$installed_hash"
+        printf 'main_started\t%s\n' "$main_started"
+        printf 'autosync_started\t%s\n' "$autosync_started"
+    } > "$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$LAST_UPDATE_FILE"
+}
+
+last_update_value() {
+    local key="$1"
+    [ -f "$LAST_UPDATE_FILE" ] || return 0
+    awk -F '\t' -v key="$key" '$1 == key {sub(/^[^\t]*\t/, ""); print; exit}' "$LAST_UPDATE_FILE"
+}
+
+stamp_component_file() {
+    local path="$1" source_hash="${UPDATE_COMPONENT_SOURCE_HASH:-}"
+    if [ -z "$source_hash" ]; then
+        source_hash="$(script_sha256 "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")"
+    fi
+    [ -f "$path" ] && [ "$source_hash" != "-" ] || return 0
+    sed -i "2i# manager-script-sha256=$source_hash" "$path"
+}
+
+component_build_status() {
+    local expected component
+    expected="$(script_sha256 "$INSTALL_BIN")"
+    [ "$expected" != "-" ] || { printf '%s\n' "未知"; return 0; }
+    for component in "$CONTROLLER_FILE" "$AUTOSYNC_FILE" "$OUT_CLIENT_FILE"; do
+        if [ ! -s "$component" ] || ! grep -Fqx "# manager-script-sha256=$expected" "$component"; then
+            printf '%s\n' "待重建"
+            return 0
+        fi
+    done
+    printf '%s\n' "已匹配"
+}
+
 install_shortcut() {
     local shortcut_dir
     shortcut_dir="$(dirname "$SHORTCUT_BIN")"
@@ -677,8 +736,8 @@ restore_update_backup() {
 }
 
 update_health_check() {
-    local autosync_should_run="$1" backup="$2" timeout="${UPDATE_HEALTH_TIMEOUT:-30}"
-    local deadline health_url svc
+    local autosync_should_run="$1" backup="$2" expected_script_hash="${3:-}" timeout="${UPDATE_HEALTH_TIMEOUT:-30}"
+    local deadline health_url svc installed_hash
     [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=30
     [ "$timeout" -ge 5 ] || timeout=5
     wait_unit_active "$APP_NAME.service" "$timeout" || { warn "更新后 API 服务未恢复。"; return 1; }
@@ -686,6 +745,19 @@ update_health_check() {
         warn "更新后的脚本组件不完整。"
         return 1
     }
+    if [ -n "$expected_script_hash" ]; then
+        installed_hash="$(script_sha256 "$INSTALL_BIN")"
+        [ "$installed_hash" = "$expected_script_hash" ] || {
+            warn "更新后的安装脚本哈希不匹配：期望 $expected_script_hash，实际 $installed_hash。"
+            return 1
+        }
+        for svc in "$CONTROLLER_FILE" "$AUTOSYNC_FILE" "$OUT_CLIENT_FILE"; do
+            grep -Fqx "# manager-script-sha256=$expected_script_hash" "$svc" || {
+                warn "更新后的运行组件不是由目标脚本生成: $svc"
+                return 1
+            }
+        done
+    fi
     nft list table inet "$NFT_TABLE" >/dev/null 2>&1 || { warn "更新后 nftables 主表不存在。"; return 1; }
     ! nft list table inet "$(apply_guard_table)" >/dev/null 2>&1 || { warn "更新后流量保护表仍未释放。"; return 1; }
     [ ! -e "$PENDING_NFT_FILE" ] || { warn "更新后仍存在待应用标记。"; return 1; }
@@ -1585,7 +1657,9 @@ ensure_runtime_config_defaults() {
 
 upgrade_config_and_components() {
     need_root
-    local source_path="${1:-}" main_was_active="false" main_was_enabled="false"
+    local source_path="${1:-}" update_mode="${2:-}" update_ref="${3:-}"
+    local source_hash installed_before_hash installed_hash
+    local main_was_active="false" main_was_enabled="false"
     local autosync_was_active="false" autosync_was_enabled="false"
     install_host_dependencies
     need_cmd install
@@ -1600,6 +1674,22 @@ upgrade_config_and_components() {
     [ -n "$source_path" ] || source_path="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
     source_path="$(readlink -f "$source_path" 2>/dev/null || printf '%s' "$source_path")"
     [ -f "$source_path" ] || source_path="$INSTALL_BIN"
+    if [ -z "$update_mode" ]; then
+        if [ "$source_path" = "$INSTALL_BIN" ]; then
+            update_mode="current-installed"
+        else
+            update_mode="local-script"
+        fi
+    fi
+    [ -n "$update_ref" ] || update_ref="$source_path"
+    source_hash="$(script_sha256 "$source_path")"
+    UPDATE_COMPONENT_SOURCE_HASH="$source_hash"
+    installed_before_hash="$(script_sha256 "$INSTALL_BIN")"
+    info "待应用脚本 SHA256: $source_hash"
+    info "当前安装 SHA256: $installed_before_hash"
+    if [ "$source_hash" = "$installed_before_hash" ]; then
+        info "脚本内容未变化；本次将重新生成组件、重启服务并执行完整健康检查。"
+    fi
     preflight_update_source "$source_path"
 
     unit_is_active "$APP_NAME.service" && main_was_active="true"
@@ -1633,6 +1723,12 @@ upgrade_config_and_components() {
             install_self_atomically "$source_path"
             info "已更新安装脚本: $INSTALL_BIN"
         fi
+        installed_hash="$(script_sha256 "$INSTALL_BIN")"
+        if [ "$installed_hash" != "$source_hash" ]; then
+            warn "安装脚本哈希校验失败：期望 $source_hash，实际 $installed_hash。"
+            exit 1
+        fi
+        info "安装脚本哈希校验通过: $installed_hash"
         install_shortcut
         write_controller
         write_autosync
@@ -1647,11 +1743,15 @@ upgrade_config_and_components() {
         else
             systemctl stop "$APP_NAME-autosync.service" 2>/dev/null || true
         fi
-        update_health_check "$autosync_was_active" "$UPDATE_BACKUP_PATH"
+        update_health_check "$autosync_was_active" "$UPDATE_BACKUP_PATH" "$source_hash"
+        write_last_update_record "$update_mode" "$update_ref" "$installed_before_hash" "$source_hash"
     ); then
         load_config
         prune_update_backups
+        installed_hash="$(script_sha256 "$INSTALL_BIN")"
         info "安全更新完成：配置项、脚本组件、systemd 和数据面均已通过健康检查。"
+        info "版本确认: $installed_before_hash -> $installed_hash"
+        info "固定在线更新命令: sbout update-github"
         info "现有出口、容器授权、token、限速、分流策略和自定义规则均已保留。"
         info "更新前备份: $UPDATE_BACKUP_PATH"
         return 0
@@ -1680,8 +1780,19 @@ update_from_github() {
         die "GitHub 更新脚本下载失败；当前安装未做任何修改。"
     fi
     chmod 0700 "$tmp"
-    # 复用原有安全更新：完整预检、备份、健康检查与失败回滚。
-    upgrade_config_and_components "$tmp"
+    info "GitHub 下载 SHA256: $(script_sha256 "$tmp")"
+    bash -n "$tmp" || { rm -f "$tmp"; die "GitHub 脚本 Bash 语法检查失败；当前安装未做任何修改。"; }
+    grep -Fq 'APP_NAME="incus-egress-switch"' "$tmp" || {
+        rm -f "$tmp"
+        die "GitHub 下载内容不是预期的 incus-egress-switch 脚本；当前安装未做任何修改。"
+    }
+    # 必须交给下载后的新脚本进程执行。否则旧版 shell 进程会用旧函数重建
+    # controller/autosync，造成主脚本已更新、实际运行组件仍是旧版。
+    info "正在交由下载后的新脚本执行预检、备份、更新和健康检查。"
+    if ! "$tmp" upgrade "$tmp" github "$url"; then
+        rm -f "$tmp"
+        die "GitHub 安全更新失败；已由更新流程保留原版本或完成自动回滚。"
+    fi
     rm -f "$tmp"
 }
 
@@ -8324,6 +8435,7 @@ def main():
 if __name__ == "__main__":
     main()
 PY
+    stamp_component_file "$tmp"
     python3 -m py_compile "$tmp"
     rm -rf "$LIB_DIR/__pycache__"
     chmod 0755 "$tmp"
@@ -9546,6 +9658,7 @@ def main():
 if __name__ == "__main__":
     main()
 PY
+    stamp_component_file "$tmp"
     python3 -m py_compile "$tmp"
     rm -rf "$LIB_DIR/__pycache__"
     chmod 0755 "$tmp"
@@ -10424,6 +10537,7 @@ write_client_file() {
     local tmp
     tmp="$(mktemp "$LIB_DIR/out.XXXXXX")"
     client_script > "$tmp"
+    stamp_component_file "$tmp"
     sh -n "$tmp"
     chmod 0755 "$tmp"
     mv -f "$tmp" "$OUT_CLIENT_FILE"
@@ -10560,6 +10674,13 @@ confirm_yes() {
         y|Y|yes|YES|Yes) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+confirm_phrase() {
+    local label="$1" phrase="$2" answer
+    printf '%s\n' "$label"
+    read -r -p "请输入 $phrase 确认，其他输入均取消: " answer
+    [ "$answer" = "$phrase" ]
 }
 
 print_exit_summary() {
@@ -12191,7 +12312,7 @@ restore_initial_state() {
 
 interactive_restore() {
     need_root
-    if ! confirm_yes "确认还原初始状态吗？这会删除出口、分流、容器接管记录和容器内 out/token，但不会卸载脚本"; then
+    if ! confirm_phrase "还原会删除出口、分流、容器接管记录和容器内 out/token，但不会卸载脚本。" "RESTORE"; then
         info "已取消还原。"
         pause_screen
         return 0
@@ -12203,7 +12324,7 @@ interactive_restore() {
 interactive_uninstall() {
     local purge_arg=""
     need_root
-    if ! confirm_yes "确认彻底卸载 cloudshlii 出口切换器吗？这会删除服务、规则、配置、出口实例、容器内 out/token 和脚本文件"; then
+    if ! confirm_phrase "彻底卸载会删除服务、规则、配置、出口实例、容器内 out/token 和脚本文件。" "UNINSTALL"; then
         info "已取消卸载。"
         pause_screen
         return 0
@@ -12248,7 +12369,7 @@ allowed_exits_label() {
 }
 
 print_main_header() {
-    local exits containers api_state sync_state out_auto_state takeover_mode
+    local exits containers api_state sync_state out_auto_state takeover_mode installed_hash last_updated component_state
     load_config
     exits=$(count_rows "$EXITS_FILE")
     containers=$(count_rows "$CONTAINERS_FILE")
@@ -12260,6 +12381,10 @@ print_main_header() {
         out_auto_state="已关闭"
     fi
     takeover_mode="$(takeover_mode_label)"
+    installed_hash="$(script_sha256 "$INSTALL_BIN")"
+    component_state="$(component_build_status)"
+    last_updated="$(last_update_value completed_at)"
+    [ -n "$last_updated" ] || last_updated="未记录"
     ui_line
     printf '%s%s' "$UI_CYAN" "$UI_BOLD"
     cat <<'EOF'
@@ -12277,6 +12402,11 @@ EOF
     printf '  %s出口数量%s     : %s%-30s%s | %s同步服务%s : %s\n' "$UI_CYAN" "$UI_RESET" "$UI_GREEN" "$exits" "$UI_RESET" "$UI_CYAN" "$UI_RESET" "$sync_state"
     printf '  %s接管容器%s     : %s%-30s%s | %s接管模式%s : %s\n' "$UI_CYAN" "$UI_RESET" "$UI_GREEN" "$containers" "$UI_RESET" "$UI_CYAN" "$UI_RESET" "$takeover_mode"
     printf '  %sout 自动补齐%s : %s%-30s%s | %s同步并发%s : 查询 %s / 注入 %s\n' "$UI_CYAN" "$UI_RESET" "$UI_GREEN" "$out_auto_state" "$UI_RESET" "$UI_CYAN" "$UI_RESET" "$AUTO_SYNC_WORKERS" "$AUTO_INJECT_WORKERS"
+    printf '  %s脚本 SHA%s      : %s%-12s%s | %s运行组件%s : %s\n' "$UI_CYAN" "$UI_RESET" "$UI_GREEN" "${installed_hash:0:12}" "$UI_RESET" "$UI_CYAN" "$UI_RESET" "$component_state"
+    printf '  %s上次更新%s      : %s\n' "$UI_CYAN" "$UI_RESET" "$last_updated"
+    if [ "$component_state" != "已匹配" ]; then
+        printf '  %s[WARN] 主脚本与运行组件不一致，请执行：sbout upgrade%s\n' "$UI_YELLOW" "$UI_RESET"
+    fi
     ui_line
 }
 
@@ -12307,8 +12437,9 @@ interactive_menu() {
         printf '\n'
         printf '  %s【维护操作】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[14]%s 从 GitHub 安全更新          %s[15]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[16]%s 彻底卸载                    %s[17]%s 使用当前脚本安全更新\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[16]%s 彻底卸载                    %s[17]%s 重建当前版本组件（不联网）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
         printf '    %s[18]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
+        printf '    固定在线更新命令：%ssbout update-github%s（跨版本请使用命令，不要记忆菜单编号）\n' "$UI_YELLOW" "$UI_RESET"
         printf '\n'
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$UI_GREEN" "$UI_RESET"
@@ -12340,11 +12471,24 @@ interactive_menu() {
 }
 
 show_status_overview() {
+    local installed_hash last_updated last_mode component_state
     load_config
+    installed_hash="$(script_sha256 "$INSTALL_BIN")"
+    component_state="$(component_build_status)"
+    last_updated="$(last_update_value completed_at)"
+    last_mode="$(last_update_value mode)"
+    [ -n "$last_updated" ] || last_updated="未记录"
+    [ -n "$last_mode" ] || last_mode="-"
     printf '============================================================\n'
     printf '                    系统与同步状态\n'
     printf '============================================================\n'
     printf '配置文件: %s\n' "$CONFIG_FILE"
+    printf '安装脚本: SHA256 %s  运行组件: %s\n' "$installed_hash" "$component_state"
+    printf '上次更新: %s（%s）\n' "$last_updated" "$last_mode"
+    if [ "$component_state" != "已匹配" ]; then
+        printf '[WARN] 主脚本与 controller/autosync/out 版本不一致，请执行: sbout upgrade\n'
+    fi
+    printf '固定在线更新命令: sbout update-github\n'
     printf 'API 监听: %s:%s  容器访问地址: %s\n' "$API_BIND" "$API_PORT" "$API_PUBLIC_URL"
     printf '容器网桥: %s\n' "$BRIDGE_IFACES"
     printf '自动同步: %s  间隔: %ss  Project: %s\n' "$AUTO_SYNC" "$AUTO_INTERVAL" "$AUTO_PROJECTS"
@@ -12736,13 +12880,15 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
   $0 status
       查看状态。
 
-  $0 upgrade-config
-      手动上传新脚本后执行安全更新：先验证脚本/组件/配置/nft，再创建 root 专属备份并原子刷新组件。
+  $0 upgrade-config [新脚本路径]
+      指定新脚本路径时执行本地安全更新；不指定路径时只重建当前已安装版本的组件，不联网、不获取新版本。
+      先验证脚本/组件/配置/nft，再创建 root 专属备份并原子刷新组件。
       更新后会检查 API、nft、自动同步和原先在线出口；失败时自动恢复旧版本与配置。
       默认保留最近 5 份备份到 /var/backups/$APP_NAME；不会改动已有出口、token、限速和分流策略。
 
-  $0 update-online
+  $0 update-github
       从 GitHub 下载最新版，然后复用 upgrade-config 的预检、备份、健康检查和自动回滚流程。
+      下载 SHA256 必须与最终安装 SHA256 一致，否则自动回滚；该命令不受不同版本菜单编号变化影响。
       默认地址: $DEFAULT_UPDATE_SCRIPT_URL
 
   sbout
