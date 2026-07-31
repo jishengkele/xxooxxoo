@@ -1751,7 +1751,7 @@ upgrade_config_and_components() {
         installed_hash="$(script_sha256 "$INSTALL_BIN")"
         info "安全更新完成：配置项、脚本组件、systemd 和数据面均已通过健康检查。"
         info "版本确认: $installed_before_hash -> $installed_hash"
-        info "固定在线更新命令: sbout update-github"
+        info "固定更新命令: sbout update-github && sbout upgrade"
         info "现有出口、容器授权、token、限速、分流策略和自定义规则均已保留。"
         info "更新前备份: $UPDATE_BACKUP_PATH"
         return 0
@@ -10817,27 +10817,35 @@ interactive_status() {
 ============================================================
                     详细状态
 ============================================================
-  1. 系统与同步状态
-  2. 出口状态
-  3. 容器状态
-  4. 分流策略
-  5. 策略路由
-  6. nftables 规则
-  7. 服务状态
-  8. 入口机与 sing-box 并发健康
+  1. 系统、同步与更新概览
+  2. 自动巡检与失败退避状态
+  3. 出口状态
+  4. 容器同步与异常跳过
+  5. 分流策略
+  6. 分流 DNS 即时健康检查（只读）
+  7. 策略路由
+  8. nftables 规则
+  9. 服务状态
+ 10. 入口机与 sing-box 并发健康
+ 11. conntrack 与临时端口容量建议
+ 12. 查看全部详细状态
   0. 返回主菜单
 ============================================================
 EOF
-        read -r -p "请输入选项 [0-8]: " choice
+        read -r -p "请输入选项 [0-12]: " choice
         case "$choice" in
             1) show_status_overview; pause_screen ;;
-            2) show_status_exits; pause_screen ;;
-            3) show_status_containers; pause_screen ;;
-            4) show_status_split; pause_screen ;;
-            5) show_status_routes; pause_screen ;;
-            6) show_status_nft; pause_screen ;;
-            7) show_status_services; pause_screen ;;
-            8) show_concurrency_health; pause_screen ;;
+            2) show_status_patrols; pause_screen ;;
+            3) show_status_exits; pause_screen ;;
+            4) show_status_containers; pause_screen ;;
+            5) show_status_split; pause_screen ;;
+            6) show_status_split_dns_live; pause_screen ;;
+            7) show_status_routes; pause_screen ;;
+            8) show_status_nft; pause_screen ;;
+            9) show_status_services; pause_screen ;;
+            10) show_concurrency_health; pause_screen ;;
+            11) show_concurrency_capacity_advice; pause_screen ;;
+            12) show_status; pause_screen ;;
             0) return 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -11054,19 +11062,16 @@ interactive_proxy_optimization_menu() {
 当前默认: log=$PROXY_LOG_LEVEL  stack=$PROXY_TUN_STACK
 入口机直连: $(entry_direct_summary)
 
-  1. 查看入口机与各出口并发健康
-  2. 设置单个 sing-box 出口运行模式
-  3. 全部应用推荐低负载模式
-  4. 全部恢复兼容模式
-  5. 查看 conntrack 与临时端口容量建议
+  1. 设置单个 sing-box 出口运行模式
+  2. 全部应用推荐低负载模式
+  3. 全部恢复兼容模式
   0. 返回主菜单
 ============================================================
 EOF
-        read -r -p "请输入选项 [0-5]: " choice
+        read -r -p "请输入选项 [0-3]: " choice
         case "$choice" in
-            1) show_concurrency_health; pause_screen ;;
-            2) interactive_configure_proxy_exit; pause_screen ;;
-            3)
+            1) interactive_configure_proxy_exit; pause_screen ;;
+            2)
                 if confirm_yes "确认依次重启全部 sing-box 出口并应用推荐低负载模式吗"; then
                     apply_recommended_proxy_profile
                 else
@@ -11074,7 +11079,7 @@ EOF
                 fi
                 pause_screen
                 ;;
-            4)
+            3)
                 if confirm_yes "确认依次重启全部 sing-box 出口并恢复兼容模式吗"; then
                     restore_compatible_proxy_profile
                 else
@@ -11082,7 +11087,6 @@ EOF
                 fi
                 pause_screen
                 ;;
-            5) show_concurrency_capacity_advice; pause_screen ;;
             0) return 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -12439,7 +12443,7 @@ interactive_menu() {
         printf '    %s[14]%s 从 GitHub 安全更新          %s[15]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
         printf '    %s[16]%s 彻底卸载                    %s[17]%s 重建当前版本组件（不联网）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
         printf '    %s[18]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
-        printf '    固定在线更新命令：%ssbout update-github%s（跨版本请使用命令，不要记忆菜单编号）\n' "$UI_YELLOW" "$UI_RESET"
+        printf '    固定更新命令：%ssbout update-github && sbout upgrade%s（跨版本请使用命令，不要记忆菜单编号）\n' "$UI_YELLOW" "$UI_RESET"
         printf '\n'
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$UI_GREEN" "$UI_RESET"
@@ -12488,7 +12492,7 @@ show_status_overview() {
     if [ "$component_state" != "已匹配" ]; then
         printf '[WARN] 主脚本与 controller/autosync/out 版本不一致，请执行: sbout upgrade\n'
     fi
-    printf '固定在线更新命令: sbout update-github\n'
+    printf '固定更新命令: sbout update-github && sbout upgrade\n'
     printf 'API 监听: %s:%s  容器访问地址: %s\n' "$API_BIND" "$API_PORT" "$API_PUBLIC_URL"
     printf '容器网桥: %s\n' "$BRIDGE_IFACES"
     printf '自动同步: %s  间隔: %ss  Project: %s\n' "$AUTO_SYNC" "$AUTO_INTERVAL" "$AUTO_PROJECTS"
@@ -12546,6 +12550,144 @@ show_status_containers() {
         return 0
     fi
     read_container_rows | awk -F '\t' '{cur=$5; if (cur=="-") cur="入口机"; print "  "$1"\t"$2"\tallowed="$4"\tcurrent="cur}' || true
+    printf '\n异常网络跳过记录:\n'
+    if [ -f "$CONFIG_DIR/autosync-state.json" ] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$CONFIG_DIR/autosync-state.json" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        skipped = json.load(fh).get("skipped_instances", {})
+except Exception as exc:
+    print("  [WARN] 无法读取自动同步状态：%s" % exc)
+    raise SystemExit(0)
+if not skipped:
+    print("  暂无，所有已发现实例网络状态正常。")
+else:
+    for name, reason in sorted(skipped.items()):
+        print("  - %s：%s" % (name, reason))
+PY
+    else
+        printf '  暂无可读取的自动同步状态。\n'
+    fi
+}
+
+show_status_patrols() {
+    load_config
+    local autosync_state="$CONFIG_DIR/autosync-state.json"
+    local dns_state="$CONFIG_DIR/split/dns-health-state.json"
+    local component_state nft_state autosync_service api_service pending_state
+    component_state="$(component_build_status)"
+    if command -v systemctl >/dev/null 2>&1; then
+        autosync_service="$(systemctl is-active "$APP_NAME-autosync" 2>/dev/null || true)"
+        api_service="$(systemctl is-active "$APP_NAME" 2>/dev/null || true)"
+    else
+        autosync_service="不可用"
+        api_service="不可用"
+    fi
+    [ -n "$autosync_service" ] || autosync_service="未安装"
+    [ -n "$api_service" ] || api_service="未安装"
+    if command -v nft >/dev/null 2>&1 && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        nft_state="已加载"
+    else
+        nft_state="缺失或不可读"
+    fi
+    if [ -e "$PENDING_NFT_FILE" ]; then
+        pending_state="是（后台下一轮会重试）"
+    else
+        pending_state="否"
+    fi
+
+    printf '============================================================\n'
+    printf '                 自动巡检与失败退避状态\n'
+    printf '============================================================\n'
+    printf '说明: 读取后台巡检记录与本机状态，不触发扫描、同步或修复。\n\n'
+    printf '基础状态:\n'
+    printf '  API 服务: %s  自动同步服务: %s\n' "$api_service" "$autosync_service"
+    printf '  运行组件: %s  nft 表: %s  待应用: %s\n' "$component_state" "$nft_state" "$pending_state"
+    printf '  自动同步周期: %ss  数据面巡检: %ss  DNS 巡检: %ss  失败退避上限: %ss\n' \
+        "$AUTO_INTERVAL" "$AUTO_DATAPLANE_VERIFY_INTERVAL" "$SPLIT_DNS_HEALTH_INTERVAL" "$AUTO_REPAIR_BACKOFF_MAX"
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$autosync_state" "$dns_state" <<'PY'
+import datetime
+import json
+import os
+import sys
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            value = json.load(fh)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def stamp(value):
+    try:
+        value = float(value or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        return "未记录"
+    return datetime.datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+autosync_path, dns_path = sys.argv[1:3]
+autosync = load(autosync_path)
+dns = load(dns_path)
+injected = autosync.get("injected")
+skipped = autosync.get("skipped_instances")
+injected_count = len(injected) if isinstance(injected, dict) else 0
+skipped_count = len(skipped) if isinstance(skipped, dict) else 0
+dataplane_failures = autosync.get("dataplane_verify_failures", 0) or 0
+dns_failures = dns.get("failures", 0) or 0
+
+print("\n数据面自动巡检:")
+print("  最近尝试: %s" % stamp(autosync.get("last_dataplane_verify_attempt")))
+print("  最近成功: %s" % stamp(autosync.get("last_dataplane_verify")))
+print("  连续失败: %s  已注入客户端: %s  异常跳过: %s" % (
+    dataplane_failures, injected_count, skipped_count,
+))
+if not os.path.exists(autosync_path):
+    print("  [INFO] 暂无自动同步状态文件，服务完成首轮巡检后会生成。")
+
+print("\n分流 DNS 自动巡检:")
+print("  最近尝试: %s" % stamp(dns.get("last_attempt")))
+print("  最近成功: %s" % stamp(dns.get("last_success")))
+print("  连续失败: %s" % dns_failures)
+if not os.path.exists(dns_path):
+    print("  [INFO] 暂无 DNS 巡检状态文件，启用分流并完成首轮巡检后会生成。")
+PY
+    else
+        printf '\n[WARN] 未安装 python3，无法解析巡检状态文件。\n'
+    fi
+    printf '\n提示: 如需现场检测分流 DNS，请返回后选择 6；该检测同样不会自动修复。\n'
+}
+
+show_status_split_dns_live() {
+    load_config
+    local reason=""
+    printf '============================================================\n'
+    printf '                 分流 DNS 即时健康检查\n'
+    printf '============================================================\n'
+    printf '检测方式: 只读核对动态集合、网桥 DNS 配置、兼容服务及 DNS 响应。\n'
+    printf '本次不会刷新缓存、重建 nftables 或重启服务。\n'
+    printf '当前模式: %s\n' "$(split_dnsmasq_status_label)"
+    printf '后台周期: %ss  失败退避上限: %ss\n\n' "$SPLIT_DNS_HEALTH_INTERVAL" "$AUTO_REPAIR_BACKOFF_MAX"
+    if [ "${ENABLE_SPLIT_RULES:-true}" != "true" ]; then
+        printf '[INFO] 分流功能已禁用，无需检查。\n'
+        return 0
+    fi
+    if reason="$(split_dns_health_check 2>&1)"; then
+        printf '[OK] 分流 DNS 动态组件、nft 集合与响应检查通过。\n'
+    else
+        printf '[WARN] 分流 DNS 即时检查未通过: %s\n' "${reason:-未知错误}"
+        printf '后台巡检会按失败退避策略重试；如需人工修复可执行 sbout split-dns-health --repair。\n'
+    fi
 }
 
 show_status_split() {
@@ -12755,6 +12897,8 @@ show_concurrency_capacity_advice() {
 show_status() {
     show_status_overview
     printf '\n'
+    show_status_patrols
+    printf '\n'
     show_status_exits
     printf '\n'
     show_status_containers
@@ -12890,6 +13034,7 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       从 GitHub 下载最新版，然后复用 upgrade-config 的预检、备份、健康检查和自动回滚流程。
       下载 SHA256 必须与最终安装 SHA256 一致，否则自动回滚；该命令不受不同版本菜单编号变化影响。
       默认地址: $DEFAULT_UPDATE_SCRIPT_URL
+      跨旧版本固定更新命令: sbout update-github && sbout upgrade
 
   sbout
       安装后可直接输入 sbout 进入主菜单。
