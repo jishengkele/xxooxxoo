@@ -8210,6 +8210,7 @@ AUTO_COMMAND_TIMEOUT = max(5, int(os.environ.get("AUTO_COMMAND_TIMEOUT", CFG.get
 AUTO_DELETE_GRACE_SCANS = max(1, int(os.environ.get("AUTO_DELETE_GRACE_SCANS", CFG.get("AUTO_DELETE_GRACE_SCANS", "2"))))
 AUTO_RECONCILE_MIN_INTERVAL = max(1, int(os.environ.get("AUTO_RECONCILE_MIN_INTERVAL", CFG.get("AUTO_RECONCILE_MIN_INTERVAL", "10"))))
 AUTO_EVENT_DEBOUNCE = max(0.0, float(os.environ.get("AUTO_EVENT_DEBOUNCE", CFG.get("AUTO_EVENT_DEBOUNCE", "2"))))
+MANAGED_BRIDGES = set(os.environ.get("BRIDGE_IFACES", CFG.get("BRIDGE_IFACES", "incusbr0 lxdbr0")).split())
 ENABLE_SPLIT_RULES = os.environ.get("ENABLE_SPLIT_RULES", CFG.get("ENABLE_SPLIT_RULES", "true")).lower() == "true"
 SPLIT_UPDATE_INTERVAL = int(os.environ.get("SPLIT_UPDATE_INTERVAL", CFG.get("SPLIT_UPDATE_INTERVAL", "259200")))
 SPLIT_DNS_REFRESH_INTERVAL = int(os.environ.get("SPLIT_DNS_REFRESH_INTERVAL", CFG.get("SPLIT_DNS_REFRESH_INTERVAL", "21600")))
@@ -8324,8 +8325,50 @@ def instance_state(project, name):
         return {}
 
 
-def pick_ip_from_state(state):
+def managed_network_identity(inst):
+    devices = inst.get("expanded_devices") or inst.get("devices") or {}
+    guest_ifaces = []
+    configured_ips = []
+    for device_name, device in devices.items():
+        if not isinstance(device, dict) or device.get("type") != "nic":
+            continue
+        parent = str(device.get("network") or device.get("parent") or "").strip()
+        if parent not in MANAGED_BRIDGES:
+            continue
+        guest_name = str(device.get("name") or device_name or "").strip()
+        if guest_name and guest_name not in guest_ifaces:
+            guest_ifaces.append(guest_name)
+        for key in ("ipv4.address", "ipv6.address"):
+            raw = str(device.get(key) or "").strip()
+            if not raw or raw.lower() in ("auto", "dhcp", "none"):
+                continue
+            for value in raw.split(","):
+                value = value.strip().split("/", 1)[0]
+                if not value:
+                    continue
+                try:
+                    normalized = normalize_ip(value)
+                except ValueError:
+                    continue
+                if normalized not in configured_ips:
+                    configured_ips.append(normalized)
+    return guest_ifaces, configured_ips
+
+
+def pick_ip_from_state(state, managed_ifaces=None, configured_ips=None):
     network = state.get("network") or {}
+    managed_ifaces = list(managed_ifaces or [])
+    configured_ips = list(configured_ips or [])
+    if not managed_ifaces:
+        # 旧版/特殊 profile 可能没有展开设备信息；Incus 创建的 veth
+        # 在 state 中带有 host_name，而容器内部 docker0/cni0 等没有。
+        managed_ifaces = [
+            iface for iface, data in network.items()
+            if iface != "lo" and str(data.get("host_name") or "").strip()
+        ]
+
+    managed_addresses = []
+    unexpected_addresses = []
     for iface, data in network.items():
         if iface == "lo":
             continue
@@ -8333,18 +8376,42 @@ def pick_ip_from_state(state):
             family = addr.get("family")
             scope = addr.get("scope")
             address = addr.get("address")
-            if family == "inet" and address and scope in ("global", ""):
-                return normalize_ip(address)
-    for iface, data in network.items():
-        if iface == "lo":
-            continue
-        for addr in data.get("addresses") or []:
-            family = addr.get("family")
-            scope = addr.get("scope")
-            address = addr.get("address")
-            if family == "inet6" and address and scope == "global":
-                return normalize_ip(address)
-    return ""
+            if family not in ("inet", "inet6") or not address or scope not in ("global", ""):
+                continue
+            try:
+                normalized = normalize_ip(address)
+            except ValueError:
+                continue
+            item = (iface, normalized)
+            if iface in managed_ifaces:
+                if item not in managed_addresses:
+                    managed_addresses.append(item)
+            elif item not in unexpected_addresses:
+                unexpected_addresses.append(item)
+
+    if unexpected_addresses:
+        details = ", ".join("%s=%s" % item for item in unexpected_addresses)
+        return "", "检测到非 Incus 主网卡的全局地址: %s" % details
+    if not managed_ifaces:
+        return "", "无法识别挂载到面板网桥的实例网卡"
+    if not managed_addresses:
+        return "", ""
+
+    configured_set = set(configured_ips)
+    if configured_set:
+        for _iface, address in managed_addresses:
+            if address in configured_set:
+                return address, ""
+        details = ", ".join("%s=%s" % item for item in managed_addresses)
+        return "", "主网卡地址与面板配置不一致: %s" % details
+
+    ipv4 = [address for _iface, address in managed_addresses if ":" not in address]
+    ipv6 = [address for _iface, address in managed_addresses if ":" in address]
+    candidates = ipv4 or ipv6
+    if len(set(candidates)) > 1:
+        details = ", ".join("%s=%s" % item for item in managed_addresses)
+        return "", "主网卡存在多个候选地址，无法安全确认默认 IP: %s" % details
+    return candidates[0], ""
 
 
 def list_instances(project):
@@ -8365,12 +8432,15 @@ def list_instances(project):
         if not include_instance(project, name):
             continue
         status = inst.get("status") or ""
+        managed_ifaces, configured_ips = managed_network_identity(inst)
         candidates.append({
             "project": project,
             "name": name,
             "status": status,
             "list_state": inst.get("state") or {},
             "fingerprint": (inst.get("config") or {}).get("volatile.uuid", "") or str(inst.get("created_at") or ""),
+            "managed_ifaces": managed_ifaces,
+            "configured_ips": configured_ips,
         })
     return candidates
 
@@ -8424,22 +8494,31 @@ def discover_instances(existing, refresh_ips=False):
         item = dict(inst)
         known = existing.get(inst["key"], {}).get("ip", "")
         state = inst.get("list_state") or {}
-        ip = pick_ip_from_state(state)
+        ip, skip_reason = pick_ip_from_state(
+            state,
+            inst.get("managed_ifaces"),
+            inst.get("configured_ips"),
+        )
         if inst.get("status", "").lower() == "running":
-            if not ip and known and not refresh_ips:
+            if not ip and not skip_reason and known and not refresh_ips:
                 ip = known
-            if not ip:
+            if not ip and not skip_reason:
                 needs_query.append(inst)
                 continue
         elif known:
             ip = known
         item["ip"] = ip
+        item["skip_reason"] = skip_reason
         item.pop("list_state", None)
         ready.append(item)
 
     def query_state(inst):
         item = dict(inst)
-        item["ip"] = pick_ip_from_state(instance_state(inst["project"], inst["name"]))
+        item["ip"], item["skip_reason"] = pick_ip_from_state(
+            instance_state(inst["project"], inst["name"]),
+            inst.get("managed_ifaces"),
+            inst.get("configured_ips"),
+        )
         item.pop("list_state", None)
         return item
 
@@ -8638,6 +8717,7 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
     state = load_state()
     injected = state.setdefault("injected", {})
     missing_counts = state.setdefault("missing_counts", {})
+    previous_skipped = state.setdefault("skipped_instances", {})
     now = time.time()
     last_verify = float(state.get("last_client_verify", 0) or 0)
     last_ip_refresh = float(state.get("last_ip_refresh", 0) or 0)
@@ -8652,8 +8732,17 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
     if refresh_ips and scan_complete:
         state["last_ip_refresh"] = now
 
+    current_skipped = {}
     ip_owners = {}
     for key, inst in found.items():
+        skip_reason = inst.get("skip_reason", "")
+        if skip_reason:
+            current_skipped[key] = skip_reason
+            if force_client_check or previous_skipped.get(key) != skip_reason:
+                log("警告跳过异常网络实例: %s；%s。该实例不参与本轮授权和 out 注入，其他实例继续同步" % (
+                    key, skip_reason,
+                ))
+            continue
         ip = inst.get("ip", "")
         if not ip:
             continue
@@ -8671,6 +8760,11 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
         removed_containers = set()
 
         for key, inst in sorted(found.items()):
+            if inst.get("skip_reason"):
+                if key in existing:
+                    new_rows.append(existing[key])
+                    missing_counts.pop(key, None)
+                continue
             running = inst.get("status", "").lower() == "running"
             if AUTO_RUNNING_ONLY and not running and key not in existing:
                 continue
@@ -8760,6 +8854,11 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
             os.replace(tmp_path, PENDING_NFT_FILE)
             # 先持久化待应用标记；即使此刻进程退出，下一轮也会补做 nft 提交。
             save_state(state)
+
+    for key in sorted(set(previous_skipped) - set(current_skipped)):
+        if key in found and not found[key].get("skip_reason"):
+            log("实例网络状态已恢复，重新纳入自动同步: %s" % key)
+    state["skipped_instances"] = current_skipped
 
     apply_error = None
     if changed or state.get("apply_pending") or os.path.exists(PENDING_NFT_FILE):
