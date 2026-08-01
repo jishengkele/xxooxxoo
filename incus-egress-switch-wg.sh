@@ -33,6 +33,7 @@ NFT_STATE_FILE="$RUN_DIR/nft.state"
 STATE_LOCK_FILE="$CONFIG_DIR/.state.lock"
 APPLY_LOCK_FILE="$RUN_DIR/apply.lock"
 PENDING_NFT_FILE="$CONFIG_DIR/.nft-apply-pending"
+UPSTREAM_HEALTH_STATE_FILE="$CONFIG_DIR/upstream-health-state.json"
 SYSCTL_FILE="/etc/sysctl.d/99-$APP_NAME.conf"
 SYSCTL_ORIGINAL_FILE="$CONFIG_DIR/sysctl-original.env"
 SPLIT_CACHE_LOCK_FILE="$SPLIT_DIR/.split-cache.lock"
@@ -843,6 +844,14 @@ load_config() {
     AUTO_CLIENT_VERIFY_INTERVAL="${AUTO_CLIENT_VERIFY_INTERVAL:-300}"
     AUTO_STATE_REFRESH_INTERVAL="${AUTO_STATE_REFRESH_INTERVAL:-300}"
     AUTO_DATAPLANE_VERIFY_INTERVAL="${AUTO_DATAPLANE_VERIFY_INTERVAL:-30}"
+    AUTO_UPSTREAM_HEALTH_INTERVAL="${AUTO_UPSTREAM_HEALTH_INTERVAL:-30}"
+    UPSTREAM_DNS_CONFIRMATIONS="${UPSTREAM_DNS_CONFIRMATIONS:-2}"
+    WG_HANDSHAKE_WARN_AGE="${WG_HANDSHAKE_WARN_AGE:-180}"
+    WG_ENDPOINT_RECOVERY_GRACE="${WG_ENDPOINT_RECOVERY_GRACE:-90}"
+    PROXY_DDNS_RESTART_ON_CHANGE="${PROXY_DDNS_RESTART_ON_CHANGE:-true}"
+    UPSTREAM_PROBE_INTERVAL="${UPSTREAM_PROBE_INTERVAL:-60}"
+    UPSTREAM_PROBE_TIMEOUT="${UPSTREAM_PROBE_TIMEOUT:-4}"
+    UPSTREAM_PROBE_FAILURE_THRESHOLD="${UPSTREAM_PROBE_FAILURE_THRESHOLD:-2}"
     AUTO_REPAIR_BACKOFF_MAX="${AUTO_REPAIR_BACKOFF_MAX:-300}"
     AUTO_CLIENT_PATH="${AUTO_CLIENT_PATH:-/usr/local/bin/out}"
     AUTO_TOKEN_PATH="${AUTO_TOKEN_PATH:-/etc/incus-egress-token}"
@@ -1253,6 +1262,17 @@ AUTO_STATE_REFRESH_INTERVAL="300"
 # 只读取小型源 IP 集合和 ip rule；发现缺失或错配时才重建数据面。
 AUTO_DATAPLANE_VERIFY_INTERVAL="30"
 
+# 上游出口巡检间隔。按“出口”检查而不是按“实例”检查，因此实例数量不会增加巡检开销。
+# WG 域名 Endpoint 连续确认变化后会原地刷新 Peer；单 IP 的 sing-box DDNS 变化后只重启对应出口服务。
+AUTO_UPSTREAM_HEALTH_INTERVAL="30"
+UPSTREAM_DNS_CONFIRMATIONS="2"
+WG_HANDSHAKE_WARN_AGE="180"
+WG_ENDPOINT_RECOVERY_GRACE="90"
+PROXY_DDNS_RESTART_ON_CHANGE="true"
+UPSTREAM_PROBE_INTERVAL="60"
+UPSTREAM_PROBE_TIMEOUT="4"
+UPSTREAM_PROBE_FAILURE_THRESHOLD="2"
+
 # 数据面或分流 DNS 连续修复失败时的最大退避秒数。
 # 默认按 60、120、300 秒递增，修复成功后立即恢复正常巡检间隔。
 AUTO_REPAIR_BACKOFF_MAX="300"
@@ -1639,6 +1659,14 @@ ensure_runtime_config_defaults() {
     ensure_config_default AUTO_INSTALL_CLIENT true
     ensure_config_default AUTO_CLIENT_VERIFY_INTERVAL 300
     ensure_config_default AUTO_DATAPLANE_VERIFY_INTERVAL 30
+    ensure_config_default AUTO_UPSTREAM_HEALTH_INTERVAL 30
+    ensure_config_default UPSTREAM_DNS_CONFIRMATIONS 2
+    ensure_config_default WG_HANDSHAKE_WARN_AGE 180
+    ensure_config_default WG_ENDPOINT_RECOVERY_GRACE 90
+    ensure_config_default PROXY_DDNS_RESTART_ON_CHANGE true
+    ensure_config_default UPSTREAM_PROBE_INTERVAL 60
+    ensure_config_default UPSTREAM_PROBE_TIMEOUT 4
+    ensure_config_default UPSTREAM_PROBE_FAILURE_THRESHOLD 2
     ensure_config_default AUTO_REPAIR_BACKOFF_MAX 300
     ensure_config_default AUTO_CLIENT_PATH "/usr/local/bin/out"
     ensure_config_default AUTO_TOKEN_PATH "/etc/incus-egress-token"
@@ -2185,11 +2213,19 @@ validate_runtime_config() {
     valid_bool_value "$SPLIT_DNSMASQ_NFTSET" || die "SPLIT_DNSMASQ_NFTSET 必须是 true 或 false"
     valid_bool_value "$SPLIT_DNS_SIDECAR_FALLBACK" || die "SPLIT_DNS_SIDECAR_FALLBACK 必须是 true 或 false"
     valid_bool_value "$SPLIT_DNS_FORCE_SIDECAR" || die "SPLIT_DNS_FORCE_SIDECAR 必须是 true 或 false"
+    valid_bool_value "$PROXY_DDNS_RESTART_ON_CHANGE" || die "PROXY_DDNS_RESTART_ON_CHANGE 必须是 true 或 false"
     [[ "$SPLIT_DNS_SIDECAR_PORT" =~ ^[0-9]+$ ]] &&
         [ "$SPLIT_DNS_SIDECAR_PORT" -ge 1024 ] &&
         [ "$SPLIT_DNS_SIDECAR_PORT" -le 65535 ] ||
         die "SPLIT_DNS_SIDECAR_PORT 必须是 1024-65535 的整数"
     [[ "$CONCURRENCY_WARN_PERCENT" =~ ^[0-9]+$ ]] && [ "$CONCURRENCY_WARN_PERCENT" -ge 50 ] && [ "$CONCURRENCY_WARN_PERCENT" -le 99 ] || die "并发健康告警阈值必须是 50-99: $CONCURRENCY_WARN_PERCENT"
+    [[ "$AUTO_UPSTREAM_HEALTH_INTERVAL" =~ ^[0-9]+$ ]] && [ "$AUTO_UPSTREAM_HEALTH_INTERVAL" -ge 15 ] && [ "$AUTO_UPSTREAM_HEALTH_INTERVAL" -le 3600 ] || die "上游巡检间隔必须是 15-3600 秒"
+    [[ "$UPSTREAM_DNS_CONFIRMATIONS" =~ ^[0-9]+$ ]] && [ "$UPSTREAM_DNS_CONFIRMATIONS" -ge 1 ] && [ "$UPSTREAM_DNS_CONFIRMATIONS" -le 5 ] || die "DDNS 变化确认次数必须是 1-5"
+    [[ "$WG_HANDSHAKE_WARN_AGE" =~ ^[0-9]+$ ]] && [ "$WG_HANDSHAKE_WARN_AGE" -ge 60 ] && [ "$WG_HANDSHAKE_WARN_AGE" -le 86400 ] || die "WG 握手告警阈值必须是 60-86400 秒"
+    [[ "$WG_ENDPOINT_RECOVERY_GRACE" =~ ^[0-9]+$ ]] && [ "$WG_ENDPOINT_RECOVERY_GRACE" -ge 30 ] && [ "$WG_ENDPOINT_RECOVERY_GRACE" -le 3600 ] || die "WG Endpoint 恢复宽限必须是 30-3600 秒"
+    [[ "$UPSTREAM_PROBE_INTERVAL" =~ ^[0-9]+$ ]] && [ "$UPSTREAM_PROBE_INTERVAL" -ge 0 ] && [ "$UPSTREAM_PROBE_INTERVAL" -le 3600 ] || die "真实出口探测间隔必须是 0-3600 秒"
+    [[ "$UPSTREAM_PROBE_TIMEOUT" =~ ^[0-9]+$ ]] && [ "$UPSTREAM_PROBE_TIMEOUT" -ge 2 ] && [ "$UPSTREAM_PROBE_TIMEOUT" -le 15 ] || die "真实出口探测超时必须是 2-15 秒"
+    [[ "$UPSTREAM_PROBE_FAILURE_THRESHOLD" =~ ^[0-9]+$ ]] && [ "$UPSTREAM_PROBE_FAILURE_THRESHOLD" -ge 1 ] && [ "$UPSTREAM_PROBE_FAILURE_THRESHOLD" -le 5 ] || die "真实出口连续失败阈值必须是 1-5"
     bridge_set_expr >/dev/null
 }
 
@@ -5226,6 +5262,606 @@ print_wireguard_exit_details() {
         "$(wireguard_bytes_label "$rx")" "$(wireguard_bytes_label "$tx")"
     printf '%s入口机公钥: %s\n' "$indent" "${local_public:--}"
     printf '%s出口机公钥: %s\n' "$indent" "${runtime_peer:-${peer_public:--}}"
+}
+
+# 检查出口服务与 DDNS 端点。WG 的域名只在接口启动时解析一次，因此必须把
+# 配置域名当前解析结果与内核运行时 Endpoint 对比；确认变化后用 wg set 原地更新，
+# 不重启接口、不重建路由/nft，也不扫描容器。sing-box 会在新连接时重新解析域名，
+# 对单地址 DDNS 则在确认变化后只重启对应出口服务，以尽快清掉指向旧 IP 的连接。
+upstream_health() {
+    load_config
+    need_cmd python3
+    local repair="false" quiet="false" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --repair) repair="true" ;;
+            --quiet) quiet="true" ;;
+            *) die "用法: $0 upstream-health [--repair] [--quiet]" ;;
+        esac
+    done
+    mkdir -p "$CONFIG_DIR"
+    python3 - "$EXITS_FILE" "$EXIT_DIR" "$UPSTREAM_HEALTH_STATE_FILE" "$repair" "$quiet" \
+        "$UPSTREAM_DNS_CONFIRMATIONS" "$WG_HANDSHAKE_WARN_AGE" "$WG_ENDPOINT_RECOVERY_GRACE" \
+        "$PROXY_DDNS_RESTART_ON_CHANGE" "$UPSTREAM_PROBE_INTERVAL" "$UPSTREAM_PROBE_TIMEOUT" \
+        "$UPSTREAM_PROBE_FAILURE_THRESHOLD" "$EXIT_SERVICE_PREFIX" <<'PY'
+import configparser
+import fcntl
+import glob
+import ipaddress
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import urlsplit
+
+
+(
+    exits_file,
+    exit_dir,
+    state_file,
+    repair_raw,
+    quiet_raw,
+    confirmations_raw,
+    handshake_age_raw,
+    recovery_grace_raw,
+    proxy_restart_raw,
+    probe_interval_raw,
+    probe_timeout_raw,
+    probe_threshold_raw,
+    service_prefix,
+) = sys.argv[1:]
+repair = repair_raw.lower() == "true"
+quiet = quiet_raw.lower() == "true"
+confirmations = max(1, min(int(confirmations_raw), 5))
+handshake_warn_age = max(60, int(handshake_age_raw))
+recovery_grace = max(30, int(recovery_grace_raw))
+proxy_restart = proxy_restart_raw.lower() == "true"
+probe_interval = max(0, int(probe_interval_raw))
+probe_timeout = max(2, min(int(probe_timeout_raw), 15))
+probe_threshold = max(1, min(int(probe_threshold_raw), 5))
+now = time.time()
+
+
+def run(args, timeout=8):
+    try:
+        return subprocess.run(args, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(args, 127, "", str(exc))
+
+
+def atomic_save(path, value):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix="upstream-health.", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(value, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+
+
+def load_state(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            value = json.load(fh)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def parse_endpoint(value):
+    try:
+        parsed = urlsplit("wg://" + value.strip())
+        if not parsed.hostname or parsed.port is None:
+            return None, None
+        return parsed.hostname, parsed.port
+    except ValueError:
+        return None, None
+
+
+def normalize_ip(value):
+    parsed = ipaddress.ip_address(value.split("%", 1)[0])
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped:
+        return str(parsed.ipv4_mapped)
+    return str(parsed)
+
+
+def split_runtime_endpoint(value):
+    value = (value or "").strip()
+    if not value or value == "(none)":
+        return None, None
+    try:
+        if value.startswith("["):
+            host, port = value[1:].split("]:", 1)
+        else:
+            host, port = value.rsplit(":", 1)
+        return normalize_ip(host), int(port)
+    except (ValueError, IndexError):
+        return None, None
+
+
+def render_endpoint(address, port):
+    ip = ipaddress.ip_address(address)
+    return "[%s]:%s" % (ip, port) if ip.version == 6 else "%s:%s" % (ip, port)
+
+
+def resolve_host(host):
+    try:
+        return [normalize_ip(host)]
+    except ValueError:
+        pass
+    addresses = []
+    for database in ("ahostsv4", "ahostsv6", "ahosts"):
+        result = run(["getent", database, host], timeout=4)
+        if result.returncode != 0:
+            continue
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            try:
+                address = normalize_ip(fields[0])
+            except ValueError:
+                continue
+            if address not in addresses:
+                addresses.append(address)
+    if not addresses and not shutil_which("getent"):
+        try:
+            for item in socket.getaddrinfo(host, None, 0, socket.SOCK_DGRAM):
+                address = normalize_ip(item[4][0])
+                if address not in addresses:
+                    addresses.append(address)
+        except (OSError, ValueError):
+            pass
+    return addresses
+
+
+def shutil_which(command):
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(directory, command)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def read_exit_rows(path):
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.rstrip("\n")
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                fields = line.split("\t", 5)
+                if len(fields) < 6:
+                    fields = line.split(None, 5)
+                if len(fields) >= 6:
+                    rows.append({
+                        "name": fields[0], "route4": fields[3], "route6": fields[4],
+                        "display": fields[5],
+                    })
+    except OSError:
+        pass
+    return rows
+
+
+def read_wg_config(path):
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+    try:
+        parser.read(path, encoding="utf-8")
+        return {
+            "endpoint": parser.get("Peer", "Endpoint", fallback="").strip(),
+            "peer": parser.get("Peer", "PublicKey", fallback="").strip(),
+        }
+    except (OSError, configparser.Error):
+        return {"endpoint": "", "peer": ""}
+
+
+def wg_runtime(iface, peer):
+    check = run(["wg", "show", iface])
+    if check.returncode != 0:
+        return False, "", 0
+    endpoint = ""
+    result = run(["wg", "show", iface, "endpoints"])
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and (not peer or fields[0] == peer):
+                endpoint = fields[1]
+                break
+    handshake = 0
+    result = run(["wg", "show", iface, "latest-handshakes"])
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and (not peer or fields[0] == peer):
+                try:
+                    handshake = int(fields[1])
+                except ValueError:
+                    handshake = 0
+                break
+    return True, endpoint, handshake
+
+
+def service_active(unit):
+    return run(["systemctl", "is-active", "--quiet", unit]).returncode == 0
+
+
+def choose_address(addresses, runtime_address):
+    if runtime_address:
+        try:
+            family = ipaddress.ip_address(runtime_address).version
+            for address in addresses:
+                if ipaddress.ip_address(address).version == family:
+                    return address
+        except ValueError:
+            pass
+    return addresses[0]
+
+
+def append_message(entry, message):
+    current = str(entry.get("message", "") or "")
+    entry["message"] = (current + "；" + message) if current else message
+
+
+def probe_interface(entry, old, iface, family):
+    """Return a hard-failure message, or an empty string."""
+    if probe_interval <= 0 or not iface or not shutil_which("curl"):
+        return ""
+    try:
+        last_probe = float(old.get("last_probe", 0) or 0)
+    except (TypeError, ValueError):
+        last_probe = 0.0
+    due = now - last_probe >= probe_interval
+    failures = int(old.get("probe_failures", 0) or 0)
+    if due:
+        if family == 6:
+            args = [
+                "curl", "-6", "-fsS", "--interface", iface,
+                "--connect-timeout", "2", "--max-time", str(probe_timeout),
+                "https://api64.ipify.org",
+            ]
+        else:
+            args = [
+                "curl", "-4", "-fsS", "--interface", iface,
+                "--connect-timeout", "2", "--max-time", str(probe_timeout),
+                "http://1.1.1.1/cdn-cgi/trace",
+            ]
+        result = run(args, timeout=probe_timeout + 2)
+        public_ip = ""
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                candidate = line.split("=", 1)[1].strip() if line.startswith("ip=") else line.strip()
+                try:
+                    parsed = normalize_ip(candidate)
+                except ValueError:
+                    continue
+                if ipaddress.ip_address(parsed).version == family:
+                    public_ip = parsed
+                    break
+        entry["last_probe"] = now
+        if public_ip:
+            failures = 0
+            entry["last_probe_success"] = now
+            entry["probe_ip"] = public_ip
+            entry["probe_status"] = "正常"
+            entry["probe_repair_attempted"] = False
+        else:
+            failures += 1
+            entry["probe_ip"] = ""
+            entry["probe_status"] = "失败"
+            entry["probe_repair_attempted"] = bool(old.get("probe_repair_attempted", False))
+    else:
+        entry["last_probe"] = last_probe
+        entry["last_probe_success"] = old.get("last_probe_success", 0)
+        entry["probe_ip"] = old.get("probe_ip", "")
+        entry["probe_status"] = old.get("probe_status", "未检查")
+        entry["probe_repair_attempted"] = bool(old.get("probe_repair_attempted", False))
+    entry["probe_failures"] = failures
+    if failures:
+        message = "真实出口探测连续 %s/%s 次失败" % (failures, probe_threshold)
+        append_message(entry, message)
+        if failures >= probe_threshold:
+            entry["status"] = "异常"
+            return message
+        if entry.get("status") == "正常":
+            entry["status"] = "待确认"
+    elif entry.get("probe_ip"):
+        append_message(entry, "出口 IPv%s %s" % (family, entry["probe_ip"]))
+    return ""
+
+
+lock_path = state_file + ".lock"
+os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+    previous = load_state(state_file)
+    previous_exits = previous.get("exits", {})
+    if not isinstance(previous_exits, dict):
+        previous_exits = {}
+    current_exits = {}
+    hard_failures = []
+    notices = []
+
+    for row in read_exit_rows(exits_file):
+        name = row["name"]
+        display = row["display"] or name
+        old = previous_exits.get(name, {})
+        if not isinstance(old, dict):
+            old = {}
+        wg_files = sorted(glob.glob(os.path.join(exit_dir, name, "cwg-*.conf")))
+        proxy_path = os.path.join(exit_dir, name, "config.json")
+
+        if wg_files:
+            conf_path = wg_files[0]
+            iface = os.path.splitext(os.path.basename(conf_path))[0]
+            config = read_wg_config(conf_path)
+            endpoint = config["endpoint"]
+            peer = config["peer"]
+            unit = "%s-%s.service" % (service_prefix, name)
+            host, port = parse_endpoint(endpoint)
+            entry = {
+                "type": "wireguard", "display": display, "interface": iface,
+                "configured_endpoint": endpoint, "last_checked": now,
+                "status": "异常", "message": "", "action": "", "service": unit,
+            }
+            if old.get("last_repair"):
+                entry["last_repair"] = old.get("last_repair")
+            if not host or not port or not peer:
+                entry["message"] = "WG 配置缺少有效 Endpoint 或 Peer 公钥"
+                hard_failures.append("%s: %s" % (display, entry["message"]))
+                current_exits[name] = entry
+                continue
+            addresses = resolve_host(host)
+            entry["resolved_addresses"] = addresses
+            active, runtime_endpoint, handshake = wg_runtime(iface, peer)
+            runtime_address, runtime_port = split_runtime_endpoint(runtime_endpoint)
+            entry["runtime_endpoint"] = runtime_endpoint
+            entry["latest_handshake"] = handshake
+            if not active:
+                entry["message"] = "WG 接口未启动"
+                hard_failures.append("%s: %s" % (display, entry["message"]))
+                current_exits[name] = entry
+                continue
+            if not addresses:
+                entry["message"] = "Endpoint 域名解析失败: %s" % host
+                hard_failures.append("%s: %s" % (display, entry["message"]))
+                current_exits[name] = entry
+                continue
+
+            matched = runtime_address in addresses and runtime_port == port
+            if not matched:
+                candidate = ",".join(sorted(addresses)) + ":%s" % port
+                count = int(old.get("candidate_count", 0) or 0) + 1 \
+                    if old.get("candidate") == candidate else 1
+                entry["candidate"] = candidate
+                entry["candidate_count"] = count
+                required = 1 if host in addresses else confirmations
+                if repair and count >= required:
+                    address = choose_address(addresses, runtime_address)
+                    new_endpoint = render_endpoint(address, port)
+                    changed = run(["wg", "set", iface, "peer", peer, "endpoint", new_endpoint])
+                    if changed.returncode == 0:
+                        runtime_endpoint = new_endpoint
+                        runtime_address = address
+                        matched = True
+                        entry["runtime_endpoint"] = new_endpoint
+                        entry["candidate"] = ""
+                        entry["candidate_count"] = 0
+                        entry["last_repair"] = now
+                        entry["action"] = "已原地刷新 WG Endpoint"
+                        notices.append("%s: %s -> %s" % (display, old.get("runtime_endpoint", "-") or "-", new_endpoint))
+                    else:
+                        entry["message"] = "刷新 WG Endpoint 失败: %s" % ((changed.stderr or "未知错误").strip())
+                        hard_failures.append("%s: %s" % (display, entry["message"]))
+                else:
+                    entry["status"] = "待确认"
+                    entry["message"] = "运行端点 %s 与 DNS 不一致（%s/%s 次）" % (
+                        runtime_endpoint or "未设置", count, required,
+                    )
+                    if not repair and count >= required:
+                        hard_failures.append("%s: %s" % (display, entry["message"]))
+
+            if matched:
+                entry["candidate"] = ""
+                entry["candidate_count"] = 0
+                entry["confirmed_addresses"] = addresses
+                age = int(max(0, now - handshake)) if handshake else 0
+                entry["handshake_age"] = age
+                last_repair = float(entry.get("last_repair", old.get("last_repair", 0)) or 0)
+                if handshake and age <= handshake_warn_age:
+                    entry["status"] = "正常"
+                    entry["message"] = "Endpoint 与 DNS 一致，%s 秒前握手" % age
+                    entry["wg_repair_attempted"] = False
+                elif last_repair and now - last_repair <= recovery_grace:
+                    entry["status"] = "恢复中"
+                    entry["message"] = "Endpoint 已刷新，等待下一次握手"
+                    entry["wg_repair_attempted"] = bool(old.get("wg_repair_attempted", False))
+                else:
+                    handshake_message = "Endpoint 正确，但%s" % (
+                        "尚无握手" if not handshake else "已 %s 秒未握手" % age
+                    )
+                    if repair and not bool(old.get("wg_repair_attempted", False)):
+                        restarted = run(["systemctl", "restart", unit], timeout=20)
+                        if restarted.returncode == 0:
+                            entry["status"] = "恢复中"
+                            entry["message"] = handshake_message + "；已重启对应 WG 出口一次"
+                            entry["action"] = "握手异常，已重启对应 WG 出口服务"
+                            entry["last_repair"] = now
+                            entry["wg_repair_attempted"] = True
+                            notices.append("%s: WG 长时间未握手，已重启对应出口服务一次" % display)
+                        else:
+                            entry["status"] = "异常"
+                            entry["message"] = handshake_message + "；WG 出口服务重启失败"
+                            entry["wg_repair_attempted"] = True
+                            hard_failures.append("%s: %s" % (display, entry["message"]))
+                    else:
+                        entry["status"] = "异常"
+                        entry["message"] = handshake_message
+                        entry["wg_repair_attempted"] = bool(old.get("wg_repair_attempted", False))
+                        hard_failures.append("%s: %s" % (display, entry["message"]))
+                if entry["status"] != "异常":
+                    family = 4 if str(row.get("route4", "none")) != "none" else 6
+                    probe_error = probe_interface(entry, old, iface, family)
+                    if probe_error:
+                        already_restarted = bool(entry.get("wg_repair_attempted", False))
+                        attempted = bool(entry.get("probe_repair_attempted", False))
+                        if repair and not attempted and not already_restarted:
+                            restarted = run(["systemctl", "restart", unit], timeout=20)
+                            if restarted.returncode == 0:
+                                entry["status"] = "恢复中"
+                                entry["probe_repair_attempted"] = True
+                                entry["last_repair"] = now
+                                entry["action"] = "真实探测失败，已重启对应 WG 出口服务"
+                                append_message(entry, "已自动重启对应出口一次")
+                                notices.append("%s: 真实出口探测失败，已重启对应 WG 服务一次" % display)
+                            else:
+                                hard_failures.append("%s: %s；服务重启失败" % (display, probe_error))
+                        else:
+                            hard_failures.append("%s: %s" % (display, probe_error))
+            current_exits[name] = entry
+            continue
+
+        if os.path.isfile(proxy_path):
+            entry = {
+                "type": "sing-box", "display": display, "last_checked": now,
+                "status": "异常", "message": "", "action": "",
+            }
+            if old.get("last_repair"):
+                entry["last_repair"] = old.get("last_repair")
+            try:
+                with open(proxy_path, encoding="utf-8") as fh:
+                    config = json.load(fh)
+                outbound = (config.get("outbounds") or [{}])[0]
+                host = str(outbound.get("server", "")).strip()
+                port = int(outbound.get("server_port", 0) or 0)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError, IndexError):
+                host, port = "", 0
+            unit = "%s-%s.service" % (service_prefix, name)
+            active = service_active(unit)
+            entry["service"] = unit
+            entry["server"] = "%s:%s" % (host, port) if host and port else ""
+            entry["service_active"] = active
+            if not active:
+                entry["message"] = "sing-box 出口服务未运行"
+                hard_failures.append("%s: %s" % (display, entry["message"]))
+                current_exits[name] = entry
+                continue
+            addresses = resolve_host(host) if host else []
+            entry["resolved_addresses"] = addresses
+            if not addresses:
+                entry["message"] = "节点域名解析失败: %s" % (host or "未配置")
+                hard_failures.append("%s: %s" % (display, entry["message"]))
+                current_exits[name] = entry
+                continue
+            confirmed = old.get("confirmed_addresses")
+            if not isinstance(confirmed, list) or not confirmed:
+                confirmed = addresses
+            if sorted(confirmed) != sorted(addresses):
+                candidate = ",".join(sorted(addresses))
+                count = int(old.get("candidate_count", 0) or 0) + 1 \
+                    if old.get("candidate") == candidate else 1
+                entry["candidate"] = candidate
+                entry["candidate_count"] = count
+                if count >= confirmations:
+                    should_restart = proxy_restart and len(confirmed) == 1 and len(addresses) == 1
+                    if repair and should_restart:
+                        restarted = run(["systemctl", "restart", unit], timeout=20)
+                        if restarted.returncode != 0:
+                            entry["message"] = "DDNS 已变化，但对应 sing-box 服务重启失败"
+                            hard_failures.append("%s: %s" % (display, entry["message"]))
+                            current_exits[name] = entry
+                            continue
+                        entry["action"] = "已重启对应 sing-box 出口服务"
+                        entry["last_repair"] = now
+                        notices.append("%s: DDNS %s -> %s，已重启对应服务" % (
+                            display, ",".join(confirmed), ",".join(addresses),
+                        ))
+                    elif repair:
+                        notices.append("%s: DDNS 地址集已变化；sing-box 将在新连接中自动采用" % display)
+                    entry["confirmed_addresses"] = addresses
+                    entry["candidate"] = ""
+                    entry["candidate_count"] = 0
+                    entry["status"] = "正常"
+                    entry["message"] = "节点域名已确认更新"
+                else:
+                    entry["confirmed_addresses"] = confirmed
+                    entry["status"] = "待确认"
+                    entry["message"] = "检测到节点 DNS 变化（%s/%s 次）" % (count, confirmations)
+            else:
+                entry["confirmed_addresses"] = addresses
+                entry["candidate"] = ""
+                entry["candidate_count"] = 0
+                entry["status"] = "正常"
+                entry["message"] = "服务运行且节点域名可解析"
+            if entry["status"] != "异常":
+                route4 = str(row.get("route4", "none"))
+                route6 = str(row.get("route6", "none"))
+                if route4.startswith("dev:"):
+                    probe_iface, family = route4[4:], 4
+                elif route6.startswith("dev:"):
+                    probe_iface, family = route6[4:], 6
+                else:
+                    probe_iface, family = "", 4
+                probe_error = probe_interface(entry, old, probe_iface, family)
+                if probe_error:
+                    attempted = bool(entry.get("probe_repair_attempted", False))
+                    already_restarted = bool(entry.get("action"))
+                    if repair and not attempted and not already_restarted:
+                        restarted = run(["systemctl", "restart", unit], timeout=20)
+                        if restarted.returncode == 0:
+                            entry["status"] = "恢复中"
+                            entry["probe_repair_attempted"] = True
+                            entry["last_repair"] = now
+                            entry["action"] = "真实探测失败，已重启对应 sing-box 出口服务"
+                            append_message(entry, "已自动重启对应出口一次")
+                            notices.append("%s: 真实出口探测失败，已重启对应 sing-box 服务一次" % display)
+                        else:
+                            hard_failures.append("%s: %s；服务重启失败" % (display, probe_error))
+                    else:
+                        hard_failures.append("%s: %s" % (display, probe_error))
+            current_exits[name] = entry
+
+    old_failures = int(previous.get("consecutive_failures", 0) or 0)
+    state = {
+        "last_attempt": now,
+        "last_success": previous.get("last_success", 0),
+        "consecutive_failures": old_failures + 1 if hard_failures else 0,
+        "repair_enabled": repair,
+        "exits": current_exits,
+    }
+    if not hard_failures:
+        state["last_success"] = now
+    atomic_save(state_file, state)
+
+    for message in notices:
+        print("[INFO] " + message)
+    for message in hard_failures:
+        print("[WARN] " + message)
+    if not quiet:
+        checked = len(current_exits)
+        healthy = sum(1 for item in current_exits.values() if item.get("status") == "正常")
+        recovering = sum(1 for item in current_exits.values() if item.get("status") in ("待确认", "恢复中"))
+        print("上游出口检查: 共 %s，正常 %s，确认/恢复中 %s，异常 %s。" % (
+            checked, healthy, recovering, len(hard_failures),
+        ))
+        for item in current_exits.values():
+            print("  - %s [%s]: %s" % (item.get("display", "-"), item.get("status", "-"), item.get("message", "")))
+    raise SystemExit(1 if hard_failures else 0)
+PY
 }
 
 stop_and_remove_exit_service() {
@@ -8506,6 +9142,7 @@ AUTO_INSTALL_CLIENT = os.environ.get("AUTO_INSTALL_CLIENT", CFG.get("AUTO_INSTAL
 AUTO_CLIENT_VERIFY_INTERVAL = int(os.environ.get("AUTO_CLIENT_VERIFY_INTERVAL", CFG.get("AUTO_CLIENT_VERIFY_INTERVAL", "300")))
 AUTO_STATE_REFRESH_INTERVAL = int(os.environ.get("AUTO_STATE_REFRESH_INTERVAL", CFG.get("AUTO_STATE_REFRESH_INTERVAL", "300")))
 AUTO_DATAPLANE_VERIFY_INTERVAL = max(5, int(os.environ.get("AUTO_DATAPLANE_VERIFY_INTERVAL", CFG.get("AUTO_DATAPLANE_VERIFY_INTERVAL", "30"))))
+AUTO_UPSTREAM_HEALTH_INTERVAL = max(0, int(os.environ.get("AUTO_UPSTREAM_HEALTH_INTERVAL", CFG.get("AUTO_UPSTREAM_HEALTH_INTERVAL", "30"))))
 AUTO_REPAIR_BACKOFF_MAX = max(60, int(os.environ.get("AUTO_REPAIR_BACKOFF_MAX", CFG.get("AUTO_REPAIR_BACKOFF_MAX", "300"))))
 AUTO_CLIENT_PATH = os.environ.get("AUTO_CLIENT_PATH", CFG.get("AUTO_CLIENT_PATH", "/usr/local/bin/out"))
 AUTO_TOKEN_PATH = os.environ.get("AUTO_TOKEN_PATH", CFG.get("AUTO_TOKEN_PATH", "/etc/incus-egress-token"))
@@ -8526,6 +9163,7 @@ SPLIT_LAST_SYNC_FILE = os.path.join(CONFIG_DIR, "split", "last-sync")
 SPLIT_LAST_DNS_REFRESH_FILE = os.path.join(CONFIG_DIR, "split", "last-dns-refresh")
 SPLIT_LAST_DNS_HEALTH_FILE = os.path.join(CONFIG_DIR, "split", "last-dns-health")
 SPLIT_DNS_HEALTH_STATE_FILE = os.path.join(CONFIG_DIR, "split", "dns-health-state.json")
+UPSTREAM_HEALTH_STATE_FILE = os.path.join(CONFIG_DIR, "upstream-health-state.json")
 SPLIT_CONTAINER_POLICIES_FILE = os.path.join(CONFIG_DIR, "split", "container-policies.tsv")
 RECONCILE_EVENT = threading.Event()
 
@@ -9601,6 +10239,48 @@ def maybe_check_split_dns_health(force=False):
         ))
 
 
+def maybe_check_upstream_health(force=False):
+    if AUTO_UPSTREAM_HEALTH_INTERVAL <= 0:
+        return
+    state = load_json_state(UPSTREAM_HEALTH_STATE_FILE)
+    try:
+        failures = max(0, int(state.get("consecutive_failures", 0) or 0))
+    except (TypeError, ValueError):
+        failures = 0
+    try:
+        last_attempt = float(state.get("last_attempt", 0) or 0)
+    except (TypeError, ValueError):
+        last_attempt = 0.0
+    # 上游故障不应延迟 DDNS Endpoint 的下一轮检查；失败也保持固定轻量周期。
+    interval = max(AUTO_UPSTREAM_HEALTH_INTERVAL, 15)
+    if not force and time.time() - last_attempt < interval:
+        return
+    try:
+        result = run(
+            [MANAGER_BIN, "upstream-health", "--repair", "--quiet"],
+            check=False,
+            capture=True,
+            timeout=max(AUTO_COMMAND_TIMEOUT, 45),
+        )
+    except Exception as exc:
+        log("上游出口巡检异常，稍后重试: %s" % exc)
+        return
+    output = (result.stdout or "").strip()
+    if output:
+        for line in output.splitlines()[-20:]:
+            log("upstream-health: %s" % line)
+    error = (result.stderr or "").strip()
+    if error:
+        for line in error.splitlines()[-10:]:
+            log("upstream-health: %s" % line)
+    if result.returncode != 0:
+        latest = load_json_state(UPSTREAM_HEALTH_STATE_FILE)
+        retry_failures = max(1, int(latest.get("consecutive_failures", 1) or 1))
+        log("上游出口巡检未通过（连续 %s 次），%s 秒后重试" % (
+            retry_failures, repair_retry_delay(retry_failures),
+        ))
+
+
 def watch_events():
     cmd = ["incus", "monitor", "--type=lifecycle"]
     last_sync = 0.0
@@ -9631,6 +10311,7 @@ def main():
         maybe_sync_split_rules(force=False)
         maybe_refresh_split_dns(force=False)
         maybe_check_split_dns_health(force=True)
+        maybe_check_upstream_health(force=True)
         reconcile(force_client_check=True, force_ip_refresh=True)
         return
     threading.Thread(target=watch_events, daemon=True).start()
@@ -9648,6 +10329,7 @@ def main():
             maybe_sync_split_rules(force=False)
             maybe_refresh_split_dns(force=False)
             maybe_check_split_dns_health(force=False)
+            maybe_check_upstream_health(force=False)
             reconcile()
         except Exception as exc:
             log("定时同步失败: %s" % exc)
@@ -12498,7 +13180,9 @@ show_status_overview() {
     printf '自动同步: %s  间隔: %ss  Project: %s\n' "$AUTO_SYNC" "$AUTO_INTERVAL" "$AUTO_PROJECTS"
     printf '自动授权出口: %s  默认出口: %s  自动注入: %s  客户端巡检: %ss\n' "$(allowed_exits_label "$AUTO_ALLOW_EXITS")" "$(display_exit_name "${AUTO_DEFAULT_EXIT:--}")" "$AUTO_INSTALL_CLIENT" "$AUTO_CLIENT_VERIFY_INTERVAL"
     printf '运行中容器: %s  查询并发: %s  注入并发: %s  事件去抖: %ss\n' "$AUTO_RUNNING_ONLY" "$AUTO_SYNC_WORKERS" "$AUTO_INJECT_WORKERS" "$AUTO_EVENT_DEBOUNCE"
-    printf 'IP 完整复核: %ss  数据面巡检: %ss  分流 DNS 巡检: %ss  失败退避上限: %ss  删除保护: %s 轮\n' "$AUTO_STATE_REFRESH_INTERVAL" "$AUTO_DATAPLANE_VERIFY_INTERVAL" "$SPLIT_DNS_HEALTH_INTERVAL" "$AUTO_REPAIR_BACKOFF_MAX" "$AUTO_DELETE_GRACE_SCANS"
+    printf 'IP 完整复核: %ss  数据面巡检: %ss  分流 DNS: %ss  上游出口: %ss  退避上限: %ss  删除保护: %s 轮\n' \
+        "$AUTO_STATE_REFRESH_INTERVAL" "$AUTO_DATAPLANE_VERIFY_INTERVAL" "$SPLIT_DNS_HEALTH_INTERVAL" \
+        "$AUTO_UPSTREAM_HEALTH_INTERVAL" "$AUTO_REPAIR_BACKOFF_MAX" "$AUTO_DELETE_GRACE_SCANS"
     printf 'sing-box 新出口默认: log=%s stack=%s EIM-NAT=%s\n' \
         "$PROXY_LOG_LEVEL" "$PROXY_TUN_STACK" "$PROXY_ENDPOINT_INDEPENDENT_NAT"
     printf '入口机直连: %s\n' "$(entry_direct_summary)"
@@ -12577,6 +13261,7 @@ show_status_patrols() {
     load_config
     local autosync_state="$CONFIG_DIR/autosync-state.json"
     local dns_state="$CONFIG_DIR/split/dns-health-state.json"
+    local upstream_state="$UPSTREAM_HEALTH_STATE_FILE"
     local component_state nft_state autosync_service api_service pending_state
     component_state="$(component_build_status)"
     if command -v systemctl >/dev/null 2>&1; then
@@ -12606,11 +13291,12 @@ show_status_patrols() {
     printf '基础状态:\n'
     printf '  API 服务: %s  自动同步服务: %s\n' "$api_service" "$autosync_service"
     printf '  运行组件: %s  nft 表: %s  待应用: %s\n' "$component_state" "$nft_state" "$pending_state"
-    printf '  自动同步周期: %ss  数据面巡检: %ss  DNS 巡检: %ss  失败退避上限: %ss\n' \
-        "$AUTO_INTERVAL" "$AUTO_DATAPLANE_VERIFY_INTERVAL" "$SPLIT_DNS_HEALTH_INTERVAL" "$AUTO_REPAIR_BACKOFF_MAX"
+    printf '  自动同步周期: %ss  数据面巡检: %ss  分流 DNS: %ss  上游出口: %ss（真实探测 %ss）  退避上限: %ss\n' \
+        "$AUTO_INTERVAL" "$AUTO_DATAPLANE_VERIFY_INTERVAL" "$SPLIT_DNS_HEALTH_INTERVAL" \
+        "$AUTO_UPSTREAM_HEALTH_INTERVAL" "$UPSTREAM_PROBE_INTERVAL" "$AUTO_REPAIR_BACKOFF_MAX"
 
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "$autosync_state" "$dns_state" <<'PY'
+        python3 - "$autosync_state" "$dns_state" "$upstream_state" <<'PY'
 import datetime
 import json
 import os
@@ -12636,9 +13322,10 @@ def stamp(value):
     return datetime.datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
 
 
-autosync_path, dns_path = sys.argv[1:3]
+autosync_path, dns_path, upstream_path = sys.argv[1:4]
 autosync = load(autosync_path)
 dns = load(dns_path)
+upstream = load(upstream_path)
 injected = autosync.get("injected")
 skipped = autosync.get("skipped_instances")
 injected_count = len(injected) if isinstance(injected, dict) else 0
@@ -12661,11 +13348,40 @@ print("  最近成功: %s" % stamp(dns.get("last_success")))
 print("  连续失败: %s" % dns_failures)
 if not os.path.exists(dns_path):
     print("  [INFO] 暂无 DNS 巡检状态文件，启用分流并完成首轮巡检后会生成。")
+
+print("\n上游出口与 DDNS 自动巡检:")
+print("  最近尝试: %s" % stamp(upstream.get("last_attempt")))
+print("  最近成功: %s" % stamp(upstream.get("last_success")))
+print("  连续失败: %s" % (upstream.get("consecutive_failures", 0) or 0))
+exits = upstream.get("exits")
+if isinstance(exits, dict) and exits:
+    for name, item in sorted(exits.items()):
+        if not isinstance(item, dict):
+            continue
+        display = item.get("display") or name
+        kind = "WG" if item.get("type") == "wireguard" else "sing-box"
+        print("  - %s [%s/%s]: %s" % (
+            display, kind, item.get("status", "未记录"), item.get("message", ""),
+        ))
+        if item.get("type") == "wireguard":
+            print("      配置: %s  运行: %s" % (
+                item.get("configured_endpoint", "-") or "-",
+                item.get("runtime_endpoint", "-") or "-",
+            ))
+        if item.get("probe_status"):
+            print("      真实出口: %s  IP: %s  连续失败: %s" % (
+                item.get("probe_status", "未检查"), item.get("probe_ip", "-") or "-",
+                item.get("probe_failures", 0) or 0,
+            ))
+        if item.get("action"):
+            print("      最近动作: %s" % item.get("action"))
+else:
+    print("  [INFO] 暂无上游巡检记录；后台完成首轮检查后会生成。")
 PY
     else
         printf '\n[WARN] 未安装 python3，无法解析巡检状态文件。\n'
     fi
-    printf '\n提示: 如需现场检测分流 DNS，请返回后选择 6；该检测同样不会自动修复。\n'
+    printf '\n提示: 手动只读检查可执行 sbout upstream-health；立即修复可执行 sbout upstream-health --repair。\n'
 }
 
 show_status_split_dns_live() {
@@ -13055,6 +13771,10 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
   $0 split-dns-health [--repair]
       检查分流动态 DNS、nftset 配置、兼容服务和 DNS 响应；--repair 会自动恢复。
 
+  $0 upstream-health [--repair]
+      检查 WG 运行端点、握手、出口服务和节点 DDNS。
+      --repair 会连续确认域名变化后原地刷新 WG Endpoint，并只重启发生单 IP DDNS 变化的 sing-box 出口。
+
   $0 split-prepare binance
       拉取/解析单个应用规则并重新应用 nft；主要供容器 out split 自动调用。
 
@@ -13315,6 +14035,9 @@ case "$command_name" in
         ;;
     split-dns-health)
         split_dns_health "$@"
+        ;;
+    upstream-health|exit-health)
+        upstream_health "$@"
         ;;
     split-set)
         split_set_policy "$@"
