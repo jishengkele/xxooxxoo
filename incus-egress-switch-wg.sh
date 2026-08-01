@@ -5289,6 +5289,7 @@ import fcntl
 import glob
 import ipaddress
 import json
+import math
 import os
 import socket
 import subprocess
@@ -5517,6 +5518,48 @@ def append_message(entry, message):
     entry["message"] = (current + "；" + message) if current else message
 
 
+def parse_probe_ip(output, family):
+    for line in output.splitlines():
+        candidate = line.split("=", 1)[1].strip() if line.startswith("ip=") else line.strip()
+        try:
+            parsed = normalize_ip(candidate)
+        except ValueError:
+            continue
+        if ipaddress.ip_address(parsed).version == family:
+            return parsed
+    return ""
+
+
+def live_probe(iface, family):
+    if family == 6:
+        targets = [("-6", "https://api64.ipify.org")]
+    else:
+        # Cloudflare 的旧 HTTP IP 地址现会返回 301 HTML；直接使用 HTTPS 域名。
+        # 主目标快速失败或返回非 IP 内容时，在同一总超时预算内尝试备用目标。
+        targets = [
+            ("-4", "https://cloudflare.com/cdn-cgi/trace"),
+            ("-4", "https://api.ipify.org"),
+        ]
+    deadline = time.monotonic() + probe_timeout
+    for family_flag, url in targets:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        attempt_timeout = max(1, int(math.ceil(remaining)))
+        args = [
+            "curl", family_flag, "-fsSL", "--interface", iface,
+            "--connect-timeout", str(min(2, attempt_timeout)),
+            "--max-time", str(attempt_timeout), url,
+        ]
+        result = run(args, timeout=attempt_timeout + 1)
+        if result.returncode != 0:
+            continue
+        public_ip = parse_probe_ip(result.stdout, family)
+        if public_ip:
+            return public_ip
+    return ""
+
+
 def probe_interface(entry, old, iface, family):
     """Return a hard-failure message, or an empty string."""
     if probe_interval <= 0 or not iface or not shutil_which("curl"):
@@ -5528,30 +5571,7 @@ def probe_interface(entry, old, iface, family):
     due = now - last_probe >= probe_interval
     failures = int(old.get("probe_failures", 0) or 0)
     if due:
-        if family == 6:
-            args = [
-                "curl", "-6", "-fsS", "--interface", iface,
-                "--connect-timeout", "2", "--max-time", str(probe_timeout),
-                "https://api64.ipify.org",
-            ]
-        else:
-            args = [
-                "curl", "-4", "-fsS", "--interface", iface,
-                "--connect-timeout", "2", "--max-time", str(probe_timeout),
-                "http://1.1.1.1/cdn-cgi/trace",
-            ]
-        result = run(args, timeout=probe_timeout + 2)
-        public_ip = ""
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                candidate = line.split("=", 1)[1].strip() if line.startswith("ip=") else line.strip()
-                try:
-                    parsed = normalize_ip(candidate)
-                except ValueError:
-                    continue
-                if ipaddress.ip_address(parsed).version == family:
-                    public_ip = parsed
-                    break
+        public_ip = live_probe(iface, family)
         entry["last_probe"] = now
         if public_ip:
             failures = 0
@@ -11505,16 +11525,17 @@ interactive_status() {
   4. 容器同步与异常跳过
   5. 分流策略
   6. 分流 DNS 即时健康检查（只读）
-  7. 策略路由
-  8. nftables 规则
-  9. 服务状态
- 10. 入口机与 sing-box 并发健康
- 11. conntrack 与临时端口容量建议
- 12. 查看全部详细状态
+  7. 上游出口即时健康检查（不执行修复）
+  8. 策略路由
+  9. nftables 规则
+ 10. 服务状态
+ 11. 入口机与 sing-box 并发健康
+ 12. conntrack 与临时端口容量建议
+ 13. 查看全部详细状态
   0. 返回主菜单
 ============================================================
 EOF
-        read -r -p "请输入选项 [0-12]: " choice
+        read -r -p "请输入选项 [0-13]: " choice
         case "$choice" in
             1) show_status_overview; pause_screen ;;
             2) show_status_patrols; pause_screen ;;
@@ -11522,12 +11543,13 @@ EOF
             4) show_status_containers; pause_screen ;;
             5) show_status_split; pause_screen ;;
             6) show_status_split_dns_live; pause_screen ;;
-            7) show_status_routes; pause_screen ;;
-            8) show_status_nft; pause_screen ;;
-            9) show_status_services; pause_screen ;;
-            10) show_concurrency_health; pause_screen ;;
-            11) show_concurrency_capacity_advice; pause_screen ;;
-            12) show_status; pause_screen ;;
+            7) show_status_upstream_live; pause_screen ;;
+            8) show_status_routes; pause_screen ;;
+            9) show_status_nft; pause_screen ;;
+            10) show_status_services; pause_screen ;;
+            11) show_concurrency_health; pause_screen ;;
+            12) show_concurrency_capacity_advice; pause_screen ;;
+            13) show_status; pause_screen ;;
             0) return 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -13403,6 +13425,22 @@ show_status_split_dns_live() {
     else
         printf '[WARN] 分流 DNS 即时检查未通过: %s\n' "${reason:-未知错误}"
         printf '后台巡检会按失败退避策略重试；如需人工修复可执行 sbout split-dns-health --repair。\n'
+    fi
+}
+
+show_status_upstream_live() {
+    load_config
+    local output=""
+    printf '============================================================\n'
+    printf '                 上游出口即时健康检查\n'
+    printf '============================================================\n'
+    printf '检测方式: 与 sbout upstream-health 完全一致。\n'
+    printf '本次会更新健康状态记录，但不会重启服务、修改 WG Endpoint 或执行修复。\n\n'
+    if output="$(upstream_health 2>&1)"; then
+        printf '%s\n' "$output"
+    else
+        printf '%s\n' "$output"
+        printf '\n[WARN] 即时检查未通过；如确认出口确实异常，可执行 sbout upstream-health --repair。\n'
     fi
 }
 
