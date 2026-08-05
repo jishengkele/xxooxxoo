@@ -12987,6 +12987,67 @@ interactive_remove_exit() {
 }
 
 # ---------- 出口排序：宿主机顺序即实例 out 列表顺序 ----------
+split_rule_exit_names() {
+    # 收集出现在分流规则（应用/分类/按出口强制/容器级）目标中的出口内部名。
+    # 目标可能为逗号分隔列表或 "-"（入口机），"-" 与空值不视为出口引用。
+    {
+        read_split_policies | awk -F '\t' 'NF >= 2 {print $2}'
+        read_split_category_policies | awk -F '\t' 'NF >= 2 {print $2}'
+        read_force_on_exit_policies | awk -F '\t' 'NF >= 3 {print $3}'
+        read_force_category_on_exit_policies | awk -F '\t' 'NF >= 3 {print $3}'
+        read_container_split_policies | awk -F '\t' 'NF >= 3 {print $3}'
+    } | tr ',' '\n' | sed 's/[[:space:]]//g' | awk 'NF && $0 != "-" {print}' | sort -u
+}
+
+explicitly_allowed_exit_names() {
+    # 收集“允许实例切换”的显式出口引用：
+    # AUTO_ALLOW_EXITS 显式列表（"*"/"-" 不算）、任一容器授权列表、任一容器当前出口、宿主机默认出口。
+    local list="${AUTO_ALLOW_EXITS:-*}"
+    if [ "$list" != "*" ] && [ "$list" != "-" ]; then
+        split_target_list_each "$list"
+    fi
+    if [ -n "${AUTO_DEFAULT_EXIT:-}" ] && [ "$AUTO_DEFAULT_EXIT" != "-" ]; then
+        printf '%s\n' "$AUTO_DEFAULT_EXIT"
+    fi
+    if [ -f "$CONTAINERS_FILE" ]; then
+        while IFS=$'\t' read -r _cname _cip _ctoken allowed current _rest; do
+            [ -n "$_cname" ] || continue
+            case "$_cname" in
+                \#*) continue ;;
+            esac
+            if [ -n "$allowed" ] && [ "$allowed" != "*" ] && [ "$allowed" != "-" ]; then
+                split_target_list_each "$allowed"
+            fi
+            if [ -n "$current" ] && [ "$current" != "-" ]; then
+                printf '%s\n' "$current"
+            fi
+        done < "$CONTAINERS_FILE"
+    fi
+}
+
+sortable_exit_names() {
+    # 输出参与排序的出口内部名（按 exits.tsv 文件顺序）。
+    # 默认与实例 out 可见出口一致；仅用于分流规则且未显式授权实例切换的出口，
+    # 视为“分流专用出口”，不参与排序序号，自动排到文件末尾。
+    local visible split_refs allowed_refs
+    visible="$(instance_visible_exit_names | tr '\n' ',')"
+    split_refs="$(split_rule_exit_names | tr '\n' ',')"
+    allowed_refs="$(explicitly_allowed_exit_names | tr '\n' ',')"
+    read_exit_rows | awk -F '\t' -v v="$visible" -v s="$split_refs" -v e="$allowed_refs" '
+        BEGIN {
+            nv = split(v, va, ",")
+            for (i = 1; i <= nv; i++) if (va[i] != "") V[va[i]] = 1
+            ns = split(s, sa, ",")
+            for (i = 1; i <= ns; i++) if (sa[i] != "") S[sa[i]] = 1
+            ne = split(e, ea, ",")
+            for (i = 1; i <= ne; i++) if (ea[i] != "") E[ea[i]] = 1
+        }
+        !V[$1] { next }
+        ($1 in S) && !($1 in E) { next }
+        { print $1 }
+    '
+}
+
 instance_visible_exit_names() {
     # 输出会出现在实例 out 列表中的出口内部名（按 exits.tsv 文件顺序）。
     # 判断依据：AUTO_ALLOW_EXITS 显式授权、任一容器授权列表/当前出口引用；
@@ -13051,7 +13112,7 @@ sort_exits() {
             ;;
     esac
     command -v python3 >/dev/null 2>&1 || die "排序功能需要 python3。"
-    visible_list="$(instance_visible_exit_names | tr '\n' ',')"
+    visible_list="$(sortable_exit_names | tr '\n' ',')"
     state_lock_acquire
     if ! python3 - "$EXITS_FILE" "$mode" "$order_arg" "$visible_list" <<'PY'
 import sys
@@ -13174,16 +13235,16 @@ interactive_sort_exits() {
     list_exits
     n="$(read_exit_rows | awk 'END {print NR}')"
     [ -n "$n" ] && [ "$n" -gt 0 ] || { warn "暂无出口可排序。"; return 0; }
-    visible_count="$(instance_visible_exit_names | awk 'END {print NR}')"
+    visible_count="$(sortable_exit_names | awk 'END {print NR}')"
     [ -n "$visible_count" ] && [ "$visible_count" -gt 0 ] || visible_count="$n"
     split_names="$(read_exit_rows | awk -F '\t' '{print $1}' | while IFS= read -r nm; do
-        if ! instance_visible_exit_names | grep -qx "$nm"; then
+        if ! sortable_exit_names | grep -qx "$nm"; then
             display_exit_name "$nm"
         fi
     done | paste -sd'、' -)"
     printf '\n请选择排序方式：\n'
     printf '  1. 按字母/拼音首字母自动排序（数字在前，分流专用出口自动排最后）\n'
-    printf '  2. 手动输入序号排序（范围 1-%s，仅限实例 out 中可见的出口）\n' "$visible_count"
+    printf '  2. 手动输入序号排序（范围 1-%s，仅限实例可切换的出口）\n' "$visible_count"
     printf '  0. 返回\n'
     read -r -p "请选择 [0-2]: " choice
     case "$choice" in
@@ -13192,14 +13253,14 @@ interactive_sort_exits() {
             list_exits
             ;;
         2)
-            printf '\n可排序出口（出现在实例 out 中）:\n'
+            printf '\n可排序出口（实例可切换出口）:\n'
             i=1
             while IFS= read -r vis_name; do
                 printf '  %s. %s\n' "$i" "$(display_exit_name "$vis_name")"
                 i=$((i + 1))
-            done < <(instance_visible_exit_names)
+            done < <(sortable_exit_names)
             if [ -n "$split_names" ]; then
-                printf '分流专用出口（不出现在实例 out，自动排在最后）: %s\n' "$split_names"
+                printf '不参与排序的出口（仅用于分流规则或未授权实例切换，自动排在最后）: %s\n' "$split_names"
             fi
             read -r -p "请输入新的排列顺序（1-$visible_count，空格或逗号分隔）: " pick
             [ -n "$pick" ] || return 0
@@ -14328,11 +14389,11 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
 
   $0 sort-exits auto
       按字母/拼音首字母自动排序出口；中文按拼音排序，英文按字母排序，数字排在最前。
-      只出现在分流规则、不出现在实例 out 中的专用出口会自动排在最后。
+      仅用于分流规则、且未授权实例切换的专用出口会自动排在最后。
       排序结果会同步到实例的 out 列表顺序。
 
   $0 sort-exits order 3 1 2
-      手动输入序号重新排列出口；序号只针对出现在实例 out 中的出口（分流专用出口自动排最后）。
+      手动输入序号重新排列出口；序号只针对实例可切换的出口（分流专用出口自动排最后）。
 
   $0 limit-exit 出口名 下载限速 [上传限速]
       设置出口级共享限速；所有使用该出口的容器共享总带宽。只填一个限速时下载/上传相同。
