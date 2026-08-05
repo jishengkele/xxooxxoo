@@ -17,6 +17,7 @@ SPLIT_FORCE_POLICIES_FILE="$SPLIT_DIR/force-policies.tsv"
 SPLIT_FORCE_CATEGORY_POLICIES_FILE="$SPLIT_DIR/force-category-policies.tsv"
 SPLIT_FORCE_ON_EXIT_POLICIES_FILE="$SPLIT_DIR/force-on-exit-policies.tsv"
 SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE="$SPLIT_DIR/force-category-on-exit-policies.tsv"
+SPLIT_ONLY_EXITS_FILE="$CONFIG_DIR/split-only-exits.tsv"
 SPLIT_CACHE_DIR="$SPLIT_DIR/cache"
 SPLIT_RAW_DIR="$SPLIT_CACHE_DIR/raw"
 SPLIT_RESOLVED_DIR="$SPLIT_CACHE_DIR/resolved"
@@ -65,6 +66,7 @@ PROXY_DIRECT_APP_ID="__proxy_direct"
 UPDATE_BACKUP_PATH=""
 UPDATE_BACKUP_ARCHIVE=""
 UPDATE_COMPONENT_SOURCE_HASH=""
+LAST_ADDED_EXIT_NAME=""
 
 info() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -1371,6 +1373,56 @@ read_exit_rows() {
     done < "$EXITS_FILE"
 }
 
+# ---------- 分流专用出口：只用于分流规则，不出现在实例 out、不能被实例切换 ----------
+split_only_exit_names() {
+    [ -f "$SPLIT_ONLY_EXITS_FILE" ] || return 0
+    awk 'NF && $1 !~ /^#/ {print $1}' "$SPLIT_ONLY_EXITS_FILE"
+}
+
+is_split_only_exit() {
+    local n="$1"
+    [ -n "$n" ] || return 1
+    [ -f "$SPLIT_ONLY_EXITS_FILE" ] || return 1
+    awk -F '\t' -v n="$n" 'NF && $1 !~ /^#/ && $1 == n {found=1} END {exit found ? 0 : 1}' "$SPLIT_ONLY_EXITS_FILE"
+}
+
+ensure_split_only_file() {
+    if [ ! -f "$SPLIT_ONLY_EXITS_FILE" ]; then
+        mkdir -p "$(dirname "$SPLIT_ONLY_EXITS_FILE")"
+        cat > "$SPLIT_ONLY_EXITS_FILE" <<'EOF'
+# 分流专用出口列表，每行一个出口内部ID：
+# 这些出口只用于分流规则，不会出现在实例 out 中，也不能被实例切换。
+EOF
+        chmod 600 "$SPLIT_ONLY_EXITS_FILE"
+    fi
+}
+
+mark_split_only_exit() {
+    local n="$1"
+    exit_exists "$n" || die "未知出口: $n"
+    ensure_split_only_file
+    if ! is_split_only_exit "$n"; then
+        printf '%s\n' "$n" >> "$SPLIT_ONLY_EXITS_FILE"
+        chmod 600 "$SPLIT_ONLY_EXITS_FILE"
+    fi
+}
+
+unmark_split_only_exit() {
+    local n="$1" tmp
+    [ -n "$n" ] || return 0
+    [ -f "$SPLIT_ONLY_EXITS_FILE" ] || return 0
+    tmp="$(mktemp)"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
+        esac
+        [ "$line" = "$n" ] && continue
+        printf '%s\n' "$line" >> "$tmp"
+    done < "$SPLIT_ONLY_EXITS_FILE"
+    install -m 0600 "$tmp" "$SPLIT_ONLY_EXITS_FILE"
+    rm -f "$tmp"
+}
+
 read_exit_limit_rows() {
     [ -f "$LIMITS_FILE" ] || return 0
     while read -r name down up rest; do
@@ -1939,6 +1991,15 @@ resolve_split_target_list() {
     done
     [ -n "$out" ] || return 1
     printf '%s\n' "$out"
+}
+
+require_split_only_targets() {
+    # 普通应用/分类分流（含强制分流）只允许使用分流专用出口或入口机直出。
+    local list="${1:-}" item
+    while IFS= read -r item; do
+        [ "$item" = "-" ] && continue
+        is_split_only_exit "$item" || die "出口 '$(display_exit_name "$item")' 不是分流专用出口；普通应用/分类分流只能选择在分流管理添加的出口。"
+    done < <(split_target_list_each "$list")
 }
 
 split_target_list_remove() {
@@ -3728,6 +3789,7 @@ add_exit() {
     mark_nft_pending
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$mark" "$table" "$route4" "$route6" "$display" >> "$EXITS_FILE"
     chmod 600 "$EXITS_FILE"
+    LAST_ADDED_EXIT_NAME="$name"
     state_lock_release
     info "已添加出口 '$display'。真实出口设备/路由表准备好后，请运行: $0 apply"
 }
@@ -4857,6 +4919,7 @@ start_proxy_exit() {
     mark_nft_pending
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$mark" "$table" "dev:$tun" "dev:$tun" "$display" >> "$EXITS_FILE"
     chmod 600 "$EXITS_FILE"
+    LAST_ADDED_EXIT_NAME="$name"
     state_lock_release
 
     if ! systemctl daemon-reload || ! systemctl enable "$service" >/dev/null || ! systemctl start "$service"; then
@@ -5169,6 +5232,7 @@ add_wireguard_exit() {
     mark_nft_pending
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$mark" "$table" "$route4" "$route6" "$display" >> "$EXITS_FILE"
     chmod 600 "$EXITS_FILE"
+    LAST_ADDED_EXIT_NAME="$name"
     state_lock_release
     if ! systemctl daemon-reload || ! systemctl enable "$service" >/dev/null || ! systemctl start "$service"; then
         rollback_proxy_exit_add "$name"
@@ -6259,6 +6323,7 @@ remove_exit() {
     reset_force_on_exit_policies_for_removed_exit "$name"
     remove_exit_limit_row "$name"
     remove_exit_row "$name"
+    unmark_split_only_exit "$name"
     do_apply
     state_lock_release
     sync_now || true
@@ -6280,6 +6345,7 @@ replace_exit_backup() {
         "$SPLIT_CONTAINER_POLICIES_FILE" \
         "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" \
         "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" \
+        "$SPLIT_ONLY_EXITS_FILE" \
         "$CONFIG_FILE"; do
         if [ -f "$f" ]; then
             cp -a "$f" "$dir/" || return 1
@@ -6510,6 +6576,9 @@ replace_exit() {
     migrate_containers_for_replaced_exit "$old" "$new"
     migrate_split_policies_for_replaced_exit "$old" "$new"
     migrate_exit_aux_references "$old" "$new"
+    if is_split_only_exit "$old"; then
+        mark_split_only_exit "$new"
+    fi
     mark_nft_pending
     if ! do_apply; then
         state_lock_release
@@ -6630,6 +6699,9 @@ resolve_allowed_exit_list() {
             esac
             resolved="$(resolve_exit_target "$item")" || return 1
             [ "$resolved" != "-" ] || return 1
+            if is_split_only_exit "$resolved"; then
+                die "出口 '$(display_exit_name "$resolved")' 是分流专用出口，不能授权给实例切换。"
+            fi
             case "$seen" in
                 *,"$resolved",*) ;;
                 *)
@@ -7930,6 +8002,7 @@ split_set_policy() {
     [ "$#" -gt 0 ] || die "用法: $0 split-set 应用ID 目标出口[,候选出口...]"
     split_app_exists "$app" || die "未知应用: $app"
     resolved="$(resolve_split_target_list "$@")" || die "存在未知出口: $*"
+    require_split_only_targets "$resolved"
     split_prepare_app_rules "$app"
     state_lock_acquire
     mark_nft_pending
@@ -7951,6 +8024,7 @@ split_set_category_policy() {
     shift || true
     [ "$#" -gt 0 ] || die "用法: $0 split-set-category 分类 目标出口[,候选出口...]"
     resolved="$(resolve_split_target_list "$@")" || die "存在未知出口: $*"
+    require_split_only_targets "$resolved"
     split_category_exists "$target_category" || die "未找到分类: $target_category"
     while IFS=$'\t' read -r app display app_category remote enabled; do
         [ "$app_category" = "$target_category" ] || continue
@@ -8059,6 +8133,7 @@ split_force_policy() {
     [ -n "$app" ] && [ -n "$target" ] || die "用法: $0 split-force 应用ID 目标出口"
     split_app_exists "$app" || die "未知应用: $app"
     resolved="$(resolve_exit_target "$target")" || die "未知出口: $target"
+    require_split_only_targets "$resolved"
     split_prepare_app_rules "$app"
     state_lock_acquire
     mark_nft_pending
@@ -8080,6 +8155,7 @@ split_force_category_policy() {
     [ -n "$target_category" ] && [ -n "$target" ] || die "用法: $0 split-force-category 分类 目标出口"
     split_category_exists "$target_category" || die "未找到分类: $target_category"
     resolved="$(resolve_exit_target "$target")" || die "未知出口: $target"
+    require_split_only_targets "$resolved"
     while IFS=$'\t' read -r app display app_category remote enabled; do
         [ "$app_category" = "$target_category" ] || continue
         split_prepare_app_rules "$app" || true
@@ -8663,6 +8739,7 @@ SPLIT_FORCE_POLICIES_FILE = os.path.join(SPLIT_DIR, "force-policies.tsv")
 SPLIT_FORCE_CATEGORY_POLICIES_FILE = os.path.join(SPLIT_DIR, "force-category-policies.tsv")
 SPLIT_FORCE_ON_EXIT_POLICIES_FILE = os.path.join(SPLIT_DIR, "force-on-exit-policies.tsv")
 SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE = os.path.join(SPLIT_DIR, "force-category-on-exit-policies.tsv")
+SPLIT_ONLY_EXITS_FILE = os.path.join(CONFIG_DIR, "split-only-exits.tsv")
 MANAGER_BIN = os.environ.get("EGRESS_MANAGER_BIN", "/usr/local/sbin/incus-egress-switch")
 STATE_LOCK_FILE = os.path.join(CONFIG_DIR, ".state.lock")
 APPLY_LOCK_FILE = os.path.join("/run", "incus-egress-switch", "apply.lock")
@@ -8761,6 +8838,22 @@ def load_exits():
         display = " ".join(rest).strip() or name
         exits[name] = {"name": name, "display": display, "mark": mark, "table": table, "route4": route4, "route6": route6}
     return exits
+
+
+def load_split_only_exits():
+    names = set()
+    if not os.path.exists(SPLIT_ONLY_EXITS_FILE):
+        return names
+    try:
+        with file_lock(STATE_LOCK_FILE, exclusive=False):
+            with open(SPLIT_ONLY_EXITS_FILE, "r", encoding="utf-8") as fh:
+                for raw in fh:
+                    name = raw.strip().split("\t", 1)[0].strip()
+                    if name and not name.startswith("#"):
+                        names.add(name)
+    except OSError:
+        return set()
+    return names
 
 
 def load_containers():
@@ -8922,11 +9015,13 @@ def find_container_by_ip(remote_ip):
 
 
 def allowed_exits(container, exits):
+    split_only = load_split_only_exits()
+    usable = [name for name in exits if name not in split_only]
     allowed = container["allowed"]
     if allowed == "*":
-        return [DIRECT_EXIT_NAME] + [exits[name].get("display") or name for name in exits]
+        return [DIRECT_EXIT_NAME] + [exits[name].get("display") or name for name in usable]
     names = [item for item in allowed.split(",") if item]
-    return [DIRECT_EXIT_NAME] + [exits[name].get("display") or name for name in exits if name in names]
+    return [DIRECT_EXIT_NAME] + [exits[name].get("display") or name for name in usable if name in names]
 
 
 def is_allowed_target(container, target):
@@ -8940,13 +9035,17 @@ def is_allowed_target(container, target):
 def visible_split_targets_for_container(container, targets, exits):
     visible = []
     seen = set()
+    split_only = load_split_only_exits()
     for target in targets:
         if target == DEFAULT_SPLIT_TARGET:
             continue
         if target == DIRECT_EXIT:
             candidate_ok = True
         else:
-            candidate_ok = target in exits and is_allowed_target(container, target)
+            if target in split_only:
+                candidate_ok = target in exits
+            else:
+                candidate_ok = target in exits and is_allowed_target(container, target)
         if candidate_ok and target not in seen:
             visible.append(target)
             seen.add(target)
@@ -9298,6 +9397,9 @@ class Handler(BaseHTTPRequestHandler):
         if not is_allowed_target(container, target):
             response(self, 403, {"ok": False, "error": "该出口未授权给当前容器"})
             return
+        if target != DIRECT_EXIT and target in load_split_only_exits():
+            response(self, 403, {"ok": False, "error": "该出口为分流专用出口，不能作为实例出口切换"})
+            return
         try:
             previous, generation = update_container_current(container["ip"], target)
             if target == DIRECT_EXIT:
@@ -9339,7 +9441,7 @@ class Handler(BaseHTTPRequestHandler):
             if not target:
                 response(self, 400, {"ok": False, "error": "未知出口"})
                 return
-            if not is_allowed_target(container, target):
+            if not is_allowed_target(container, target) and target not in load_split_only_exits():
                 response(self, 403, {"ok": False, "error": "该出口未授权给当前容器"})
                 return
             if not split_target_allowed(policy_targets, target):
@@ -9358,7 +9460,7 @@ class Handler(BaseHTTPRequestHandler):
         override_target = overrides.get((container["name"], app), "")
         if override_target and not split_target_allowed(policy_targets, override_target):
             override_target = ""
-        if override_target and not is_allowed_target(container, override_target):
+        if override_target and not is_allowed_target(container, override_target) and override_target not in load_split_only_exits():
             override_target = ""
         effective_target = override_target if override_target else split_target_default(policy_targets)
         response(self, 200, {
@@ -11720,7 +11822,11 @@ list_exits() {
         else
             status="手动路由/未托管服务"
         fi
-        printf '  %s. %s\n' "$count" "${display:-$name}"
+        if is_split_only_exit "$name"; then
+            printf '  %s. %s（分流专用）\n' "$count" "${display:-$name}"
+        else
+            printf '  %s. %s\n' "$count" "${display:-$name}"
+        fi
         printf '     内部ID: %s  服务状态: %s\n' "$name" "$status"
         printf '     fwmark: %s  路由表: %s\n' "$mark" "$table"
         printf '     IPv4路由: %s\n' "$route4"
@@ -11742,7 +11848,7 @@ list_exits() {
 }
 
 interactive_list_exits() {
-    interactive_sort_exits
+    list_exits
     pause_screen
 }
 
@@ -11883,6 +11989,7 @@ interactive_client_script() {
 
 interactive_add_proxy_exit() {
     local choice link parsed default_name name server port username password method uuid endpoint peer_key address4 address6 psk mtu
+    LAST_ADDED_EXIT_NAME=""
     need_root
     load_config
     write_default_config
@@ -11973,11 +12080,29 @@ interactive_add_ss_exit() {
     interactive_add_proxy_exit
 }
 
+interactive_add_split_only_exit() {
+    # 复用 [3] 添加出口的完整流程，添加成功后自动标记为“分流专用出口”。
+    local added
+    LAST_ADDED_EXIT_NAME=""
+    interactive_add_proxy_exit
+    added="$LAST_ADDED_EXIT_NAME"
+    if [ -n "$added" ] && exit_exists "$added"; then
+        mark_split_only_exit "$added"
+        info "出口 '$(display_exit_name "$added")' 已标记为分流专用：只用于分流规则，不会出现在实例 out 中，也不能被实例切换。"
+    fi
+}
+
 choose_host_exit() {
     local out_file="$1" tmp pick target i item
     [ -n "$out_file" ] || return 1
     tmp="$(mktemp)"
-    read_exit_rows | awk -F '\t' '{print $1 "\t" $6}' > "$tmp"
+    read_exit_rows | while IFS=$'\t' read -r item _mark _table _r4 _r6 display; do
+        if is_split_only_exit "$item"; then
+            printf '%s\t%s\n' "$item" "${display:-$item}（分流专用）"
+        else
+            printf '%s\t%s\n' "$item" "${display:-$item}"
+        fi
+    done > "$tmp"
     if [ ! -s "$tmp" ]; then
         rm -f "$tmp"
         warn "暂无出口可删除。"
@@ -12487,12 +12612,48 @@ choose_split_categories() {
     rm -f "$tmp"; [ -n "$categories" ] || return 1; printf '%s\n' "$categories" > "$out_file"
 }
 
+split_target_candidate_rows() {
+    # scope: all | split-only；输出 内部ID<TAB>显示名（不含入口机行）
+    local scope="${1:-all}" name display
+    read_exit_rows | while IFS=$'\t' read -r name _mark _table _r4 _r6 display; do
+        [ -n "$name" ] || continue
+        case "$scope" in
+            split-only)
+                if is_split_only_exit "$name"; then
+                    printf '%s\t%s\n' "$name" "${display:-$name}"
+                fi
+                ;;
+            *)
+                printf '%s\t%s\n' "$name" "${display:-$name}"
+                ;;
+        esac
+    done
+}
+
+instance_exit_candidate_rows() {
+    # 输出所有非分流专用出口（可被实例切换/授权）的内部ID与显示名
+    local name display
+    read_exit_rows | while IFS=$'\t' read -r name _mark _table _r4 _r6 display; do
+        [ -n "$name" ] || continue
+        is_split_only_exit "$name" && continue
+        printf '%s\t%s\n' "$name" "${display:-$name}"
+    done
+}
+
 choose_split_target() {
-    local out_file="$1" prompt_label="${2:-分流目标}" tmp pick target i item display
+    local out_file="$1" prompt_label="${2:-分流目标}" scope="${3:-all}" tmp pick target i item display
     [ -n "$out_file" ] || return 1
     tmp="$(mktemp)"
-    read_exit_rows | awk -F '\t' '{print $1 "\t" $6}' > "$tmp"
+    split_target_candidate_rows "$scope" > "$tmp"
+    if [ "$scope" = "split-only" ] && [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        warn "暂无分流专用出口，请先在分流管理选择 18 添加。"
+        return 1
+    fi
     printf '\n请选择%s:\n' "$prompt_label"
+    if [ "$scope" = "split-only" ]; then
+        printf '  （仅列出分流专用出口；普通应用/分类分流只能使用分流专用出口）\n'
+    fi
     printf '  0. 返回上一步\n'
     printf '  1. 入口机直出\n'
     i=2
@@ -12505,7 +12666,14 @@ choose_split_target() {
         "") target="" ;;
         0) target="" ;;
         1) target="-" ;;
-        *[!0-9]*) target="$(resolve_exit_target "$pick" || true)" ;;
+        *[!0-9]*)
+            target="$(resolve_exit_target "$pick" || true)"
+            if [ -n "$target" ] && [ "$target" != "-" ] && [ "$scope" = "split-only" ] && ! is_split_only_exit "$target"; then
+                rm -f "$tmp"
+                warn "出口 '$(display_exit_name "$target")' 不是分流专用出口，普通分流只能选择分流专用出口。"
+                return 1
+            fi
+            ;;
         *) target="$(sed -n "$((pick - 1))p" "$tmp" | awk -F '\t' '{print $1}')" ;;
     esac
     rm -f "$tmp"
@@ -12514,15 +12682,23 @@ choose_split_target() {
 }
 
 choose_split_targets() {
-    local out_file="$1" prompt_label="${2:-分流候选出口（第一个为默认出口）}" tmp pick i item display part target targets="" seen=","
+    local out_file="$1" prompt_label="${2:-分流候选出口（第一个为默认出口）}" scope="${3:-all}" tmp pick i item display part target targets="" seen=","
     local parts=()
     [ -n "$out_file" ] || return 1
     tmp="$(mktemp)"
     {
         printf -- '-\t入口机直出\n'
-        read_exit_rows | awk -F '\t' '{print $1 "\t" $6}'
+        split_target_candidate_rows "$scope"
     } > "$tmp"
+    if [ "$scope" = "split-only" ] && [ "$(awk 'NR > 1' "$tmp" | wc -l)" -eq 0 ]; then
+        rm -f "$tmp"
+        warn "暂无分流专用出口，请先在分流管理选择 18 添加。"
+        return 1
+    fi
     printf '\n请选择%s:\n' "$prompt_label"
+    if [ "$scope" = "split-only" ]; then
+        printf '  （仅列出分流专用出口；普通应用/分类分流只能使用分流专用出口）\n'
+    fi
     printf '  0. 返回上一步\n'
     i=1
     while IFS=$'\t' read -r item display || [ -n "${item:-}" ]; do
@@ -12542,6 +12718,11 @@ choose_split_targets() {
             target="$(sed -n "${part}p" "$tmp" | awk -F '\t' '{print $1}')"
         else
             target="$(resolve_exit_target "$part" || true)"
+        fi
+        if [ -n "$target" ] && [ "$target" != "-" ] && [ "$scope" = "split-only" ] && ! is_split_only_exit "$target"; then
+            rm -f "$tmp"
+            warn "出口 '$(display_exit_name "$target")' 不是分流专用出口，普通分流只能选择分流专用出口。"
+            return 1
         fi
         if [ -z "$target" ]; then
             rm -f "$tmp"
@@ -12567,7 +12748,7 @@ choose_takeover_allowed_exits() {
     local parts=()
     [ -n "$out_file" ] || return 1
     tmp="$(mktemp)"
-    read_exit_rows | awk -F '\t' '{print $1 "\t" $6}' > "$tmp.exits"
+    instance_exit_candidate_rows > "$tmp.exits"
     if [ ! -s "$tmp.exits" ]; then
         rm -f "$tmp.exits"
         rm -f "$tmp"
@@ -12575,7 +12756,7 @@ choose_takeover_allowed_exits() {
         return 1
     fi
     {
-        printf '*\t全部已添加出口\n'
+        printf '*\t全部可切换出口\n'
         cat "$tmp.exits"
     } > "$tmp"
     rm -f "$tmp.exits"
@@ -12587,9 +12768,10 @@ choose_takeover_allowed_exits() {
         printf '  %s. %s\n' "$i" "${display:-$item}"
         i=$((i + 1))
     done < "$tmp"
-    printf '\n选择 1 可一次授权全部已添加出口；也可以输入一个或多个序号/出口名，英文逗号分隔。\n'
+    printf '\n选择 1 可一次授权全部可切换出口；也可以输入一个或多个序号/出口名，英文逗号分隔。\n'
     printf '未选中的出口不会出现在容器 out 中，也不能通过 API 强制切换。\n'
     printf '入口机直出是内置回退，不属于已添加出口，容器始终可以切回入口机。\n'
+    printf '分流专用出口不会出现在本列表，也不能授权给实例。\n'
     read -r -p "请输入授权出口: " pick
     case "$pick" in
         ""|0) rm -f "$tmp"; return 1 ;;
@@ -12616,6 +12798,11 @@ choose_takeover_allowed_exits() {
             warn "未知或不可用于授权的出口: $part"
             return 1
         fi
+        if is_split_only_exit "$target"; then
+            rm -f "$tmp"
+            warn "出口 '$(display_exit_name "$target")' 是分流专用出口，不能授权给实例切换。"
+            return 1
+        fi
         case "$seen" in
             *,"$target",*) ;;
             *)
@@ -12635,7 +12822,7 @@ interactive_split_set_app() {
     app_file="/tmp/incus-egress-split-app.$$"
     target_file="/tmp/incus-egress-split-target.$$"
     choose_split_app "$app_file" || { rm -f "$app_file" "$target_file"; return 0; }
-    choose_split_targets "$target_file" || { rm -f "$app_file" "$target_file"; return 0; }
+    choose_split_targets "$target_file" "应用候选出口（仅分流专用出口）" split-only || { rm -f "$app_file" "$target_file"; return 0; }
     app="$(cat "$app_file")"
     target="$(cat "$target_file")"
     rm -f "$app_file" "$target_file"
@@ -12647,7 +12834,7 @@ interactive_split_set_category() {
     category_file="/tmp/incus-egress-split-category.$$"
     target_file="/tmp/incus-egress-split-target.$$"
     choose_split_category "$category_file" || { rm -f "$category_file" "$target_file"; return 0; }
-    choose_split_targets "$target_file" || { rm -f "$category_file" "$target_file"; return 0; }
+    choose_split_targets "$target_file" "分类候选出口（仅分流专用出口）" split-only || { rm -f "$category_file" "$target_file"; return 0; }
     category="$(cat "$category_file")"
     target="$(cat "$target_file")"
     rm -f "$category_file" "$target_file"
@@ -12677,7 +12864,7 @@ interactive_split_force_app() {
     app_file="/tmp/incus-egress-force-app.$$"
     target_file="/tmp/incus-egress-force-target.$$"
     choose_split_app "$app_file" || { rm -f "$app_file" "$target_file"; return 0; }
-    choose_split_target "$target_file" || { rm -f "$app_file" "$target_file"; return 0; }
+    choose_split_target "$target_file" "强制分流目标（仅分流专用出口）" split-only || { rm -f "$app_file" "$target_file"; return 0; }
     app="$(cat "$app_file")"
     target="$(cat "$target_file")"
     rm -f "$app_file" "$target_file"
@@ -12689,7 +12876,7 @@ interactive_split_force_category() {
     category_file="/tmp/incus-egress-force-category.$$"
     target_file="/tmp/incus-egress-force-target.$$"
     choose_split_category "$category_file" || { rm -f "$category_file" "$target_file"; return 0; }
-    choose_split_target "$target_file" || { rm -f "$category_file" "$target_file"; return 0; }
+    choose_split_target "$target_file" "强制分类目标（仅分流专用出口）" split-only || { rm -f "$category_file" "$target_file"; return 0; }
     category="$(cat "$category_file")"
     target="$(cat "$target_file")"
     rm -f "$category_file" "$target_file"
@@ -12929,6 +13116,7 @@ interactive_split_menu() {
   15. 设置按当前出口强制分类分流
   16. 取消按当前出口强制单应用分流
   17. 取消按当前出口强制分类分流
+  18. 添加分流专用出口（仅用于分流，不进实例 out）
   0. 返回主菜单
 ============================================================
 EOF
@@ -12958,6 +13146,7 @@ EOF
             15) interactive_split_force_on_exit_category; pause_screen ;;
             16) interactive_split_force_on_exit_clear_app; pause_screen ;;
             17) interactive_split_force_on_exit_clear_category; pause_screen ;;
+            18) interactive_add_split_only_exit ;;
             0) return 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -13051,10 +13240,15 @@ sortable_exit_names() {
 instance_visible_exit_names() {
     # 输出会出现在实例 out 列表中的出口内部名（按 exits.tsv 文件顺序）。
     # 判断依据：AUTO_ALLOW_EXITS 显式授权、任一容器授权列表/当前出口引用；
-    # 如果授权为 "*"（或没有容器记录），则所有出口都视为实例可见。
-    local item allowed current visible_set=","
+    # 如果授权为 "*"（或没有容器记录），则所有出口都视为实例可见；
+    # 标记为“分流专用”的出口永远不视为实例可见。
+    local item allowed current visible_set="," split_set
+    split_set="$(split_only_exit_names | tr '\n' ',')"
     if [ "${AUTO_ALLOW_EXITS:-*}" = "*" ] || [ ! -f "$CONTAINERS_FILE" ]; then
-        read_exit_rows | awk -F '\t' '{print $1}'
+        read_exit_rows | awk -F '\t' -v s="$split_set" '
+            BEGIN { n = split(s, a, ","); for (i = 1; i <= n; i++) if (a[i] != "") S[a[i]] = 1 }
+            !($1 in S) { print $1 }
+        '
         return 0
     fi
     for item in $(printf '%s' "${AUTO_ALLOW_EXITS}" | tr ',' ' '); do
@@ -13070,7 +13264,10 @@ instance_visible_exit_names() {
             \#*) continue ;;
         esac
         if [ "$allowed" = "*" ]; then
-            read_exit_rows | awk -F '\t' '{print $1}'
+            read_exit_rows | awk -F '\t' -v s="$split_set" '
+                BEGIN { n = split(s, a, ","); for (i = 1; i <= n; i++) if (a[i] != "") S[a[i]] = 1 }
+                !($1 in S) { print $1 }
+            '
             return 0
         fi
         for item in $(printf '%s' "${allowed:-*}" | tr ',' ' '); do
@@ -13087,7 +13284,10 @@ instance_visible_exit_names() {
             esac
         fi
     done < "$CONTAINERS_FILE"
-    read_exit_rows | awk -F '\t' -v s="$visible_set" 'index(s, "," $1 ",") > 0 {print $1}'
+    read_exit_rows | awk -F '\t' -v v="$visible_set" -v s="$split_set" '
+        BEGIN { n = split(s, a, ","); for (i = 1; i <= n; i++) if (a[i] != "") S[a[i]] = 1 }
+        index(v, "," $1 ",") > 0 && !($1 in S) { print $1 }
+    '
 }
 
 sort_exits() {
@@ -13328,7 +13528,7 @@ sync_and_enable_takeover() {
     enable_autosync
     systemctl enable --now "$APP_NAME" >/dev/null 2>&1 || true
     if [ "$allowed" = "*" ]; then
-        info "已同步容器、注入 out/token，并启动全量接管和轮询检查；容器可自助切换全部出口。"
+        info "已同步容器、注入 out/token，并启动全量接管和轮询检查；容器可自助切换全部可切换出口（分流专用出口除外）。"
     else
         info "已同步容器、注入 out/token，并启动可选出口接管和轮询检查；容器仅可自助切换: $(split_target_list_label "$allowed")。"
     fi
@@ -13374,7 +13574,12 @@ choose_bulk_switch_exit() {
     [ -n "$out_file" ] || return 1
     tmp="$(mktemp)"
     printf '%s\t%s\n' '-' '入口机' > "$tmp"
-    read_exit_rows | awk -F '\t' '{print $1 "\t" $6}' >> "$tmp"
+    instance_exit_candidate_rows >> "$tmp"
+    if [ "$(awk 'NR > 1' "$tmp" | wc -l)" -eq 0 ]; then
+        rm -f "$tmp"
+        warn "暂无可切换出口，请先添加出口后再一键切换。"
+        return 1
+    fi
 
     printf '\n请选择全部运行中容器的目标出口:\n'
     printf '  0. 返回主菜单\n'
@@ -13392,6 +13597,10 @@ choose_bulk_switch_exit() {
     rm -f "$tmp"
     if [ -z "$target" ]; then
         [ -z "$pick" ] || [ "$pick" = "0" ] || warn "没有找到对应出口: $pick"
+        return 1
+    fi
+    if [ "$target" != "-" ] && is_split_only_exit "$target"; then
+        warn "出口 '$(display_exit_name "$target")' 是分流专用出口，不能作为实例出口切换。"
         return 1
     fi
     printf '%s\n' "$target" > "$out_file"
@@ -13708,7 +13917,7 @@ takeover_mode_label() {
 
 allowed_exits_label() {
     case "${1:-*}" in
-        "*") printf '全部已添加出口' ;;
+        "*") printf '全部可切换出口' ;;
         "-") printf '仅入口机' ;;
         *) split_target_list_label "$1" ;;
     esac
@@ -13769,29 +13978,29 @@ interactive_menu() {
         printf '  %s【出口管理】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[3]%s 添加出口                  %s[4]%s 查看出口\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
         printf '    %s[5]%s 删除出口                  %s[6]%s 出口替换（实例自动迁移）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[7]%s 出口共享限速\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[7]%s 出口排序                  %s[8]%s 出口共享限速\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【容器同步】%s\n' "$UI_CYAN" "$UI_RESET"
-        printf '    %s[8]%s 同步运行中容器，并选择可切换出口\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[9]%s 同步运行中容器，但仅启用宿主机分流\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[10]%s 容器 out/token 自动补齐开关\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[11]%s 一键清空全部实例出口信息\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[12]%s 全部运行中容器一键切换出口\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[9]%s 同步运行中容器，并选择可切换出口\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[10]%s 同步运行中容器，但仅启用宿主机分流\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[11]%s 容器 out/token 自动补齐开关\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[12]%s 一键清空全部实例出口信息\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[13]%s 全部运行中容器一键切换出口\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【分流管理】%s\n' "$UI_CYAN" "$UI_RESET"
-        printf '    %s[13]%s 分流管理\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[14]%s 入口机直连\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[14]%s 分流管理\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[15]%s 入口机直连\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【维护操作】%s\n' "$UI_CYAN" "$UI_RESET"
-        printf '    %s[15]%s 从 GitHub 安全更新          %s[16]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[17]%s 彻底卸载                    %s[18]%s 重建当前版本组件（不联网）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[19]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[16]%s 从 GitHub 安全更新          %s[17]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[18]%s 彻底卸载                    %s[19]%s 重建当前版本组件（不联网）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[20]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
         printf '    固定更新命令：%ssbout update-github && sbout upgrade%s（跨版本请使用命令，不要记忆菜单编号）\n' "$UI_YELLOW" "$UI_RESET"
         printf '\n'
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$UI_GREEN" "$UI_RESET"
         ui_line
-        read -r -p "请输入选项 [0-19]: " choice
+        read -r -p "请输入选项 [0-20]: " choice
         case "$choice" in
             1) interactive_install_host ;;
             2) interactive_status ;;
@@ -13799,19 +14008,20 @@ interactive_menu() {
             4) interactive_list_exits ;;
             5) interactive_remove_exit ;;
             6) interactive_replace_exit ;;
-            7) interactive_limit_menu ;;
-            8) interactive_sync_and_enable ;;
-            9) interactive_sync_split_only ;;
-            10) interactive_container_out_autofill ;;
-            11) interactive_clear_container_out ;;
-            12) interactive_switch_all_running_containers ;;
-            13) interactive_split_menu ;;
-            14) interactive_entry_direct_menu ;;
-            15) update_from_github; exec "$INSTALL_BIN" menu ;;
-            16) interactive_restore ;;
-            17) interactive_uninstall ;;
-            18) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
-            19) interactive_proxy_optimization_menu ;;
+            7) interactive_sort_exits ;;
+            8) interactive_limit_menu ;;
+            9) interactive_sync_and_enable ;;
+            10) interactive_sync_split_only ;;
+            11) interactive_container_out_autofill ;;
+            12) interactive_clear_container_out ;;
+            13) interactive_switch_all_running_containers ;;
+            14) interactive_split_menu ;;
+            15) interactive_entry_direct_menu ;;
+            16) update_from_github; exec "$INSTALL_BIN" menu ;;
+            17) interactive_restore ;;
+            18) interactive_uninstall ;;
+            19) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
+            20) interactive_proxy_optimization_menu ;;
             0) info "退出。"; exit 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -14395,6 +14605,13 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
   $0 sort-exits order 3 1 2
       手动输入序号重新排列出口；序号只针对实例可切换的出口（分流专用出口自动排最后）。
 
+  $0 mark-split-exit 出口名
+      把已添加的出口标记为“分流专用”：只用于分流规则，不会出现在实例 out 中，
+      也不能被实例切换；普通应用/分类分流只能选择这类出口。
+
+  $0 unmark-split-exit 出口名
+      取消“分流专用”标记，出口恢复为可被实例切换的普通出口。
+
   $0 limit-exit 出口名 下载限速 [上传限速]
       设置出口级共享限速；所有使用该出口的容器共享总带宽。只填一个限速时下载/上传相同。
       单位使用 Mbps；1 Mbps = 0.125 MB/s，8 Mbps = 1 MB/s；0 或 - 表示不限速。
@@ -14638,6 +14855,18 @@ case "$command_name" in
         ;;
     replace-exit|replace|exit-replace|migrate-exit)
         replace_exit "$@"
+        ;;
+    mark-split-exit|mark-split-only|split-exit-mark)
+        need_root
+        load_config
+        mark_split_only_exit "$1"
+        info "出口 '$(display_exit_name "$1")' 已标记为分流专用：只用于分流规则，不会出现在实例 out 中。"
+        ;;
+    unmark-split-exit|unmark-split-only|split-exit-unmark)
+        need_root
+        load_config
+        unmark_split_only_exit "$1"
+        info "出口 '$(display_exit_name "$1")' 已取消分流专用标记。"
         ;;
     add-container)
         add_container "$@"
