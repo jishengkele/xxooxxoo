@@ -1956,6 +1956,24 @@ split_target_list_remove() {
     printf '%s\t%s\n' "$out" "$changed"
 }
 
+replace_split_target_list() {
+    local list="${1:-}" old="$2" new="$3" item out="" changed="false"
+    while IFS= read -r item; do
+        [ -n "$item" ] || continue
+        if [ "$item" = "$old" ]; then
+            item="$new"
+            changed="true"
+        fi
+        case ",$out," in
+            *,"$item",*) continue ;;
+        esac
+        [ -n "$out" ] && out="$out,"
+        out="$out$item"
+    done < <(split_target_list_each "$list")
+    [ -n "$out" ] || out="-"
+    printf '%s\t%s\n' "$out" "$changed"
+}
+
 exit_exists() {
     local target="$1"
     [ -f "$EXITS_FILE" ] || return 1
@@ -3841,9 +3859,10 @@ if "@" in body:
     method, password = userinfo.split(":", 1)
     if server.startswith("["):
         host, rest = server[1:].split("]", 1)
-        port = rest.lstrip(":")
+        port = rest.lstrip(":").split("?", 1)[0]
     else:
         host, port = server.rsplit(":", 1)
+        port = port.split("?", 1)[0]
 else:
     decoded = b64decode_text(body)
     if "@" not in decoded:
@@ -3851,6 +3870,7 @@ else:
     userinfo, server = decoded.rsplit("@", 1)
     method, password = userinfo.split(":", 1)
     host, port = server.rsplit(":", 1)
+    port = port.split("?", 1)[0]
 
 display = fragment or host.replace(".", "-")
 print("\t".join([display, method, password, host, port]))
@@ -5167,7 +5187,7 @@ add_wireguard_exit() {
     printf '  入口机公钥 : %s\n' "$public_key"
     printf '  隧道地址   : %s\n' "$address4"
     printf '\n下一步：回到 WG 出口机，选择“添加入口机”，复制上面的公钥和隧道地址。\n'
-    printf '出口机添加完成后，再通过入口机主菜单 7 同步实例。\n'
+        printf '出口机添加完成后，再通过入口机主菜单 8 同步实例。\n'
 }
 
 wireguard_exit_conf() {
@@ -6245,6 +6265,283 @@ remove_exit() {
     info "出口 '$display_label' 已删除；相关服务、配置目录、路由表和容器引用已清理。"
 }
 
+# ---------- 出口替换：把旧出口上的实例与分流规则引用整体迁移到新出口 ----------
+REPLACE_BACKUP_DIR=""
+
+replace_exit_backup() {
+    local ts dir f
+    [ -n "$CONFIG_DIR" ] || return 1
+    ts="$(date +%Y%m%d-%H%M%S)"
+    dir="$CONFIG_DIR/replace-backups/$ts"
+    mkdir -p "$dir" || return 1
+    for f in \
+        "$EXITS_FILE" "$CONTAINERS_FILE" "$LIMITS_FILE" \
+        "$SPLIT_POLICIES_FILE" "$SPLIT_CATEGORY_POLICIES_FILE" \
+        "$SPLIT_CONTAINER_POLICIES_FILE" \
+        "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" \
+        "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" \
+        "$CONFIG_FILE"; do
+        if [ -f "$f" ]; then
+            cp -a "$f" "$dir/" || return 1
+        fi
+    done
+    REPLACE_BACKUP_DIR="$dir"
+}
+
+replace_exit_restore() {
+    local f base
+    [ -n "$REPLACE_BACKUP_DIR" ] || return 1
+    for f in \
+        "$EXITS_FILE" "$CONTAINERS_FILE" "$LIMITS_FILE" \
+        "$SPLIT_POLICIES_FILE" "$SPLIT_CATEGORY_POLICIES_FILE" \
+        "$SPLIT_CONTAINER_POLICIES_FILE" \
+        "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" \
+        "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" \
+        "$CONFIG_FILE"; do
+        base="$(basename "$f")"
+        if [ -f "$REPLACE_BACKUP_DIR/$base" ]; then
+            install -m 0600 "$REPLACE_BACKUP_DIR/$base" "$f" || return 1
+        fi
+    done
+}
+
+migrate_containers_for_replaced_exit() {
+    local old="$1" new="$2" tmp changed=0
+    local name ip token allowed current project instance rest new_allowed new_current
+    [ -f "$CONTAINERS_FILE" ] || return 0
+    tmp="$(mktemp)"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
+        esac
+        read -r name ip token allowed current project instance rest <<< "$line"
+        new_allowed="$(replace_allowed_item "${allowed:-*}" "$old" "$new")"
+        new_current="${current:--}"
+        if [ "$new_current" = "$old" ]; then
+            new_current="$new"
+        fi
+        if [ "$new_allowed" != "${allowed:-*}" ] || [ "$new_current" != "${current:--}" ]; then
+            changed=$((changed + 1))
+        fi
+        append_container_row "$tmp" "$name" "$ip" "${token:--}" "$new_allowed" "$new_current" "${project:-}" "${instance:-}" "${rest:-}"
+    done < "$CONTAINERS_FILE"
+    install -m 0600 "$tmp" "$CONTAINERS_FILE"
+    rm -f "$tmp"
+    if [ "$changed" -gt 0 ]; then
+        info "已把 $changed 个实例的出口引用从 '$(display_exit_name "$old")' 替换为 '$(display_exit_name "$new")'。"
+    fi
+}
+
+migrate_split_policies_for_replaced_exit() {
+    local old="$1" new="$2" file tmp line key source target new_target was_changed total=0
+    for file in "$SPLIT_POLICIES_FILE" "$SPLIT_CATEGORY_POLICIES_FILE"; do
+        [ -f "$file" ] || continue
+        tmp="$(mktemp)"
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
+            esac
+            IFS=$'\t' read -r key target <<< "$line"
+            IFS=$'\t' read -r new_target was_changed <<< "$(replace_split_target_list "$target" "$old" "$new")"
+            if [ "$was_changed" = "true" ]; then
+                printf '%s\t%s\n' "$key" "$new_target" >> "$tmp"
+                total=$((total + 1))
+            else
+                printf '%s\n' "$line" >> "$tmp"
+            fi
+        done < "$file"
+        install -m 0600 "$tmp" "$file"
+        rm -f "$tmp"
+    done
+    if [ -f "$SPLIT_CONTAINER_POLICIES_FILE" ]; then
+        tmp="$(mktemp)"
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
+            esac
+            IFS=$'\t' read -r key source target <<< "$line"
+            IFS=$'\t' read -r new_target was_changed <<< "$(replace_split_target_list "$target" "$old" "$new")"
+            if [ "$was_changed" = "true" ]; then
+                printf '%s\t%s\t%s\n' "$key" "$source" "$new_target" >> "$tmp"
+                total=$((total + 1))
+            else
+                printf '%s\n' "$line" >> "$tmp"
+            fi
+        done < "$SPLIT_CONTAINER_POLICIES_FILE"
+        install -m 0600 "$tmp" "$SPLIT_CONTAINER_POLICIES_FILE"
+        rm -f "$tmp"
+    fi
+    for file in "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE"; do
+        [ -f "$file" ] || continue
+        tmp="$(mktemp)"
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
+            esac
+            IFS=$'\t' read -r key source target <<< "$line"
+            changed="false"
+            if [ "$source" = "$old" ]; then
+                source="$new"
+                changed="true"
+            fi
+            IFS=$'\t' read -r new_target was_changed <<< "$(replace_split_target_list "$target" "$old" "$new")"
+            if [ "$changed" = "true" ] || [ "$was_changed" = "true" ]; then
+                total=$((total + 1))
+                printf '%s\t%s\t%s\n' "$key" "$source" "$new_target" >> "$tmp"
+            else
+                printf '%s\n' "$line" >> "$tmp"
+            fi
+        done < "$file"
+        install -m 0600 "$tmp" "$file"
+        rm -f "$tmp"
+    done
+    if [ "$total" -gt 0 ]; then
+        info "已把 $total 条分流/强制分流规则中的旧出口引用替换为新出口。"
+    else
+        info "旧出口不存在分流或强制分流规则引用，无需处理。"
+    fi
+}
+
+migrate_exit_aux_references() {
+    local old="$1" new="$2" tmp line cur_name down up new_allowed changed=0
+    if [ -f "$LIMITS_FILE" ]; then
+        tmp="$(mktemp)"
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
+            esac
+            read -r cur_name down up rest <<< "$line"
+            if [ "$cur_name" = "$old" ]; then
+                printf '%s\t%s\t%s\n' "$new" "$down" "$up" >> "$tmp"
+                changed=$((changed + 1))
+            else
+                printf '%s\n' "$line" >> "$tmp"
+            fi
+        done < "$LIMITS_FILE"
+        install -m 0600 "$tmp" "$LIMITS_FILE"
+        rm -f "$tmp"
+        if [ "$changed" -gt 0 ]; then
+            info "已把旧出口的共享限速迁移到新出口。"
+        fi
+    fi
+    if [ "${AUTO_ALLOW_EXITS:-*}" != "*" ]; then
+        new_allowed="$(replace_allowed_item "${AUTO_ALLOW_EXITS:-*}" "$old" "$new")"
+        if [ "$new_allowed" != "${AUTO_ALLOW_EXITS:-*}" ]; then
+            set_config_value AUTO_ALLOW_EXITS "$new_allowed"
+            info "已更新自动授权出口列表中的旧出口引用。"
+        fi
+    fi
+    if [ -n "${AUTO_DEFAULT_EXIT:-}" ] && [ "$AUTO_DEFAULT_EXIT" = "$old" ]; then
+        set_config_value AUTO_DEFAULT_EXIT "$new"
+        info "已把自动默认出口更新为新出口。"
+    fi
+}
+
+replace_exit_health_check() {
+    local name="$1" status
+    info "正在对新出口 '$(display_exit_name "$name")' 做上游健康检查（只读，不修复）..."
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "缺少 python3，无法执行上游健康检查，将跳过验证。"
+        return 0
+    fi
+    upstream_health --quiet || true
+    if [ ! -f "$UPSTREAM_HEALTH_STATE_FILE" ]; then
+        warn "未生成上游健康检查状态，无法验证新出口，将跳过验证。"
+        return 0
+    fi
+    status="$(python3 - "$UPSTREAM_HEALTH_STATE_FILE" "$name" <<'PY'
+import json
+import sys
+try:
+    state = json.load(open(sys.argv[1], encoding="utf-8"))
+    entry = (state.get("exits") or {}).get(sys.argv[2]) or {}
+    print(entry.get("status", ""))
+except Exception:
+    print("")
+PY
+)"
+    case "$status" in
+        正常)
+            info "新出口 '$(display_exit_name "$name")' 健康检查通过。"
+            return 0
+            ;;
+        "")
+            warn "新出口未被上游健康检查覆盖，跳过验证。"
+            return 0
+            ;;
+        *)
+            die "新出口 '$(display_exit_name "$name")' 健康检查未通过（状态: $status），已中止替换。确认新出口可用后可加 --no-check 跳过。"
+            ;;
+    esac
+}
+
+replace_exit() {
+    need_root
+    load_config
+    write_default_config
+    local old_ref="${1:-}" new_ref="${2:-}" arg check="true" delete_mode="prompt"
+    local old new count=0
+    shift 2 || true
+    for arg in "$@"; do
+        case "$arg" in
+            --no-check) check="false" ;;
+            --delete|-y) delete_mode="delete" ;;
+            --keep|-n) delete_mode="keep" ;;
+            *) die "未知参数: $arg（支持 --no-check / --delete / --keep）" ;;
+        esac
+    done
+    [ -n "$old_ref" ] && [ -n "$new_ref" ] || die "用法: $0 replace-exit 旧出口 新出口 [--no-check] [--delete|--keep]"
+    old="$(resolve_exit_target "$old_ref")" || die "未找到旧出口: $old_ref"
+    new="$(resolve_exit_target "$new_ref")" || die "未找到新出口: $new_ref"
+    [ "$old" != "-" ] || die "入口机直出不是可替换出口。"
+    [ "$new" != "-" ] || die "新出口不能是入口机直出。"
+    [ "$old" != "$new" ] || die "旧出口和新出口不能相同。"
+    valid_name "$old" || die "旧出口内部名称无效: $old"
+    valid_name "$new" || die "新出口内部名称无效: $new"
+    exit_exists "$new" || die "未找到新出口: $new_ref"
+    if [ -f "$CONTAINERS_FILE" ]; then
+        count="$(awk -F '\t' -v o="$old" 'NF && $1 !~ /^#/ && $5 == o {n++} END {print n+0}' "$CONTAINERS_FILE")"
+    fi
+    if [ "$check" = "true" ]; then
+        replace_exit_health_check "$new"
+    fi
+    replace_exit_backup || die "出口替换前备份失败，已中止。"
+    state_lock_acquire
+    migrate_containers_for_replaced_exit "$old" "$new"
+    migrate_split_policies_for_replaced_exit "$old" "$new"
+    migrate_exit_aux_references "$old" "$new"
+    mark_nft_pending
+    if ! do_apply; then
+        state_lock_release
+        warn "出口替换的数据面应用失败，正在回滚备份..."
+        replace_exit_restore || warn "回滚文件失败，请手动检查 $CONFIG_DIR/replace-backups。"
+        do_apply || warn "回滚后的 apply 仍失败，请手动检查。"
+        die "出口替换失败，已回滚。"
+    fi
+    state_lock_release
+    sync_now || true
+    info "出口替换完成：'$(display_exit_name "$old")' -> '$(display_exit_name "$new")'，已迁移 $count 个实例。"
+    case "$delete_mode" in
+        delete)
+            remove_exit "$old"
+            ;;
+        keep)
+            info "旧出口 '$(display_exit_name "$old")' 已保留（当前无实例引用），需要时可通过删除出口功能清理。"
+            ;;
+        prompt)
+            if [ -t 0 ]; then
+                if confirm_yes "是否现在自动删除旧出口 '$(display_exit_name "$old")'？（输入 n 则保留，稍后可通过删除出口功能删除）"; then
+                    remove_exit "$old"
+                else
+                    info "已保留旧出口，可通过删除出口功能稍后清理。"
+                fi
+            else
+                info "非交互模式默认保留旧出口；如需自动删除请使用 --delete。"
+            fi
+            ;;
+    esac
+}
+
 allowed_contains() {
     local allowed="$1" target="$2" item
     local items=()
@@ -6290,6 +6587,23 @@ remove_allowed_item() {
     for item in "${items[@]}"; do
         [ -n "$item" ] || continue
         [ "$item" = "$removed" ] && continue
+        out="${out}${comma}${item}"
+        comma=","
+    done
+    printf '%s\n' "${out:--}"
+}
+
+replace_allowed_item() {
+    local allowed="$1" old="$2" new="$3" item out="" comma=""
+    local items=()
+    [ "$allowed" = "*" ] && { printf '*\n'; return 0; }
+    IFS=',' read -r -a items <<< "$allowed"
+    for item in "${items[@]}"; do
+        [ -n "$item" ] || continue
+        [ "$item" = "$old" ] && item="$new"
+        case ",$out," in
+            *,"$item",*) continue ;;
+        esac
         out="${out}${comma}${item}"
         comma=","
     done
@@ -8610,9 +8924,9 @@ def find_container_by_ip(remote_ip):
 def allowed_exits(container, exits):
     allowed = container["allowed"]
     if allowed == "*":
-        return [DIRECT_EXIT_NAME] + [exits[name].get("display") or name for name in sorted(exits.keys())]
+        return [DIRECT_EXIT_NAME] + [exits[name].get("display") or name for name in exits]
     names = [item for item in allowed.split(",") if item]
-    return [DIRECT_EXIT_NAME] + [exits[name].get("display") or name for name in names if name in exits]
+    return [DIRECT_EXIT_NAME] + [exits[name].get("display") or name for name in exits if name in names]
 
 
 def is_allowed_target(container, target):
@@ -11428,7 +11742,7 @@ list_exits() {
 }
 
 interactive_list_exits() {
-    list_exits
+    interactive_sort_exits
     pause_screen
 }
 
@@ -12672,6 +12986,191 @@ interactive_remove_exit() {
     pause_screen
 }
 
+# ---------- 出口排序：宿主机顺序即实例 out 列表顺序 ----------
+sort_exits() {
+    need_root
+    load_config
+    local mode="${1:-auto}" order_arg="" arg
+    [ -f "$EXITS_FILE" ] || die "暂无出口可排序。"
+    shift || true
+    case "$mode" in
+        auto|pinyin|alpha|alphabet|letter)
+            mode="auto"
+            ;;
+        order|manual)
+            if [ "$#" -gt 0 ]; then
+                order_arg="$*"
+            else
+                die "手动排序需要提供序号列表，例如: $0 sort-exits order 3 1 2"
+            fi
+            ;;
+        *)
+            die "用法: $0 sort-exits auto|order 序号列表"
+            ;;
+    esac
+    command -v python3 >/dev/null 2>&1 || die "排序功能需要 python3。"
+    state_lock_acquire
+    if ! python3 - "$EXITS_FILE" "$mode" "$order_arg" <<'PY'
+import sys
+
+GB_BOUNDS = [
+    (0xB0A1, "a"), (0xB0C5, "b"), (0xB2C1, "c"), (0xB4EE, "d"), (0xB6EA, "e"),
+    (0xB7A2, "f"), (0xB8C1, "g"), (0xB9FE, "h"), (0xBBF7, "j"), (0xBFA6, "k"),
+    (0xC0AC, "l"), (0xC2E8, "m"), (0xC4C3, "n"), (0xC5B6, "o"), (0xC5BE, "p"),
+    (0xC6DA, "q"), (0xC8BB, "r"), (0xC8F6, "s"), (0xCBFA, "t"), (0xCDDA, "w"),
+    (0xCEF4, "x"), (0xD1B9, "y"), (0xD4D1, "z"),
+]
+
+
+def zh_initial(ch):
+    try:
+        b = ch.encode("gb2312")
+    except UnicodeEncodeError:
+        return ""
+    if len(b) != 2:
+        return ""
+    code = (b[0] << 8) | b[1]
+    if not (0xB0A1 <= code <= 0xD7F9):
+        return ""
+    letter = ""
+    for bound_code, bound_letter in GB_BOUNDS:
+        if code >= bound_code:
+            letter = bound_letter
+        else:
+            break
+    return letter
+
+
+def sort_key(display):
+    key = []
+    for ch in display:
+        if ch.isascii():
+            if ch.isdigit():
+                key.append((0, ch, 0))
+            elif ch.isalpha():
+                key.append((1, ch.lower(), 0))
+            else:
+                key.append((3, ch, 0))
+        elif "\u4e00" <= ch <= "\u9fff":
+            initial = zh_initial(ch)
+            if initial:
+                code = 0
+                try:
+                    b = ch.encode("gb2312")
+                    if len(b) == 2:
+                        code = (b[0] << 8) | b[1]
+                except UnicodeEncodeError:
+                    pass
+                key.append((1, initial, code))
+            else:
+                key.append((2, ch, 0))
+        else:
+            key.append((3, ch, 0))
+    return tuple(key)
+
+
+def display_of(row):
+    parts = row.split("\t")
+    return parts[5] if len(parts) > 5 and parts[5] else parts[0]
+
+
+path, mode = sys.argv[1:3]
+order_raw = sys.argv[3] if len(sys.argv) > 3 else ""
+with open(path, "r", encoding="utf-8") as fh:
+    lines = fh.read().splitlines()
+comments = [ln for ln in lines if not ln.strip() or ln.lstrip().startswith("#")]
+rows = [ln for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
+if mode == "auto":
+    rows.sort(key=lambda r: sort_key(display_of(r)))
+elif mode == "order":
+    nums = []
+    for token in order_raw.replace(",", " ").split():
+        if not token.strip():
+            continue
+        try:
+            nums.append(int(token))
+        except ValueError:
+            sys.exit("序号必须是数字: %s" % token)
+    if sorted(nums) != list(range(1, len(rows) + 1)):
+        sys.exit("序号必须是从 1 到 %s 的完整排列" % len(rows))
+    rows = [rows[i - 1] for i in nums]
+else:
+    sys.exit("未知排序模式: %s" % mode)
+with open(path, "w", encoding="utf-8", newline="\n") as fh:
+    fh.write("\n".join(comments + rows) + "\n")
+PY
+    then
+        state_lock_release
+        die "出口排序失败。"
+    fi
+    state_lock_release
+    info "出口排序已更新（共 $(read_exit_rows | awk -F '\t' 'END {print NR}') 个出口）。"
+}
+
+interactive_sort_exits() {
+    local choice n pick
+    list_exits
+    n="$(read_exit_rows | awk 'END {print NR}')"
+    [ -n "$n" ] && [ "$n" -gt 0 ] || { warn "暂无出口可排序。"; return 0; }
+    printf '\n请选择排序方式：\n'
+    printf '  1. 按字母/拼音首字母自动排序（数字在前）\n'
+    printf '  2. 手动输入序号排序（范围 1-%s）\n' "$n"
+    printf '  0. 返回\n'
+    read -r -p "请选择 [0-2]: " choice
+    case "$choice" in
+        1)
+            sort_exits auto
+            list_exits
+            ;;
+        2)
+            read -r -p "请输入新的排列顺序（空格或逗号分隔的序号）: " pick
+            [ -n "$pick" ] || return 0
+            if sort_exits order $pick; then
+                list_exits
+            fi
+            ;;
+        0|"") return 0 ;;
+        *) warn "无效选项。" ;;
+    esac
+}
+
+interactive_replace_exit() {
+    local choice_file old new count=0
+    need_root
+    load_config
+    print_exit_summary
+    printf '\n【出口替换】先选择要替换的旧出口，再添加新出口。\n'
+    choice_file="/tmp/incus-egress-replace.$$"
+    if ! choose_host_exit "$choice_file"; then
+        rm -f "$choice_file"
+        pause_screen
+        return 0
+    fi
+    old="$(cat "$choice_file")"
+    rm -f "$choice_file"
+    printf '\n现在添加替换用的新出口。\n'
+    interactive_add_proxy_exit
+    new="$(prompt_exit_name "请输入刚才添加的新出口名称（显示名或内部 ID）")"
+    if ! exit_exists "$new"; then
+        new="$(exit_name_by_display "$new")"
+    fi
+    if [ -z "$new" ] || ! exit_exists "$new"; then
+        warn "未找到新出口，替换已取消。"
+        pause_screen
+        return 0
+    fi
+    if [ -f "$CONTAINERS_FILE" ]; then
+        count="$(awk -F '\t' -v o="$old" 'NF && $1 !~ /^#/ && $5 == o {n++} END {print n+0}' "$CONTAINERS_FILE")"
+    fi
+    if ! confirm_yes "将把 '$(display_exit_name "$old")' 上的 $count 个实例及全部分流/强制分流规则引用替换为 '$(display_exit_name "$new")'，继续吗？"; then
+        info "已取消替换。"
+        pause_screen
+        return 0
+    fi
+    replace_exit "$old" "$new"
+    pause_screen
+}
+
 sync_and_enable_takeover() {
     need_root
     local allowed
@@ -12958,7 +13457,7 @@ clear_container_out_access() {
     cat > "$tmp" <<'EOF'
 # 容器授权配置，每行一台：
 # 名称    容器IP       token               允许出口      当前出口
-# 请通过主菜单 7 重新同步运行中容器并选择授权出口。
+# 请通过主菜单 8 重新同步运行中容器并选择授权出口。
 EOF
     install -m 0600 "$tmp" "$CONTAINERS_FILE"
     cat > "$tmp" <<'EOF'
@@ -12970,7 +13469,7 @@ EOF
     do_apply_nftables
     state_lock_release
     info "已清空全部实例出口信息；自动同步和 out/token 自动补齐保持关闭。"
-    info "下一步：执行主菜单 7 重新同步；选择 1 可授权全部已添加出口。"
+    info "下一步：执行主菜单 8 重新同步；选择 1 可授权全部已添加出口。"
 }
 
 enable_container_out_access() {
@@ -13130,48 +13629,50 @@ interactive_menu() {
         printf '\n'
         printf '  %s【出口管理】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[3]%s 添加出口                  %s[4]%s 查看出口\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[5]%s 删除出口                  %s[6]%s 出口共享限速\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[5]%s 删除出口                  %s[6]%s 出口替换（实例自动迁移）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[7]%s 出口共享限速\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【容器同步】%s\n' "$UI_CYAN" "$UI_RESET"
-        printf '    %s[7]%s 同步运行中容器，并选择可切换出口\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[8]%s 同步运行中容器，但仅启用宿主机分流\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[9]%s 容器 out/token 自动补齐开关\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[10]%s 一键清空全部实例出口信息\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[11]%s 全部运行中容器一键切换出口\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[8]%s 同步运行中容器，并选择可切换出口\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[9]%s 同步运行中容器，但仅启用宿主机分流\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[10]%s 容器 out/token 自动补齐开关\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[11]%s 一键清空全部实例出口信息\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[12]%s 全部运行中容器一键切换出口\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【分流管理】%s\n' "$UI_CYAN" "$UI_RESET"
-        printf '    %s[12]%s 分流管理\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[13]%s 入口机直连\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[13]%s 分流管理\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[14]%s 入口机直连\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【维护操作】%s\n' "$UI_CYAN" "$UI_RESET"
-        printf '    %s[14]%s 从 GitHub 安全更新          %s[15]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[16]%s 彻底卸载                    %s[17]%s 重建当前版本组件（不联网）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[18]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[15]%s 从 GitHub 安全更新          %s[16]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[17]%s 彻底卸载                    %s[18]%s 重建当前版本组件（不联网）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[19]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
         printf '    固定更新命令：%ssbout update-github && sbout upgrade%s（跨版本请使用命令，不要记忆菜单编号）\n' "$UI_YELLOW" "$UI_RESET"
         printf '\n'
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$UI_GREEN" "$UI_RESET"
         ui_line
-        read -r -p "请输入选项 [0-18]: " choice
+        read -r -p "请输入选项 [0-19]: " choice
         case "$choice" in
             1) interactive_install_host ;;
             2) interactive_status ;;
             3) interactive_add_proxy_exit ;;
             4) interactive_list_exits ;;
             5) interactive_remove_exit ;;
-            6) interactive_limit_menu ;;
-            7) interactive_sync_and_enable ;;
-            8) interactive_sync_split_only ;;
-            9) interactive_container_out_autofill ;;
-            10) interactive_clear_container_out ;;
-            11) interactive_switch_all_running_containers ;;
-            12) interactive_split_menu ;;
-            13) interactive_entry_direct_menu ;;
-            14) update_from_github; exec "$INSTALL_BIN" menu ;;
-            15) interactive_restore ;;
-            16) interactive_uninstall ;;
-            17) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
-            18) interactive_proxy_optimization_menu ;;
+            6) interactive_replace_exit ;;
+            7) interactive_limit_menu ;;
+            8) interactive_sync_and_enable ;;
+            9) interactive_sync_split_only ;;
+            10) interactive_container_out_autofill ;;
+            11) interactive_clear_container_out ;;
+            12) interactive_switch_all_running_containers ;;
+            13) interactive_split_menu ;;
+            14) interactive_entry_direct_menu ;;
+            15) update_from_github; exec "$INSTALL_BIN" menu ;;
+            16) interactive_restore ;;
+            17) interactive_uninstall ;;
+            18) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
+            19) interactive_proxy_optimization_menu ;;
             0) info "退出。"; exit 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -13747,6 +14248,13 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
   $0 list-exits
       查看所有已添加的出口信息。
 
+  $0 sort-exits auto
+      按字母/拼音首字母自动排序出口；中文按拼音排序，英文按字母排序，数字排在最前。
+      排序结果会同步到实例的 out 列表顺序。
+
+  $0 sort-exits order 3 1 2
+      手动输入序号重新排列出口；序号是当前列表从 1 开始的位置。
+
   $0 limit-exit 出口名 下载限速 [上传限速]
       设置出口级共享限速；所有使用该出口的容器共享总带宽。只填一个限速时下载/上传相同。
       单位使用 Mbps；1 Mbps = 0.125 MB/s，8 Mbps = 1 MB/s；0 或 - 表示不限速。
@@ -13760,6 +14268,11 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
 
   $0 remove-exit 出口名
       删除一个出口，并把正在使用该出口的容器切回入口机。
+
+  $0 replace-exit 旧出口 新出口 [--no-check] [--delete|--keep]
+      把旧出口上的全部实例、授权引用和分流/强制分流规则同步替换为新出口，并自动重建数据面。
+      默认先对新出口做上游健康检查（--no-check 跳过）；交互模式会询问是否删除旧出口，
+      非交互模式默认保留旧出口，--delete 自动删除、--keep 明确保留。
 
   $0 sync-now
       立即扫描 Incus 容器，自动注入 out/token。
@@ -13850,7 +14363,7 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
 
   $0 clear-container-out
       一键清空容器内 out/token、宿主机容器授权、当前出口和容器级分流覆盖。
-      自动同步会停止；出口节点与全局分流保留，请通过主菜单 7 重新同步。
+       自动同步会停止；出口节点与全局分流保留，请通过主菜单 8 重新同步。
 
   $0 enable-container-out
       重新开启容器 out/token 自动注入，并立即同步一次。
@@ -13965,6 +14478,9 @@ case "$command_name" in
     list-exits|list-exit|exits)
         list_exits "$@"
         ;;
+    sort-exits|sort-exit|exit-sort)
+        sort_exits "$@"
+        ;;
     limit-exit|set-limit|set-exit-limit)
         set_exit_limit "$@"
         ;;
@@ -13979,6 +14495,9 @@ case "$command_name" in
         ;;
     remove-exit|delete-exit|del-exit)
         remove_exit "$@"
+        ;;
+    replace-exit|replace|exit-replace|migrate-exit)
+        replace_exit "$@"
         ;;
     add-container)
         add_container "$@"
