@@ -12987,10 +12987,52 @@ interactive_remove_exit() {
 }
 
 # ---------- 出口排序：宿主机顺序即实例 out 列表顺序 ----------
+instance_visible_exit_names() {
+    # 输出会出现在实例 out 列表中的出口内部名（按 exits.tsv 文件顺序）。
+    # 判断依据：AUTO_ALLOW_EXITS 显式授权、任一容器授权列表/当前出口引用；
+    # 如果授权为 "*"（或没有容器记录），则所有出口都视为实例可见。
+    local item allowed current visible_set=","
+    if [ "${AUTO_ALLOW_EXITS:-*}" = "*" ] || [ ! -f "$CONTAINERS_FILE" ]; then
+        read_exit_rows | awk -F '\t' '{print $1}'
+        return 0
+    fi
+    for item in $(printf '%s' "${AUTO_ALLOW_EXITS}" | tr ',' ' '); do
+        [ -n "$item" ] || continue
+        case "$visible_set" in
+            *,"$item",*) ;;
+            *) visible_set="$visible_set$item," ;;
+        esac
+    done
+    while IFS=$'\t' read -r _cname _cip _ctoken allowed current _rest; do
+        [ -n "$_cname" ] || continue
+        case "$_cname" in
+            \#*) continue ;;
+        esac
+        if [ "$allowed" = "*" ]; then
+            read_exit_rows | awk -F '\t' '{print $1}'
+            return 0
+        fi
+        for item in $(printf '%s' "${allowed:-*}" | tr ',' ' '); do
+            [ -n "$item" ] && [ "$item" != "-" ] || continue
+            case "$visible_set" in
+                *,"$item",*) ;;
+                *) visible_set="$visible_set$item," ;;
+            esac
+        done
+        if [ -n "$current" ] && [ "$current" != "-" ]; then
+            case "$visible_set" in
+                *,"$current",*) ;;
+                *) visible_set="$visible_set$current," ;;
+            esac
+        fi
+    done < "$CONTAINERS_FILE"
+    read_exit_rows | awk -F '\t' -v s="$visible_set" 'index(s, "," $1 ",") > 0 {print $1}'
+}
+
 sort_exits() {
     need_root
     load_config
-    local mode="${1:-auto}" order_arg="" arg
+    local mode="${1:-auto}" order_arg="" arg visible_list
     [ -f "$EXITS_FILE" ] || die "暂无出口可排序。"
     shift || true
     case "$mode" in
@@ -13009,8 +13051,9 @@ sort_exits() {
             ;;
     esac
     command -v python3 >/dev/null 2>&1 || die "排序功能需要 python3。"
+    visible_list="$(instance_visible_exit_names | tr '\n' ',')"
     state_lock_acquire
-    if ! python3 - "$EXITS_FILE" "$mode" "$order_arg" <<'PY'
+    if ! python3 - "$EXITS_FILE" "$mode" "$order_arg" "$visible_list" <<'PY'
 import sys
 
 GB_BOUNDS = [
@@ -13076,45 +13119,71 @@ def display_of(row):
 
 path, mode = sys.argv[1:3]
 order_raw = sys.argv[3] if len(sys.argv) > 3 else ""
+visible_raw = sys.argv[4] if len(sys.argv) > 4 else ""
 with open(path, "r", encoding="utf-8") as fh:
     lines = fh.read().splitlines()
 comments = [ln for ln in lines if not ln.strip() or ln.lstrip().startswith("#")]
 rows = [ln for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def name_of(row):
+    return row.split("\t", 1)[0]
+
+
+visible_set = set(x for x in visible_raw.split(",") if x)
+visible_rows = [r for r in rows if name_of(r) in visible_set]
+split_rows = [r for r in rows if name_of(r) not in visible_set]
+if not visible_rows:
+    visible_rows = rows
+    split_rows = []
 if mode == "auto":
-    rows.sort(key=lambda r: sort_key(display_of(r)))
+    visible_rows.sort(key=lambda r: sort_key(display_of(r)))
 elif mode == "order":
     nums = []
-    for token in order_raw.replace(",", " ").split():
+    normalized = order_raw
+    for full, half in zip("０１２３４５６７８９", "0123456789"):
+        normalized = normalized.replace(full, half)
+    normalized = normalized.replace("，", ",").replace("、", ",").replace("　", " ")
+    for token in normalized.replace(",", " ").split():
         if not token.strip():
             continue
         try:
             nums.append(int(token))
         except ValueError:
             sys.exit("序号必须是数字: %s" % token)
-    if sorted(nums) != list(range(1, len(rows) + 1)):
-        sys.exit("序号必须是从 1 到 %s 的完整排列" % len(rows))
-    rows = [rows[i - 1] for i in nums]
+    if sorted(nums) != list(range(1, len(visible_rows) + 1)):
+        sys.exit("序号必须是从 1 到 %s 的完整排列（只含出现在实例 out 中的出口）" % len(visible_rows))
+    visible_rows = [visible_rows[i - 1] for i in nums]
 else:
     sys.exit("未知排序模式: %s" % mode)
+rows = visible_rows + split_rows
 with open(path, "w", encoding="utf-8", newline="\n") as fh:
     fh.write("\n".join(comments + rows) + "\n")
 PY
     then
         state_lock_release
-        die "出口排序失败。"
+        warn "出口排序失败，请检查输入的序号（必须是 1 到 N 的完整排列，不重复不遗漏；N 为出现在实例 out 中的出口数）。"
+        return 1
     fi
     state_lock_release
     info "出口排序已更新（共 $(read_exit_rows | awk -F '\t' 'END {print NR}') 个出口）。"
 }
 
 interactive_sort_exits() {
-    local choice n pick
+    local choice n pick visible_count split_names vis_name i
     list_exits
     n="$(read_exit_rows | awk 'END {print NR}')"
     [ -n "$n" ] && [ "$n" -gt 0 ] || { warn "暂无出口可排序。"; return 0; }
+    visible_count="$(instance_visible_exit_names | awk 'END {print NR}')"
+    [ -n "$visible_count" ] && [ "$visible_count" -gt 0 ] || visible_count="$n"
+    split_names="$(read_exit_rows | awk -F '\t' '{print $1}' | while IFS= read -r nm; do
+        if ! instance_visible_exit_names | grep -qx "$nm"; then
+            display_exit_name "$nm"
+        fi
+    done | paste -sd'、' -)"
     printf '\n请选择排序方式：\n'
-    printf '  1. 按字母/拼音首字母自动排序（数字在前）\n'
-    printf '  2. 手动输入序号排序（范围 1-%s）\n' "$n"
+    printf '  1. 按字母/拼音首字母自动排序（数字在前，分流专用出口自动排最后）\n'
+    printf '  2. 手动输入序号排序（范围 1-%s，仅限实例 out 中可见的出口）\n' "$visible_count"
     printf '  0. 返回\n'
     read -r -p "请选择 [0-2]: " choice
     case "$choice" in
@@ -13123,7 +13192,16 @@ interactive_sort_exits() {
             list_exits
             ;;
         2)
-            read -r -p "请输入新的排列顺序（空格或逗号分隔的序号）: " pick
+            printf '\n可排序出口（出现在实例 out 中）:\n'
+            i=1
+            while IFS= read -r vis_name; do
+                printf '  %s. %s\n' "$i" "$(display_exit_name "$vis_name")"
+                i=$((i + 1))
+            done < <(instance_visible_exit_names)
+            if [ -n "$split_names" ]; then
+                printf '分流专用出口（不出现在实例 out，自动排在最后）: %s\n' "$split_names"
+            fi
+            read -r -p "请输入新的排列顺序（1-$visible_count，空格或逗号分隔）: " pick
             [ -n "$pick" ] || return 0
             if sort_exits order $pick; then
                 list_exits
@@ -14250,10 +14328,11 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
 
   $0 sort-exits auto
       按字母/拼音首字母自动排序出口；中文按拼音排序，英文按字母排序，数字排在最前。
+      只出现在分流规则、不出现在实例 out 中的专用出口会自动排在最后。
       排序结果会同步到实例的 out 列表顺序。
 
   $0 sort-exits order 3 1 2
-      手动输入序号重新排列出口；序号是当前列表从 1 开始的位置。
+      手动输入序号重新排列出口；序号只针对出现在实例 out 中的出口（分流专用出口自动排最后）。
 
   $0 limit-exit 出口名 下载限速 [上传限速]
       设置出口级共享限速；所有使用该出口的容器共享总带宽。只填一个限速时下载/上传相同。
@@ -14479,7 +14558,7 @@ case "$command_name" in
         list_exits "$@"
         ;;
     sort-exits|sort-exit|exit-sort)
-        sort_exits "$@"
+        sort_exits "$@" || exit 1
         ;;
     limit-exit|set-limit|set-exit-limit)
         set_exit_limit "$@"
