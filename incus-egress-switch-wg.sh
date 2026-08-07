@@ -8168,26 +8168,40 @@ split_force_category_policy() {
     need_root
     load_config
     write_default_config
-    local target_category="${1:-}" target="${2:-}" resolved app display app_category remote enabled count=0
+    local categories_input="${1:-}" target="${2:-}" resolved item category app display app_category remote enabled count=0 total_count=0 label="" comma=""
+    local categories=()
     split_require_catalog
-    [ -n "$target_category" ] && [ -n "$target" ] || die "用法: $0 split-force-category 分类 目标出口"
-    split_category_exists "$target_category" || die "未找到分类: $target_category"
+    [ -n "$categories_input" ] && [ -n "$target" ] || die "用法: $0 split-force-category 分类[,分类...] 目标出口"
+    IFS=',' read -r -a categories <<< "$categories_input"
+    for item in "${categories[@]}"; do
+        item="$(trim_space "$item")"
+        split_category_exists "$item" || die "未找到分类: $item"
+    done
     resolved="$(resolve_exit_target "$target")" || die "未知出口: $target"
     require_split_only_targets "$resolved"
-    while IFS=$'\t' read -r app display app_category remote enabled; do
-        [ "$app_category" = "$target_category" ] || continue
-        split_prepare_app_rules "$app" || true
-    done < <(read_split_apps)
+    for category in "${categories[@]}"; do
+        category="$(trim_space "$category")"
+        while IFS=$'\t' read -r app display app_category remote enabled; do
+            [ "$app_category" = "$category" ] || continue
+            split_prepare_app_rules "$app" || true
+        done < <(read_split_apps)
+    done
     state_lock_acquire
     mark_nft_pending
-    split_write_category_policy_value "$target_category" "$resolved"
-    force_write_category_value "$target_category"
-    count="$(split_bulk_set_category_apps "$target_category" "$resolved")"
-    cleanup_container_split_policies_for_category_targets "$target_category" "$resolved"
+    for category in "${categories[@]}"; do
+        category="$(trim_space "$category")"
+        split_write_category_policy_value "$category" "$resolved"
+        force_write_category_value "$category"
+        count="$(split_bulk_set_category_apps "$category" "$resolved")"
+        total_count=$((total_count + count))
+        cleanup_container_split_policies_for_category_targets "$category" "$resolved"
+        label="$label$comma$category"
+        comma=","
+    done
     cleanup_container_split_policies_for_container_allowed
     do_apply_nftables
     state_lock_release
-    info "已设置强制分类分流：$target_category -> $(display_exit_name "$resolved")，共 $count 个应用。"
+    info "已设置强制分类分流：$label -> $(split_target_list_label "$resolved")，共 $total_count 个应用。"
 }
 
 split_clear_category_policy() {
@@ -12894,7 +12908,7 @@ interactive_split_force_category() {
     local category_file target_file category target
     category_file="/tmp/incus-egress-force-category.$$"
     target_file="/tmp/incus-egress-force-target.$$"
-    choose_split_category "$category_file" || { rm -f "$category_file" "$target_file"; return 0; }
+    choose_split_categories "$category_file" || { rm -f "$category_file" "$target_file"; return 0; }
     choose_split_target "$target_file" "强制分类目标（仅分流专用出口）" split-only || { rm -f "$category_file" "$target_file"; return 0; }
     category="$(cat "$category_file")"
     target="$(cat "$target_file")"
@@ -14720,8 +14734,8 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
   $0 split-force binance 美国
       设置强制单应用分流；无论容器当前出口是什么，该应用都走宿主机指定出口。
 
-  $0 split-force-category '金融、支付与数字资产' 美国
-      设置强制分类分流；该分类下应用无论容器当前出口是什么，都走宿主机指定出口。
+  $0 split-force-category '金融、支付与数字资产[,视频,...]' 美国
+      设置强制分类分流（可多选分类，英文逗号分隔）；所选分类下应用无论容器当前出口是什么，都走宿主机指定出口。
 
   $0 split-clear YouTube
       取消单个应用的分流策略，恢复按容器当前出口处理。
