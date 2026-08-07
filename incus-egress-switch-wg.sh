@@ -5143,8 +5143,8 @@ install_wireguard_tools() {
 }
 
 write_wireguard_exit_files() {
-    local name="$1" iface="$2" endpoint="$3" peer_public_key="$4" address4="$5" address6="$6" private_key="$7" preshared_key="$8" mtu="$9"
-    local conf_dir conf service addresses="" allowed_ips="" psk_line=""
+    local name="$1" iface="$2" endpoint="$3" peer_public_key="$4" address4="$5" address6="$6" private_key="$7" preshared_key="$8" mtu="$9" listen_port="${10:-}"
+    local conf_dir conf service addresses="" allowed_ips="" psk_line="" listen_port_line=""
     conf_dir="$EXIT_DIR/$name"
     # wg-quick 使用配置文件名作为接口名，因此必须保存为 <iface>.conf。
     conf="$conf_dir/$iface.conf"
@@ -5157,10 +5157,14 @@ write_wireguard_exit_files() {
         allowed_ips="${allowed_ips}::/0"
     fi
     [ "$preshared_key" = "-" ] || psk_line="PresharedKey = $preshared_key"
+    if [ -n "$listen_port" ] && [ "$listen_port" != "-" ]; then
+        listen_port_line="ListenPort = $listen_port"
+    fi
     mkdir -p "$conf_dir"
     cat > "$conf" <<EOF
 [Interface]
 PrivateKey = $private_key
+$listen_port_line
 Address = $addresses
 MTU = $mtu
 Table = off
@@ -5201,10 +5205,10 @@ add_wireguard_exit() {
     need_cmd systemctl
     need_cmd ip
     state_lock_acquire
-    local display="${1:-}" endpoint="${2:-}" peer_public_key="${3:-}" address4="${4:--}" address6="${5:--}" preshared_key="${6:--}" mtu="${7:-1380}"
+    local display="${1:-}" endpoint="${2:-}" peer_public_key="${3:-}" address4="${4:--}" address6="${5:--}" preshared_key="${6:--}" mtu="${7:-1380}" listen_port="${8:--}"
     local name idx mark table iface private_key public_key route4 route6 service
     [ -n "$display" ] && [ -n "$endpoint" ] && [ -n "$peer_public_key" ] \
-        || die "用法: $0 add-wg 出口名 服务端地址:端口 服务端公钥 IPv4隧道地址 [IPv6隧道地址|-] [PSK|-] [MTU]"
+        || die "用法: $0 add-wg 出口名 服务端地址:端口 服务端公钥 IPv4隧道地址 [IPv6隧道地址|-] [PSK|-] [MTU] [本地UDP端口|-]"
     display="$(normalize_display_name "$display")"
     valid_wireguard_endpoint "$endpoint" || die "WireGuard Endpoint 无效，请使用 域名:端口、IPv4:端口 或 [IPv6]:端口。"
     valid_wireguard_key "$peer_public_key" || die "WireGuard 服务端公钥无效。"
@@ -5213,6 +5217,15 @@ add_wireguard_exit() {
     valid_wireguard_address 6 "$address6" || die "WireGuard IPv6 隧道地址无效，请包含前缀；不启用请填 -。"
     [ "$address4" != "-" ] || [ "$address6" != "-" ] || die "WireGuard 至少需要一个 IPv4 或 IPv6 隧道地址。"
     [[ "$mtu" =~ ^[0-9]+$ ]] && [ "$mtu" -ge 1280 ] && [ "$mtu" -le 9000 ] || die "WireGuard MTU 必须是 1280-9000 的整数。"
+    if [ "$listen_port" != "-" ]; then
+        validate_port "$listen_port" || die "入口机 WG 本地 UDP 端口无效（1-65535）: $listen_port"
+        if [ -d "$EXIT_DIR" ] && grep -R -l "^ListenPort = $listen_port$" "$EXIT_DIR" --include='*.conf' 2>/dev/null | grep -q .; then
+            die "UDP 端口 $listen_port 已被其它 WG 出口使用。"
+        fi
+        if command -v ss >/dev/null 2>&1 && ss -H -lun "sport = :$listen_port" 2>/dev/null | grep -q .; then
+            die "UDP 端口 $listen_port 已被其它程序占用。"
+        fi
+    fi
     name="$(safe_exit_id "wg" "$display" "$endpoint" "")"
     valid_name "$name" || die "出口内部名称无效: $name"
     exit_exists "$name" && die "出口已存在: $name"
@@ -5227,7 +5240,7 @@ add_wireguard_exit() {
     route4="none"; route6="none"
     [ "$address4" = "-" ] || route4="dev:$iface"
     [ "$address6" = "-" ] || route6="dev:$iface"
-    write_wireguard_exit_files "$name" "$iface" "$endpoint" "$peer_public_key" "$address4" "$address6" "$private_key" "$preshared_key" "$mtu"
+    write_wireguard_exit_files "$name" "$iface" "$endpoint" "$peer_public_key" "$address4" "$address6" "$private_key" "$preshared_key" "$mtu" "$listen_port"
     service="${EXIT_SERVICE_PREFIX}-${name}"
     mark_nft_pending
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$mark" "$table" "$route4" "$route6" "$display" >> "$EXITS_FILE"
@@ -5250,6 +5263,11 @@ add_wireguard_exit() {
     printf '  出口名称   : %s\n' "$display"
     printf '  入口机公钥 : %s\n' "$public_key"
     printf '  隧道地址   : %s\n' "$address4"
+    if [ "$listen_port" != "-" ]; then
+        printf '  本地UDP端口: %s（固定，重启不变）\n' "$listen_port"
+    else
+        printf '  本地UDP端口: 随机（如需防火墙白名单，请重新添加时指定固定端口）\n'
+    fi
     printf '\n下一步：回到 WG 出口机，选择“添加入口机”，复制上面的公钥和隧道地址。\n'
         printf '出口机添加完成后，再通过入口机主菜单 8 同步实例。\n'
 }
@@ -11988,7 +12006,7 @@ interactive_client_script() {
 }
 
 interactive_add_proxy_exit() {
-    local choice link parsed default_name name server port username password method uuid endpoint peer_key address4 address6 psk mtu
+    local choice link parsed default_name name server port username password method uuid endpoint peer_key address4 address6 psk mtu listen_port
     LAST_ADDED_EXIT_NAME=""
     need_root
     load_config
@@ -12069,7 +12087,8 @@ interactive_add_proxy_exit() {
             address6="-"
             psk="-"
             mtu="1380"
-            add_wireguard_exit "$name" "$endpoint" "$peer_key" "$address4" "$address6" "$psk" "$mtu"
+            listen_port="$(prompt_default "入口机 WG 本地 UDP 端口（直接回车随机；固定端口便于防火墙白名单）" "-")"
+            add_wireguard_exit "$name" "$endpoint" "$peer_key" "$address4" "$address6" "$psk" "$mtu" "$listen_port"
             ;;
         *) warn "无效选择。"; pause_screen; return 0 ;;
     esac
@@ -14591,7 +14610,9 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
 
   $0 add-wg 出口名 Endpoint 服务端公钥 IPv4隧道地址 [IPv6隧道地址|-] [PSK|-] [MTU]
       在 Incus 入口母机添加原生 WireGuard 出口；入口机私钥自动生成。
-      示例: add-wg JP-WG 203.0.113.10:51820 服务端公钥 10.66.0.2/32 - - 1380
+      可选参数 [本地UDP端口|-]：指定后入口机 WG 固定使用该 UDP 端口（重启不变），
+      适合需要防火墙白名单放行 WG 隧道的场景；不填或填 - 则每次启动随机分配。
+      示例: add-wg JP-WG 203.0.113.10:51820 服务端公钥 10.66.0.2/32 - - 1380 23456
       添加完成后，把脚本显示的入口机公钥和隧道地址填回独立 WG 出口脚本。
 
   $0 list-exits
