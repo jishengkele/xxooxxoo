@@ -6816,6 +6816,449 @@ replace_exit() {
     esac
 }
 
+# ---------- 出口引用全面修复：清理改名/删除/旧进程环境遗留的未知出口 ----------
+#
+# 维护入口会处理所有会被 validate_split_policies/validate_containers 读取的
+# 出口引用，而不是只修复当前报错的 containers.tsv。优先按显示名或“旧名-数字”
+# 规则自动映射；无法安全判断的引用会被移除，当前出口回退到入口机，避免把
+# 未知出口误映射到错误节点。所有实际写入都会先保存到 repair-backups。
+repair_exit_references() {
+    need_root
+    load_config
+    write_default_config
+    local dry_run="false" no_runtime="false" arg report rc
+    for arg in "$@"; do
+        case "$arg" in
+            --dry-run) dry_run="true" ;;
+            --no-runtime) no_runtime="true" ;;
+            *) die "未知参数: $arg（支持 --dry-run / --no-runtime）" ;;
+        esac
+    done
+    need_cmd python3
+
+    state_lock_acquire
+    if report="$(python3 - "$CONFIG_DIR" "$dry_run" <<'PY'
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+
+root = Path(sys.argv[1])
+dry_run = sys.argv[2].lower() == "true"
+split = root / "split"
+config_path = root / "config.env"
+exits_path = root / "exits.tsv"
+
+
+def read_text(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def exit_rows():
+    rows = []
+    try:
+        lines = exits_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return rows
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        rows.append((parts[0], " ".join(parts[5:]) if len(parts) > 5 else parts[0]))
+    return rows
+
+
+rows = exit_rows()
+exit_names = {name for name, _display in rows}
+display_to_names = {}
+for name, display in rows:
+    display_to_names.setdefault(display.casefold(), []).append(name)
+
+mapped = {}
+unresolved = set()
+changed_files = []
+dropped_rows = 0
+
+
+def resolve(ref):
+    ref = (ref or "").strip()
+    if not ref:
+        return ""
+    if ref in exit_names:
+        return ref
+    display_candidates = display_to_names.get(ref.casefold(), [])
+    if len(display_candidates) == 1:
+        return display_candidates[0]
+    # 出口替换生成的常见新名：HKBN -> HKBN-1。仅接受唯一的数字后缀，
+    # 避免 HKBN、HKBN-1、HKBN-2 并存时发生猜错。
+    suffix_candidates = [
+        name for name in exit_names
+        if name.casefold().startswith((ref + "-").casefold())
+        and name[len(ref) + 1:].isdigit()
+    ]
+    if len(suffix_candidates) == 1:
+        return suffix_candidates[0]
+    mapped.setdefault(ref, "")
+    unresolved.add(ref)
+    return ""
+
+
+def map_exit(ref):
+    ref = (ref or "").strip()
+    if ref in ("", "-", "*"):
+        return ref
+    if ref in mapped:
+        return mapped[ref]
+    target = resolve(ref)
+    mapped[ref] = target
+    return target
+
+
+def repair_list(value):
+    value = (value or "").strip()
+    if value in ("", "*", "-"):
+        return value or "-", value == ""
+    output = []
+    changed = False
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            changed = True
+            continue
+        target = map_exit(item)
+        if not target:
+            changed = True
+            continue
+        if target != item:
+            changed = True
+        if target not in output:
+            output.append(target)
+        else:
+            changed = True
+    if not output:
+        output = ["-"]
+    return ",".join(output), changed or ",".join(output) != value
+
+
+def repair_single(value, fallback="-"):
+    value = (value or "").strip()
+    if value in ("", "-"):
+        return fallback if not value else value, value == ""
+    target = map_exit(value)
+    return (target or fallback), target != value
+
+
+def backup_path(path):
+    files = [
+        root / "config.env",
+        root / "exits.tsv",
+        root / "containers.tsv",
+        root / "exit-limits.tsv",
+        root / "split-only-exits.tsv",
+        root / "upstream-health-state.json",
+        root / "autosync-state.json",
+    ]
+    if split.exists():
+        files.extend(sorted(split.glob("*.tsv")))
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+    for source in files:
+        if source.is_file():
+            destination = path / source.relative_to(root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
+
+backup_dir = None
+
+
+def ensure_backup():
+    global backup_dir
+    if dry_run or backup_dir is not None:
+        return
+    import datetime
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    candidate = root / "repair-backups" / stamp
+    suffix = 1
+    while candidate.exists():
+        candidate = root / "repair-backups" / (stamp + "-%d" % suffix)
+        suffix += 1
+    backup_path(candidate)
+    backup_dir = candidate
+
+
+def write_if_changed(path, content, original):
+    global changed_files
+    if content == original:
+        return False
+    ensure_backup()
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+        fd, tmp_name = tempfile.mkstemp(prefix="repair.", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                out.write(content)
+            os.chmod(tmp_name, mode)
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    changed_files.append(str(path.relative_to(root)))
+    return True
+
+
+def transform_rows(path, transform):
+    if not path.is_file():
+        return
+    original = read_text(path)
+    output = []
+    for line in original.splitlines(keepends=True):
+        ending = "\n" if line.endswith("\n") else ""
+        body = line[:-1] if ending else line
+        if not body.strip() or body.lstrip().startswith("#"):
+            output.append(line)
+            continue
+        parts = body.split("\t")
+        replacement = transform(parts)
+        if replacement is None:
+            output.append(line)
+        elif replacement is False:
+            global dropped_rows
+            dropped_rows += 1
+        else:
+            output.append("\t".join(replacement) + ending)
+    write_if_changed(path, "".join(output), original)
+
+
+def repair_containers():
+    def transform(parts):
+        if len(parts) < 5:
+            return parts
+        allowed, allowed_changed = repair_list(parts[3])
+        current, current_changed = repair_single(parts[4])
+        if current != "-" and current not in allowed.split(",") and allowed != "*":
+            current = "-"
+            current_changed = True
+        parts = list(parts)
+        parts[3] = allowed
+        parts[4] = current
+        return parts
+    transform_rows(root / "containers.tsv", transform)
+
+
+def repair_limits():
+    def transform(parts):
+        if not parts:
+            return parts
+        target = map_exit(parts[0])
+        if not target:
+            return False
+        parts = list(parts)
+        parts[0] = target
+        return parts
+    transform_rows(root / "exit-limits.tsv", transform)
+
+
+def repair_split_only():
+    def transform(parts):
+        if not parts:
+            return parts
+        target = map_exit(parts[0])
+        if not target:
+            return False
+        parts = list(parts)
+        parts[0] = target
+        return parts
+    transform_rows(root / "split-only-exits.tsv", transform)
+
+
+def repair_two_column(path):
+    def transform(parts):
+        if len(parts) < 2:
+            return parts
+        target, _changed = repair_list(parts[1])
+        parts = list(parts)
+        parts[1] = target
+        return parts
+    transform_rows(path, transform)
+
+
+def repair_container_policies():
+    def transform(parts):
+        if len(parts) < 3:
+            return parts
+        target, _changed = repair_single(parts[2])
+        if target == "-" and parts[2].strip() not in ("", "-") and not map_exit(parts[2]):
+            return False
+        parts = list(parts)
+        parts[2] = target
+        return parts
+    transform_rows(split / "container-policies.tsv", transform)
+
+
+def repair_force_on_exit(path):
+    def transform(parts):
+        if len(parts) < 3:
+            return parts
+        source = parts[1].strip()
+        if source not in ("", "-"):
+            source_target = map_exit(source)
+            if not source_target:
+                return False
+            source = source_target
+        target, _changed = repair_list(parts[2])
+        parts = list(parts)
+        parts[1] = source or "-"
+        parts[2] = target
+        return parts
+    transform_rows(path, transform)
+
+
+def repair_config():
+    if not config_path.is_file():
+        return
+    original = read_text(config_path)
+    output = []
+    for line in original.splitlines(keepends=True):
+        ending = "\n" if line.endswith("\n") else ""
+        body = line[:-1] if ending else line
+        changed = False
+        for key in ("AUTO_ALLOW_EXITS", "AUTO_DEFAULT_EXIT"):
+            prefix = key + "="
+            if not body.startswith(prefix):
+                continue
+            value = body[len(prefix):].strip().strip("'").strip('"')
+            if key == "AUTO_ALLOW_EXITS":
+                new_value, changed = repair_list(value)
+            else:
+                new_value, changed = repair_single(value)
+            body = prefix + '"' + new_value + '"'
+            break
+        output.append(body + ending)
+    write_if_changed(config_path, "".join(output), original)
+
+
+def repair_state():
+    path = root / "upstream-health-state.json"
+    if not path.is_file():
+        return
+    original = read_text(path)
+    try:
+        data = json.loads(original)
+    except (ValueError, TypeError):
+        return
+    exits = data.get("exits")
+    if not isinstance(exits, dict):
+        return
+    new_exits = {}
+    changed = False
+    for key, value in exits.items():
+        target = map_exit(key)
+        if not target:
+            changed = True
+            continue
+        if target != key:
+            changed = True
+        if target in new_exits and isinstance(new_exits[target], dict) and isinstance(value, dict):
+            merged = dict(new_exits[target])
+            merged.update(value)
+            value = merged
+        new_exits[target] = value
+    if changed:
+        data["exits"] = new_exits
+        content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+        write_if_changed(path, content, original)
+
+
+repair_containers()
+repair_limits()
+repair_split_only()
+repair_config()
+repair_two_column(split / "policies.tsv")
+repair_two_column(split / "category-policies.tsv")
+repair_container_policies()
+repair_force_on_exit(split / "force-on-exit-policies.tsv")
+repair_force_on_exit(split / "force-category-on-exit-policies.tsv")
+repair_state()
+
+print("出口引用修复扫描完成。")
+if mapped:
+    for old, new in sorted(mapped.items()):
+        if new and old != new:
+            print("  自动映射: %s -> %s" % (old, new))
+if unresolved:
+    print("  无法安全映射、已按安全策略清理: %s" % ", ".join(sorted(unresolved)))
+if changed_files:
+    print("  变更文件: %s" % ", ".join(changed_files))
+else:
+    print("  未发现需要修改的出口引用。")
+if dropped_rows:
+    print("  清理无效策略行: %d" % dropped_rows)
+if backup_dir is not None:
+    print("  修复备份: %s" % backup_dir)
+PY
+)"; then
+        :
+    else
+        rc=$?
+        state_lock_release
+        printf '%s\n' "$report"
+        return "$rc"
+    fi
+    state_lock_release
+    printf '%s\n' "$report"
+    [ "$dry_run" = "true" ] && return 0
+
+    mark_nft_pending
+    if ! do_apply; then
+        warn "出口引用已修复，但数据面应用仍失败；请检查上面的备份和错误。"
+        return 1
+    fi
+
+    if [ "$no_runtime" != "true" ]; then
+        ensure_autosync_files || warn "自动同步组件重建失败，请手动执行 sbout upgrade。"
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || warn "systemd daemon-reload 失败。"
+            systemctl enable "$APP_NAME" >/dev/null 2>&1 || true
+            if ! systemctl restart "$APP_NAME"; then
+                warn "API 服务重启失败: $APP_NAME"
+            fi
+            if [ "${AUTO_SYNC:-true}" = "true" ]; then
+                systemctl enable "$APP_NAME-autosync" >/dev/null 2>&1 || true
+                if ! systemctl restart --no-block "$APP_NAME-autosync"; then
+                    warn "自动同步服务重启失败: $APP_NAME-autosync"
+                fi
+            fi
+        fi
+        if command -v incus >/dev/null 2>&1; then
+            if ! sync_now; then
+                warn "出口引用修复后自动同步未通过，请查看服务日志。"
+                return 1
+            fi
+        fi
+    fi
+
+    load_config
+    validate_runtime_config
+    validate_exits
+    validate_exit_limits
+    validate_containers
+    validate_split_policies
+    info "出口引用修复完成，配置校验已通过。"
+}
+
 allowed_contains() {
     local allowed="$1" target="$2" item
     local items=()
@@ -9805,6 +10248,19 @@ AUTO_RUNNING_ONLY = os.environ.get("AUTO_RUNNING_ONLY", CFG.get("AUTO_RUNNING_ON
 AUTO_SYNC_WORKERS = max(1, min(int(os.environ.get("AUTO_SYNC_WORKERS", CFG.get("AUTO_SYNC_WORKERS", "8"))), 32))
 AUTO_INJECT_WORKERS = max(1, min(int(os.environ.get("AUTO_INJECT_WORKERS", CFG.get("AUTO_INJECT_WORKERS", "4"))), 16))
 AUTO_COMMAND_TIMEOUT = max(5, int(os.environ.get("AUTO_COMMAND_TIMEOUT", CFG.get("AUTO_COMMAND_TIMEOUT", "30"))))
+
+
+def refresh_live_policy_config():
+    """Reload policy values changed by the host menu without waiting for a process restart."""
+    global AUTO_ALLOW_EXITS, AUTO_DEFAULT_EXIT
+    try:
+        live = read_env_file(CONFIG_FILE)
+    except OSError:
+        return
+    if "AUTO_ALLOW_EXITS" in live:
+        AUTO_ALLOW_EXITS = live["AUTO_ALLOW_EXITS"]
+    if "AUTO_DEFAULT_EXIT" in live:
+        AUTO_DEFAULT_EXIT = live["AUTO_DEFAULT_EXIT"]
 AUTO_DELETE_GRACE_SCANS = max(1, int(os.environ.get("AUTO_DELETE_GRACE_SCANS", CFG.get("AUTO_DELETE_GRACE_SCANS", "2"))))
 AUTO_RECONCILE_MIN_INTERVAL = max(1, int(os.environ.get("AUTO_RECONCILE_MIN_INTERVAL", CFG.get("AUTO_RECONCILE_MIN_INTERVAL", "10"))))
 AUTO_EVENT_DEBOUNCE = max(0.0, float(os.environ.get("AUTO_EVENT_DEBOUNCE", CFG.get("AUTO_EVENT_DEBOUNCE", "2"))))
@@ -10565,6 +11021,7 @@ def reconcile(force_client_check=False, force_ip_refresh=False):
 
 
 def reconcile_locked(force_client_check=False, force_ip_refresh=False):
+    refresh_live_policy_config()
     state = load_state()
     injected = state.setdefault("injected", {})
     missing_counts = state.setdefault("missing_counts", {})
@@ -14223,14 +14680,15 @@ interactive_menu() {
         printf '\n'
         printf '  %s【维护操作】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[16]%s 从 GitHub 安全更新          %s[17]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[18]%s 彻底卸载                    %s[19]%s 重建当前版本组件（不联网）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-        printf '    %s[20]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
-        printf '    固定更新命令：%ssbout update-github && sbout upgrade%s（跨版本请使用命令，不要记忆菜单编号）\n' "$UI_YELLOW" "$UI_RESET"
+          printf '    %s[18]%s 彻底卸载                    %s[19]%s 重建当前版本组件（不联网）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+          printf '    %s[20]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
+          printf '    %s[21]%s 出口引用全面修复（自动映射或安全清理）\n' "$UI_GREEN" "$UI_RESET"
+          printf '    固定更新命令：%ssbout update-github && sbout upgrade%s（跨版本请使用命令，不要记忆菜单编号）\n' "$UI_YELLOW" "$UI_RESET"
         printf '\n'
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$UI_GREEN" "$UI_RESET"
         ui_line
-        read -r -p "请输入选项 [0-20]: " choice
+          read -r -p "请输入选项 [0-21]: " choice
         case "$choice" in
             1) interactive_install_host ;;
             2) interactive_status ;;
@@ -14250,9 +14708,10 @@ interactive_menu() {
             16) update_from_github; exec "$INSTALL_BIN" menu ;;
             17) interactive_restore ;;
             18) interactive_uninstall ;;
-            19) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
-            20) interactive_proxy_optimization_menu ;;
-            0) info "退出。"; exit 0 ;;
+              19) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
+              20) interactive_proxy_optimization_menu ;;
+              21) repair_exit_references; pause_screen ;;
+              0) info "退出。"; exit 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
     done
@@ -15087,6 +15546,9 @@ case "$command_name" in
         ;;
     replace-exit|replace|exit-replace|migrate-exit)
         replace_exit "$@"
+        ;;
+    repair-exit-references|repair-exits|repair-references)
+        repair_exit_references "$@"
         ;;
     mark-split-exit|mark-split-only|split-exit-mark)
         need_root
