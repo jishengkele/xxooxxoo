@@ -4944,14 +4944,32 @@ add_ss_exit_values() {
     need_cmd python3
     need_cmd systemctl
     need_cmd ip
-    state_lock_acquire
-    local display="$1" method="$2" password="$3" server="$4" port="$5" name="${6:-}" idx mark table tun
+    local display="$1" method="$2" password="$3" server="$4" port="$5" name="${6:-}" idx mark table tun existing
     display="$(normalize_display_name "$display")"
     server="$(normalize_proxy_host "$server")"
     valid_proxy_host "$server" || die "SS 地址无效，请填写纯 IP 或域名/DDNS，不要带协议、端口或路径: $server"
     [ -n "$method" ] || die "SS 加密方式不能为空。"
     [ -n "$password" ] || die "SS 密码不能为空。"
     validate_port "$port" || die "SS 端口无效: $port"
+    existing="$(exit_name_by_display "$display")"
+    if [ -n "$existing" ]; then
+        if replace_exit_duplicate_action "$existing" "$display"; then
+            case "$REPLACE_EXIT_DUPLICATE_ACTION" in
+                reuse)
+                    replace_proxy_exit_in_place "$REPLACE_EXIT_CONTEXT_OLD" "shadowsocks" "$display" "$server" "$port" "$method" "$password" ""
+                    REPLACE_EXIT_COMPLETED="true"
+                    return 0
+                    ;;
+                new)
+                    display="$(replace_exit_prompt_new_display "$display")"
+                    name=""
+                    ;;
+            esac
+        else
+            die "出口显示名已存在: $display"
+        fi
+    fi
+    state_lock_acquire
     name="${name:-$(safe_exit_id "ss" "$display" "$server" "$port")}"
     valid_name "$name" || die "出口内部名称无效: $name"
     exit_exists "$name" && die "出口已存在: $name"
@@ -4996,8 +5014,7 @@ add_sk5_exit() {
     need_cmd python3
     need_cmd systemctl
     need_cmd ip
-    state_lock_acquire
-    local first="${1:-}" display server port username password idx mark table tun parsed name
+    local first="${1:-}" display server port username password idx mark table tun parsed name existing
     [ -n "$first" ] || die "用法: $0 add-sk5 socks5://[用户:密码@]地址:端口#名称 或 $0 add-sk5 出口名 地址 端口 [用户名] [密码]"
     if [[ "$first" == *"://"* ]]; then
         parsed=$(parse_socks_link "$first") || die "SK5 链接解析失败。"
@@ -5013,6 +5030,25 @@ add_sk5_exit() {
     server="$(normalize_proxy_host "$server")"
     valid_proxy_host "$server" || die "SK5 地址无效，请填写纯 IP 或域名/DDNS，不要带协议、端口或路径: $server"
     validate_port "$port" || die "SK5 端口无效: $port"
+    existing="$(exit_name_by_display "$display")"
+    if [ -n "$existing" ]; then
+        if replace_exit_duplicate_action "$existing" "$display"; then
+            case "$REPLACE_EXIT_DUPLICATE_ACTION" in
+                reuse)
+                    replace_proxy_exit_in_place "$REPLACE_EXIT_CONTEXT_OLD" "socks" "$display" "$server" "$port" "" "$password" "$username"
+                    REPLACE_EXIT_COMPLETED="true"
+                    return 0
+                    ;;
+                new)
+                    display="$(replace_exit_prompt_new_display "$display")"
+                    name=""
+                    ;;
+            esac
+        else
+            die "出口显示名已存在: $display"
+        fi
+    fi
+    state_lock_acquire
     name="$(safe_exit_id "sk5" "$display" "$server" "$port")"
     valid_name "$name" || die "出口内部名称无效: $name"
     exit_exists "$name" && die "出口已存在: $name"
@@ -5033,8 +5069,7 @@ add_vless_exit_values() {
     need_cmd python3
     need_cmd systemctl
     need_cmd ip
-    state_lock_acquire
-    local display="$1" server="$2" port="$3" uuid="$4" name="${5:-}" idx mark table tun normalized_uuid
+    local display="$1" server="$2" port="$3" uuid="$4" name="${5:-}" idx mark table tun normalized_uuid existing
     display="$(normalize_display_name "$display")"
     server="$(normalize_proxy_host "$server")"
     valid_proxy_host "$server" || die "VLESS 地址无效，请填写纯 IP 或域名/DDNS，不要带协议、端口或路径: $server"
@@ -5047,6 +5082,25 @@ except (ValueError, AttributeError):
     raise SystemExit(1)
 PY
 )" || die "VLESS 用户 ID 不是有效 UUID。"
+    existing="$(exit_name_by_display "$display")"
+    if [ -n "$existing" ]; then
+        if replace_exit_duplicate_action "$existing" "$display"; then
+            case "$REPLACE_EXIT_DUPLICATE_ACTION" in
+                reuse)
+                    replace_proxy_exit_in_place "$REPLACE_EXIT_CONTEXT_OLD" "vless" "$display" "$server" "$port" "$normalized_uuid" "" ""
+                    REPLACE_EXIT_COMPLETED="true"
+                    return 0
+                    ;;
+                new)
+                    display="$(replace_exit_prompt_new_display "$display")"
+                    name=""
+                    ;;
+            esac
+        else
+            die "出口显示名已存在: $display"
+        fi
+    fi
+    state_lock_acquire
     name="${name:-$(safe_exit_id "vless" "$display" "$server" "$port")}"
     valid_name "$name" || die "出口内部名称无效: $name"
     exit_exists "$name" && die "出口已存在: $name"
@@ -6350,6 +6404,9 @@ remove_exit() {
 
 # ---------- 出口替换：把旧出口上的实例与分流规则引用整体迁移到新出口 ----------
 REPLACE_BACKUP_DIR=""
+REPLACE_EXIT_CONTEXT_OLD=""
+REPLACE_EXIT_DUPLICATE_ACTION=""
+REPLACE_EXIT_COMPLETED="false"
 
 replace_exit_backup() {
     local ts dir f
@@ -6387,6 +6444,136 @@ replace_exit_restore() {
             install -m 0600 "$REPLACE_BACKUP_DIR/$base" "$f" || return 1
         fi
     done
+}
+
+replace_exit_duplicate_action() {
+    local existing="$1" display="$2" choice
+    [ -n "${REPLACE_EXIT_CONTEXT_OLD:-}" ] || return 1
+    [ "$existing" = "$REPLACE_EXIT_CONTEXT_OLD" ] || return 1
+
+    printf '\n出口显示名“%s”与当前要替换的出口相同。请选择处理方式:\n' "$display"
+    printf '  1. 沿用当前出口名称，仅替换节点链接（保留实例、分流和授权引用）\n'
+    printf '  2. 全新替换，使用新的出口名称并继续现有迁移流程\n'
+    while true; do
+        read -r -p "请输入选项 [1-2]: " choice || return 1
+        case "$choice" in
+            1)
+                REPLACE_EXIT_DUPLICATE_ACTION="reuse"
+                return 0
+                ;;
+            2)
+                REPLACE_EXIT_DUPLICATE_ACTION="new"
+                return 0
+                ;;
+            *) warn "无效选项，请输入 1 或 2。" ;;
+        esac
+    done
+}
+
+replace_exit_prompt_new_display() {
+    local original="$1" suggested candidate
+    suggested="${original}-new"
+    while true; do
+        candidate="$(prompt_default "全新替换的新出口名称（不能重复）" "$suggested")"
+        candidate="$(normalize_display_name "$candidate")"
+        if [ -z "$(exit_name_by_display "$candidate")" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        warn "出口显示名已存在: $candidate，请重新输入。"
+    done
+}
+
+replace_proxy_exit_runtime_backup() {
+    local name="$1" dir service
+    [ -n "$REPLACE_BACKUP_DIR" ] || return 1
+    dir="$REPLACE_BACKUP_DIR/runtime"
+    service="${EXIT_SERVICE_PREFIX}-${name}.service"
+    mkdir -p "$dir" || return 1
+    if [ -d "$EXIT_DIR/$name" ]; then
+        cp -a "$EXIT_DIR/$name" "$dir/exit" || return 1
+    fi
+    if [ -f "$SYSTEMD_DIR/$service" ]; then
+        cp -a "$SYSTEMD_DIR/$service" "$dir/service" || return 1
+    fi
+}
+
+replace_proxy_exit_runtime_restore() {
+    local name="$1" dir service
+    [ -n "$REPLACE_BACKUP_DIR" ] || return 1
+    dir="$REPLACE_BACKUP_DIR/runtime"
+    service="${EXIT_SERVICE_PREFIX}-${name}.service"
+    stop_and_remove_exit_service "$name"
+    rm -rf -- "${EXIT_DIR:?}/$name"
+    if [ -d "$dir/exit" ]; then
+        mkdir -p "$EXIT_DIR" || return 1
+        cp -a "$dir/exit" "$EXIT_DIR/$name" || return 1
+    fi
+    if [ -f "$dir/service" ]; then
+        mkdir -p "$SYSTEMD_DIR" || return 1
+        cp -a "$dir/service" "$SYSTEMD_DIR/$service" || return 1
+        systemctl daemon-reload || return 1
+        systemctl enable "$service" >/dev/null 2>&1 || return 1
+        systemctl start "$service" || return 1
+    fi
+}
+
+replace_proxy_exit_in_place_rollback() {
+    local name="$1"
+    replace_proxy_exit_runtime_restore "$name" || warn "旧出口 $name 的运行时配置恢复失败，请检查备份目录: $REPLACE_BACKUP_DIR"
+    replace_exit_restore || warn "出口替换状态文件恢复失败，请检查备份目录: $REPLACE_BACKUP_DIR"
+    do_apply || warn "回滚后的 apply 仍失败，请手动检查。"
+}
+
+replace_proxy_exit_in_place() {
+    local name="$1" protocol="$2" display="$3" server="$4" port="$5" method="${6:-}" password="${7:-}" username="${8:-}"
+    local row mark table route4 route6 tun service
+    need_root
+    load_config
+    write_default_config
+    row="$(exit_row "$name")"
+    [ -n "$row" ] || die "未找到当前出口: $name"
+    IFS=$'\t' read -r _name mark table route4 route6 _old_display <<< "$row"
+    is_proxy_exit "$name" || die "当前出口 '$display' 不是脚本托管的节点出口，无法沿用名称替换链接；请选择全新替换。"
+    tun="$(proxy_exit_interface "$name")" || die "无法确定当前出口 '$display' 的 TUN 接口，已中止替换。"
+    service="${EXIT_SERVICE_PREFIX}-${name}.service"
+
+    replace_exit_backup || die "出口节点替换前备份失败，已中止。"
+    replace_proxy_exit_runtime_backup "$name" || die "出口运行时配置备份失败，已中止。"
+    stop_and_remove_exit_service "$name"
+    rm -rf -- "${EXIT_DIR:?}/$name"
+
+    case "$protocol" in
+        shadowsocks)
+            write_ss_exit_files "$name" "$method" "$password" "$server" "$port" "$table" "$tun" || { replace_proxy_exit_in_place_rollback "$name"; die "SS 节点配置写入失败，已回滚。"; }
+            ;;
+        socks)
+            write_sk5_exit_files "$name" "$server" "$port" "$username" "$password" "$table" "$tun" || { replace_proxy_exit_in_place_rollback "$name"; die "SK5 节点配置写入失败，已回滚。"; }
+            ;;
+        vless)
+            write_vless_exit_files "$name" "$server" "$port" "$method" "$table" "$tun" || { replace_proxy_exit_in_place_rollback "$name"; die "VLESS 节点配置写入失败，已回滚。"; }
+            ;;
+        *)
+            replace_proxy_exit_in_place_rollback "$name"
+            die "不支持沿用名称替换的出口协议: $protocol"
+            ;;
+    esac
+
+    mark_nft_pending
+    if ! systemctl daemon-reload || ! systemctl enable "$service" >/dev/null || ! systemctl start "$service"; then
+        replace_proxy_exit_in_place_rollback "$name"
+        die "出口 '$display' 的新节点服务启动失败，已回滚。"
+    fi
+    if ! wait_for_iface "$tun"; then
+        replace_proxy_exit_in_place_rollback "$name"
+        die "出口 '$display' 的 TUN 设备 $tun 未启动，已回滚。"
+    fi
+    if ! do_apply; then
+        replace_proxy_exit_in_place_rollback "$name"
+        die "出口 '$display' 的新节点路由应用失败，已回滚。"
+    fi
+    sync_now || true
+    info "已沿用出口名称 '$display'，仅替换节点链接；实例、分流规则和授权引用保持不变。"
 }
 
 migrate_containers_for_replaced_exit() {
@@ -13521,7 +13708,17 @@ interactive_replace_exit() {
     old="$(cat "$choice_file")"
     rm -f "$choice_file"
     printf '\n现在添加替换用的新出口。\n'
+    REPLACE_EXIT_CONTEXT_OLD="$old"
+    REPLACE_EXIT_DUPLICATE_ACTION=""
+    REPLACE_EXIT_COMPLETED="false"
     interactive_add_proxy_exit
+    REPLACE_EXIT_CONTEXT_OLD=""
+    REPLACE_EXIT_DUPLICATE_ACTION=""
+    if [ "$REPLACE_EXIT_COMPLETED" = "true" ]; then
+        REPLACE_EXIT_COMPLETED="false"
+        return 0
+    fi
+    REPLACE_EXIT_COMPLETED="false"
     new="$(prompt_exit_name "请输入刚才添加的新出口名称（显示名或内部 ID）")"
     if ! exit_exists "$new"; then
         new="$(exit_name_by_display "$new")"
