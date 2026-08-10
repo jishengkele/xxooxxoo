@@ -10074,6 +10074,10 @@ class Handler(BaseHTTPRequestHandler):
                 nft_clear(container["ip"], previous)
             else:
                 nft_update(container["ip"], exits[target]["mark"], previous)
+            # 当前出口变化后全量重建 nft：按当前出口强制（force-on-exit /
+            # force-category-on-exit）的分流规则只覆盖 current == 来源出口的
+            # 容器，切换后必须重建，否则新增的容器不会补上、切走的不会移除。
+            apply_nft_fallback()
             clear_pending_generation(generation)
             clear_conntrack(container["ip"])
         except Exception as exc:
@@ -13300,6 +13304,7 @@ split_target_candidate_rows() {
     local scope="${1:-all}" name display
     read_exit_rows | while IFS=$'\t' read -r name _mark _table _r4 _r6 display; do
         [ -n "$name" ] || continue
+        [ "$name" = "-" ] && continue
         case "$scope" in
             split-only)
                 if is_split_only_exit "$name"; then
@@ -14781,7 +14786,7 @@ interactive_menu() {
             13) interactive_switch_all_running_containers ;;
             14) interactive_split_menu ;;
             15) interactive_entry_direct_menu ;;
-            16) update_from_github; exec "$INSTALL_BIN" menu ;;
+            16) update_from_github; "$INSTALL_BIN" upgrade; exec "$INSTALL_BIN" menu ;;
             17) interactive_restore ;;
             18) interactive_uninstall ;;
               19) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
