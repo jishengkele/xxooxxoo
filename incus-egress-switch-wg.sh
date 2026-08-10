@@ -3192,6 +3192,8 @@ build_nft_file() {
     local dns_sidecar_rules="" dns_sidecar_chain=""
     local split_sets="" split_rules="" force_split_rules="" conditional_force_rules="" container_split_rules="" proxy_direct_rules="" bridge_expr app target policy_targets safe v4file v6file domains_file v4elems v6elems v4elements_line v6elements_line split_mark
     local container cip source category display app_category remote enabled
+    local force_sources="" force_src_sets="" src_safe line4 line6
+    declare -A force4_src=() force6_src=()
     local tunnel_mss_rules="" tunnel_mss_seen=$'\n' exit_name exit_route4 exit_route6 exit_route exit_dev exit_conf tunnel_mtu tunnel_mtu_default tunnel_mss _exit_mark _exit_table _exit_display
     bridge_expr="$(bridge_set_expr)"
     dns_sidecar_rules="$(build_split_dns_sidecar_redirect_rules)"
@@ -3258,6 +3260,10 @@ $dns_sidecar_rules
             comma=""
             [ -n "$keys4" ] && comma=", "
             keys4="${keys4}${comma}${ip}"
+            # 按当前出口强制分流的容器按来源出口分组，规则用集合引用而非逐容器展开。
+            comma=""
+            [ -n "${force4_src[$current]:-}" ] && comma=", "
+            force4_src[$current]="${force4_src[$current]:-}${comma}${ip}"
         else
             comma=""
             [ -n "$managed6" ] && comma=", "
@@ -3276,6 +3282,10 @@ $dns_sidecar_rules
             comma=""
             [ -n "$keys6" ] && comma=", "
             keys6="${keys6}${comma}${ip}"
+            # 按当前出口强制分流的容器按来源出口分组，规则用集合引用而非逐容器展开。
+            comma=""
+            [ -n "${force6_src[$current]:-}" ] && comma=", "
+            force6_src[$current]="${force6_src[$current]:-}${comma}${ip}"
         fi
     done < <(read_container_rows)
 
@@ -3319,6 +3329,35 @@ $v6elements_line
         fi
     done < <(read_enabled_split_app_ids)
 
+    # 按当前出口强制的容器按来源出口分组为 force{4,6}_src_* 集合。
+    # 规则只引用集合（每应用一条），容器切换出口时增量增删集合元素即可，
+    # 不再需要全量重建 nft 表；集合语义与逐容器展开完全等价。
+    while IFS=$'\t' read -r _app source _target; do
+        case " $force_sources " in
+            *" $source "*) ;;
+            *) force_sources="$force_sources $source" ;;
+        esac
+    done < <(read_force_on_exit_policies; read_force_category_on_exit_policies)
+    for source in $force_sources; do
+        split_nft_name_into src_safe "$source"
+        [ -n "$src_safe" ] || continue
+        line4=""
+        line6=""
+        [ -n "${force4_src[$source]:-}" ] && line4="    elements = { ${force4_src[$source]} }"
+        [ -n "${force6_src[$source]:-}" ] && line6="    elements = { ${force6_src[$source]} }"
+        force_src_sets="$force_src_sets
+  set force4_src_$src_safe {
+    type ipv4_addr
+$line4
+  }
+
+  set force6_src_$src_safe {
+    type ipv6_addr
+$line6
+  }
+"
+    done
+
     if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
         while IFS=$'\t' read -r app target; do
             split_app_is_forced "$app" || continue
@@ -3357,11 +3396,13 @@ $v6elements_line
 
         # 条件强制只对当前使用指定来源出口的容器生效。单应用规则
         # 优先于同来源出口的分类规则；现有全局强制仍位于最前面。
+        # 容器按来源出口分组为 force{4,6}_src_* 集合，规则每应用一条。
         while IFS=$'\t' read -r app source target; do
             split_app_is_forced "$app" && continue
             target="$(split_target_list_default "$target")"
             split_nft_name_into safe "$app"
             [ -n "$safe" ] || continue
+            split_nft_name_into src_safe "$source"
             if [ "$target" != "-" ]; then
                 split_mark="$(exit_mark "$target")"
                 [ -n "$split_mark" ] || continue
@@ -3371,30 +3412,29 @@ $v6elements_line
             v4file="$(split_resolved_v4_file "$app")"
             v6file="$(split_resolved_v6_file "$app")"
             domains_file="$SPLIT_RESOLVED_DIR/$app.domains"
-            while IFS=$'\t' read -r container cip _token _allowed current; do
-                [ "$current" = "$source" ] || continue
-                if is_ipv4 "$cip" && { [ -s "$v4file" ] || [ -s "$domains_file" ]; }; then
-                    if [ "$target" = "-" ]; then
-                        conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip saddr $cip ip daddr @split4_$safe return
+            if [ -s "$v4file" ] || [ -s "$domains_file" ]; then
+                if [ "$target" = "-" ]; then
+                    conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip saddr @force4_src_$src_safe ip daddr @split4_$safe return
 "
-                    else
-                        conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip saddr $cip ip daddr @split4_$safe meta mark set $split_mark return
+                else
+                    conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip saddr @force4_src_$src_safe ip daddr @split4_$safe meta mark set $split_mark return
 "
-                    fi
-                elif is_ipv6 "$cip" && { [ -s "$v6file" ] || [ -s "$domains_file" ]; }; then
-                    if [ "$target" = "-" ]; then
-                        conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip6 saddr $cip ip6 daddr @split6_$safe return
-"
-                    else
-                        conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip6 saddr $cip ip6 daddr @split6_$safe meta mark set $split_mark return
-"
-                    fi
                 fi
-            done < <(read_container_rows)
+            fi
+            if [ -s "$v6file" ] || [ -s "$domains_file" ]; then
+                if [ "$target" = "-" ]; then
+                    conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip6 saddr @force6_src_$src_safe ip6 daddr @split6_$safe return
+"
+                else
+                    conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip6 saddr @force6_src_$src_safe ip6 daddr @split6_$safe meta mark set $split_mark return
+"
+                fi
+            fi
         done < <(read_force_on_exit_policies)
 
         while IFS=$'\t' read -r category source target; do
             target="$(split_target_list_default "$target")"
+            split_nft_name_into src_safe "$source"
             while IFS=$'\t' read -r app display app_category remote enabled; do
                 [ "$app_category" = "$category" ] || continue
                 split_app_is_forced "$app" && continue
@@ -3410,26 +3450,24 @@ $v6elements_line
                 v4file="$(split_resolved_v4_file "$app")"
                 v6file="$(split_resolved_v6_file "$app")"
                 domains_file="$SPLIT_RESOLVED_DIR/$app.domains"
-                while IFS=$'\t' read -r container cip _token _allowed current; do
-                    [ "$current" = "$source" ] || continue
-                    if is_ipv4 "$cip" && { [ -s "$v4file" ] || [ -s "$domains_file" ]; }; then
-                        if [ "$target" = "-" ]; then
-                            conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip saddr $cip ip daddr @split4_$safe return
+                if [ -s "$v4file" ] || [ -s "$domains_file" ]; then
+                    if [ "$target" = "-" ]; then
+                        conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip saddr @force4_src_$src_safe ip daddr @split4_$safe return
 "
-                        else
-                            conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip saddr $cip ip daddr @split4_$safe meta mark set $split_mark return
+                    else
+                        conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip saddr @force4_src_$src_safe ip daddr @split4_$safe meta mark set $split_mark return
 "
-                        fi
-                    elif is_ipv6 "$cip" && { [ -s "$v6file" ] || [ -s "$domains_file" ]; }; then
-                        if [ "$target" = "-" ]; then
-                            conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip6 saddr $cip ip6 daddr @split6_$safe return
-"
-                        else
-                            conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip6 saddr $cip ip6 daddr @split6_$safe meta mark set $split_mark return
-"
-                        fi
                     fi
-                done < <(read_container_rows)
+                fi
+                if [ -s "$v6file" ] || [ -s "$domains_file" ]; then
+                    if [ "$target" = "-" ]; then
+                        conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip6 saddr @force6_src_$src_safe ip6 daddr @split6_$safe return
+"
+                    else
+                        conditional_force_rules="$conditional_force_rules    iifname { $bridge_expr } ip6 saddr @force6_src_$src_safe ip6 daddr @split6_$safe meta mark set $split_mark return
+"
+                    fi
+                fi
             done < <(read_split_apps)
         done < <(read_force_category_on_exit_policies)
 
@@ -3566,7 +3604,7 @@ $elems4_line
     type ipv6_addr : mark
 $elems6_line
   }
-$split_sets
+$force_src_sets$split_sets
 $dns_sidecar_chain
 
   chain prerouting {
@@ -9383,9 +9421,11 @@ write_controller() {
     cat > "$tmp" <<'PY'
 #!/usr/bin/env python3
 import fcntl
+import hashlib
 import ipaddress
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -9917,6 +9957,50 @@ def nft_clear(container_ip, previous):
         apply_nft_fallback()
 
 
+def nft_safe_name(name):
+    # 与脚本侧 split_nft_name_into 保持一致：小写、- 转 _、非法字符转 _、
+    # 去首尾 _、截断 39 字符、追加 sha256 前 8 位，保证 nft 集合名完全一致。
+    clean = name.lower()
+    clean = clean.replace("-", "_")
+    clean = re.sub(r"[^a-z0-9_]", "_", clean)
+    clean = clean.lstrip("_")
+    clean = clean.rstrip("_")
+    clean = clean[:39]
+    if not clean:
+        clean = "set"
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    return "%s_%s" % (clean, digest)
+
+
+def load_force_exit_sources():
+    sources = set()
+    sources.update(source for (_app, source) in load_force_on_exit_policies())
+    sources.update(source for (_category, source) in load_force_category_on_exit_policies())
+    return sources
+
+
+def nft_force_source_transition(container_ip, previous, target):
+    # 按当前出口强制的容器按来源出口分组在 force{4,6}_src_* 集合里。
+    # 切换出口只做增量 add/delete 集合元素，避免全量重建 nft 表；
+    # 任何失败回退 apply_nft_fallback() 全量重建保证规则与状态一致。
+    try:
+        ip = ipaddress.ip_address(normalize_ip(container_ip))
+    except ValueError:
+        apply_nft_fallback()
+        return
+    family = "4" if ip.version == 4 else "6"
+    sources = load_force_exit_sources()
+    lines = []
+    if previous != DIRECT_EXIT and previous in sources:
+        lines.append("delete element inet %s force%s_src_%s { %s }" % (NFT_TABLE, family, nft_safe_name(previous), str(ip)))
+    if target != DIRECT_EXIT and target in sources:
+        lines.append("add element inet %s force%s_src_%s { %s }" % (NFT_TABLE, family, nft_safe_name(target), str(ip)))
+    if not lines:
+        return
+    if not run_nft_transition(lines):
+        apply_nft_fallback()
+
+
 def clear_conntrack(container_ip):
     if not SWITCH_CLEAR_CONNTRACK or not CONNTRACK_BIN:
         return
@@ -10074,10 +10158,10 @@ class Handler(BaseHTTPRequestHandler):
                 nft_clear(container["ip"], previous)
             else:
                 nft_update(container["ip"], exits[target]["mark"], previous)
-            # 当前出口变化后全量重建 nft：按当前出口强制（force-on-exit /
-            # force-category-on-exit）的分流规则只覆盖 current == 来源出口的
-            # 容器，切换后必须重建，否则新增的容器不会补上、切走的不会移除。
-            apply_nft_fallback()
+            # 按当前出口强制（force-on-exit / force-category-on-exit）的分流规则
+            # 覆盖 current == 来源出口的容器，容器按来源出口分组在 force{4,6}_src_*
+            # 集合里；切换后增量增删集合元素即可，失败时内部回退全量重建。
+            nft_force_source_transition(container["ip"], previous, target)
             clear_pending_generation(generation)
             clear_conntrack(container["ip"])
         except Exception as exc:
