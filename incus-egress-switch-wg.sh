@@ -6770,6 +6770,12 @@ replace_exit() {
     valid_name "$old" || die "旧出口内部名称无效: $old"
     valid_name "$new" || die "新出口内部名称无效: $new"
     exit_exists "$new" || die "未找到新出口: $new_ref"
+    if is_split_only_exit "$old" && ! is_split_only_exit "$new"; then
+        die "旧出口 '$(display_exit_name "$old")' 是分流专用出口，新出口也必须是分流专用出口。"
+    fi
+    if ! is_split_only_exit "$old" && is_split_only_exit "$new"; then
+        die "新出口 '$(display_exit_name "$new")' 是分流专用出口，不能作为实例出口替换目标；请先更换实例出口或选择普通出口。"
+    fi
     if [ -f "$CONTAINERS_FILE" ]; then
         count="$(awk -F '\t' -v o="$old" 'NF && $1 !~ /^#/ && $5 == o {n++} END {print n+0}' "$CONTAINERS_FILE")"
     fi
@@ -8699,8 +8705,8 @@ split_force_on_exit_policy() {
     [ -n "$apps_input" ] && [ -n "$sources_input" ] && [ -n "$targets_input" ] || die "用法: $0 split-force-on-exit 应用ID列表 来源出口列表 目标出口列表"
     IFS=',' read -r -a apps <<< "$apps_input"; IFS=',' read -r -a sources <<< "$sources_input"; IFS=',' read -r -a targets <<< "$targets_input"
     for app in "${apps[@]}"; do app="$(trim_space "$app")"; split_app_exists "$app" || die "未知应用: $app"; split_prepare_app_rules "$app"; done
-    for item in "${sources[@]}"; do item="$(trim_space "$item")"; source="$(resolve_exit_target "$item")" || die "未知来源出口: $item"; comma=""; [ -n "$resolved_sources" ] && comma=","; case ",$resolved_sources," in *,"$source",*) ;; *) resolved_sources="$resolved_sources$comma$source" ;; esac; done
-    for item in "${targets[@]}"; do item="$(trim_space "$item")"; target="$(resolve_exit_target "$item")" || die "未知目标出口: $item"; comma=""; [ -n "$resolved_targets" ] && comma=","; case ",$resolved_targets," in *,"$target",*) ;; *) resolved_targets="$resolved_targets$comma$target" ;; esac; done
+    for item in "${sources[@]}"; do item="$(trim_space "$item")"; source="$(resolve_exit_target "$item")" || die "未知来源出口: $item"; is_split_only_exit "$source" && die "来源出口 '$(display_exit_name "$source")' 是分流专用出口，只能作为强制分流目标，不能作为实例出口来源。"; comma=""; [ -n "$resolved_sources" ] && comma=","; case ",$resolved_sources," in *,"$source",*) ;; *) resolved_sources="$resolved_sources$comma$source" ;; esac; done
+    for item in "${targets[@]}"; do item="$(trim_space "$item")"; target="$(resolve_exit_target "$item")" || die "未知目标出口: $item"; require_split_only_targets "$target"; comma=""; [ -n "$resolved_targets" ] && comma=","; case ",$resolved_targets," in *,"$target",*) ;; *) resolved_targets="$resolved_targets$comma$target" ;; esac; done
     state_lock_acquire
     mark_nft_pending
     IFS=',' read -r -a sources <<< "$resolved_sources"
@@ -8720,8 +8726,8 @@ split_force_category_on_exit_policy() {
     [ -n "$categories_input" ] && [ -n "$sources_input" ] && [ -n "$targets_input" ] || die "用法: $0 split-force-category-on-exit 分类列表 来源出口列表 目标出口列表"
     IFS=',' read -r -a categories <<< "$categories_input"; IFS=',' read -r -a sources <<< "$sources_input"; IFS=',' read -r -a targets <<< "$targets_input"
     for category in "${categories[@]}"; do category="$(trim_space "$category")"; split_category_exists "$category" || die "未找到分类: $category"; done
-    for item in "${sources[@]}"; do item="$(trim_space "$item")"; source="$(resolve_exit_target "$item")" || die "未知来源出口: $item"; comma=""; [ -n "$resolved_sources" ] && comma=","; case ",$resolved_sources," in *,"$source",*) ;; *) resolved_sources="$resolved_sources$comma$source" ;; esac; done
-    for item in "${targets[@]}"; do item="$(trim_space "$item")"; target="$(resolve_exit_target "$item")" || die "未知目标出口: $item"; comma=""; [ -n "$resolved_targets" ] && comma=","; case ",$resolved_targets," in *,"$target",*) ;; *) resolved_targets="$resolved_targets$comma$target" ;; esac; done
+    for item in "${sources[@]}"; do item="$(trim_space "$item")"; source="$(resolve_exit_target "$item")" || die "未知来源出口: $item"; is_split_only_exit "$source" && die "来源出口 '$(display_exit_name "$source")' 是分流专用出口，只能作为强制分流目标，不能作为实例出口来源。"; comma=""; [ -n "$resolved_sources" ] && comma=","; case ",$resolved_sources," in *,"$source",*) ;; *) resolved_sources="$resolved_sources$comma$source" ;; esac; done
+    for item in "${targets[@]}"; do item="$(trim_space "$item")"; target="$(resolve_exit_target "$item")" || die "未知目标出口: $item"; require_split_only_targets "$target"; comma=""; [ -n "$resolved_targets" ] && comma=","; case ",$resolved_targets," in *,"$target",*) ;; *) resolved_targets="$resolved_targets$comma$target" ;; esac; done
     while IFS=$'\t' read -r app display app_category remote enabled; do
         case ",$categories_input," in *,"$app_category",*) ;; *) continue ;; esac
         split_prepare_app_rules "$app" || true
@@ -8748,7 +8754,7 @@ split_force_on_exit_clear_policy() {
     for app in "${apps[@]}"; do app="$(trim_space "$app")"; split_app_exists "$app" || die "未知应用: $app"; done
     state_lock_acquire
     mark_nft_pending
-    for app in "${apps[@]}"; do app="$(trim_space "$app")"; for item in "${sources[@]}"; do item="$(trim_space "$item")"; source="$(resolve_exit_target "$item")" || die "未知来源出口: $item"; force_on_exit_clear_value "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" "$app" "$source" && removed="true" || true; done; done
+    for app in "${apps[@]}"; do app="$(trim_space "$app")"; for item in "${sources[@]}"; do item="$(trim_space "$item")"; source="$(resolve_exit_target "$item")" || die "未知来源出口: $item"; is_split_only_exit "$source" && die "来源出口 '$(display_exit_name "$source")' 是分流专用出口，不能作为实例出口来源。"; force_on_exit_clear_value "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" "$app" "$source" && removed="true" || true; done; done
     do_apply_nftables
     state_lock_release
     [ "$removed" = "true" ] && info "已批量取消对应的按出口强制应用分流。" || info "未找到对应的按出口强制应用分流。"
@@ -8766,7 +8772,7 @@ split_force_category_on_exit_clear_policy() {
     for category in "${categories[@]}"; do category="$(trim_space "$category")"; split_category_exists "$category" || die "未找到分类: $category"; done
     state_lock_acquire
     mark_nft_pending
-    for category in "${categories[@]}"; do category="$(trim_space "$category")"; for item in "${sources[@]}"; do item="$(trim_space "$item")"; source="$(resolve_exit_target "$item")" || die "未知来源出口: $item"; force_on_exit_clear_value "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" "$category" "$source" && removed="true" || true; done; done
+    for category in "${categories[@]}"; do category="$(trim_space "$category")"; for item in "${sources[@]}"; do item="$(trim_space "$item")"; source="$(resolve_exit_target "$item")" || die "未知来源出口: $item"; is_split_only_exit "$source" && die "来源出口 '$(display_exit_name "$source")' 是分流专用出口，不能作为实例出口来源。"; force_on_exit_clear_value "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" "$category" "$source" && removed="true" || true; done; done
     do_apply_nftables
     state_lock_release
     [ "$removed" = "true" ] && info "已批量取消对应的按出口强制分类分流。" || info "未找到对应的按出口强制分类分流。"
@@ -13300,6 +13306,10 @@ split_target_candidate_rows() {
                     printf '%s\t%s\n' "$name" "${display:-$name}"
                 fi
                 ;;
+            normal)
+                is_split_only_exit "$name" && continue
+                printf '%s\t%s\n' "$name" "${display:-$name}"
+                ;;
             *)
                 printf '%s\t%s\n' "$name" "${display:-$name}"
                 ;;
@@ -13322,14 +13332,19 @@ choose_split_target() {
     [ -n "$out_file" ] || return 1
     tmp="$(mktemp)"
     split_target_candidate_rows "$scope" > "$tmp"
-    if [ "$scope" = "split-only" ] && [ ! -s "$tmp" ]; then
+    if [ ! -s "$tmp" ] && { [ "$scope" = "split-only" ] || [ "$scope" = "normal" ]; }; then
         rm -f "$tmp"
-        warn "暂无分流专用出口，请先在分流管理选择 18 添加。"
+        case "$scope" in
+            split-only) warn "暂无分流专用出口，请先在分流管理选择 18 添加。" ;;
+            normal) warn "暂无普通出口（当前出口均为分流专用出口），请先通过 [3] 添加出口。" ;;
+        esac
         return 1
     fi
     printf '\n请选择%s:\n' "$prompt_label"
     if [ "$scope" = "split-only" ]; then
         printf '  （仅列出分流专用出口；普通应用/分类分流只能使用分流专用出口）\n'
+    elif [ "$scope" = "normal" ]; then
+        printf '  （仅列出实例出口；分流专用出口不会出现在本列表）\n'
     fi
     printf '  0. 返回上一步\n'
     printf '  1. 入口机直出\n'
@@ -13345,10 +13360,17 @@ choose_split_target() {
         1) target="-" ;;
         *[!0-9]*)
             target="$(resolve_exit_target "$pick" || true)"
-            if [ -n "$target" ] && [ "$target" != "-" ] && [ "$scope" = "split-only" ] && ! is_split_only_exit "$target"; then
-                rm -f "$tmp"
-                warn "出口 '$(display_exit_name "$target")' 不是分流专用出口，普通分流只能选择分流专用出口。"
-                return 1
+            if [ -n "$target" ] && [ "$target" != "-" ]; then
+                if [ "$scope" = "split-only" ] && ! is_split_only_exit "$target"; then
+                    rm -f "$tmp"
+                    warn "出口 '$(display_exit_name "$target")' 不是分流专用出口，普通分流只能选择分流专用出口。"
+                    return 1
+                fi
+                if [ "$scope" = "normal" ] && is_split_only_exit "$target"; then
+                    rm -f "$tmp"
+                    warn "出口 '$(display_exit_name "$target")' 是分流专用出口，不能作为实例出口。"
+                    return 1
+                fi
             fi
             ;;
         *) target="$(sed -n "$((pick - 1))p" "$tmp" | awk -F '\t' '{print $1}')" ;;
@@ -13367,14 +13389,19 @@ choose_split_targets() {
         printf -- '-\t入口机直出\n'
         split_target_candidate_rows "$scope"
     } > "$tmp"
-    if [ "$scope" = "split-only" ] && [ "$(awk 'NR > 1' "$tmp" | wc -l)" -eq 0 ]; then
+    if { [ "$scope" = "split-only" ] || [ "$scope" = "normal" ]; } && [ "$(awk 'NR > 1' "$tmp" | wc -l)" -eq 0 ]; then
         rm -f "$tmp"
-        warn "暂无分流专用出口，请先在分流管理选择 18 添加。"
+        case "$scope" in
+            split-only) warn "暂无分流专用出口，请先在分流管理选择 18 添加。" ;;
+            normal) warn "暂无普通出口（当前出口均为分流专用出口），请先通过 [3] 添加出口。" ;;
+        esac
         return 1
     fi
     printf '\n请选择%s:\n' "$prompt_label"
     if [ "$scope" = "split-only" ]; then
         printf '  （仅列出分流专用出口；普通应用/分类分流只能使用分流专用出口）\n'
+    elif [ "$scope" = "normal" ]; then
+        printf '  （仅列出实例出口；分流专用出口不会出现在本列表）\n'
     fi
     printf '  0. 返回上一步\n'
     i=1
@@ -13396,10 +13423,17 @@ choose_split_targets() {
         else
             target="$(resolve_exit_target "$part" || true)"
         fi
-        if [ -n "$target" ] && [ "$target" != "-" ] && [ "$scope" = "split-only" ] && ! is_split_only_exit "$target"; then
-            rm -f "$tmp"
-            warn "出口 '$(display_exit_name "$target")' 不是分流专用出口，普通分流只能选择分流专用出口。"
-            return 1
+        if [ -n "$target" ] && [ "$target" != "-" ]; then
+            if [ "$scope" = "split-only" ] && ! is_split_only_exit "$target"; then
+                rm -f "$tmp"
+                warn "出口 '$(display_exit_name "$target")' 不是分流专用出口，普通分流只能选择分流专用出口。"
+                return 1
+            fi
+            if [ "$scope" = "normal" ] && is_split_only_exit "$target"; then
+                rm -f "$tmp"
+                warn "出口 '$(display_exit_name "$target")' 是分流专用出口，不能作为实例出口。"
+                return 1
+            fi
         fi
         if [ -z "$target" ]; then
             rm -f "$tmp"
@@ -13582,8 +13616,8 @@ interactive_split_force_on_exit_app() {
     local app_file source_file target_file app source target
     app_file="/tmp/incus-egress-force-source-app.$$"; source_file="/tmp/incus-egress-force-source.$$"; target_file="/tmp/incus-egress-force-target.$$"
     choose_split_apps "$app_file" || { rm -f "$app_file" "$source_file" "$target_file"; return 0; }
-    choose_split_targets "$source_file" "来源出口（可多选）" || { rm -f "$app_file" "$source_file" "$target_file"; return 0; }
-    choose_split_targets "$target_file" "强制分流目标候选（可多选，第一个为实际目标）" || { rm -f "$app_file" "$source_file" "$target_file"; return 0; }
+    choose_split_targets "$source_file" "来源出口（实例出口，可多选）" normal || { rm -f "$app_file" "$source_file" "$target_file"; return 0; }
+    choose_split_targets "$target_file" "强制分流目标候选（仅分流专用出口，可多选，第一个为实际目标）" split-only || { rm -f "$app_file" "$source_file" "$target_file"; return 0; }
     app="$(cat "$app_file")"; source="$(cat "$source_file")"; target="$(cat "$target_file")"
     rm -f "$app_file" "$source_file" "$target_file"
     split_force_on_exit_policy "$app" "$source" "$target"
@@ -13593,8 +13627,8 @@ interactive_split_force_on_exit_category() {
     local category_file source_file target_file category source target
     category_file="/tmp/incus-egress-force-source-category.$$"; source_file="/tmp/incus-egress-force-source.$$"; target_file="/tmp/incus-egress-force-target.$$"
     choose_split_categories "$category_file" || { rm -f "$category_file" "$source_file" "$target_file"; return 0; }
-    choose_split_targets "$source_file" "来源出口（可多选）" || { rm -f "$category_file" "$source_file" "$target_file"; return 0; }
-    choose_split_targets "$target_file" "强制分流目标候选（可多选，第一个为实际目标）" || { rm -f "$category_file" "$source_file" "$target_file"; return 0; }
+    choose_split_targets "$source_file" "来源出口（实例出口，可多选）" normal || { rm -f "$category_file" "$source_file" "$target_file"; return 0; }
+    choose_split_targets "$target_file" "强制分流目标候选（仅分流专用出口，可多选，第一个为实际目标）" split-only || { rm -f "$category_file" "$source_file" "$target_file"; return 0; }
     category="$(cat "$category_file")"; source="$(cat "$source_file")"; target="$(cat "$target_file")"
     rm -f "$category_file" "$source_file" "$target_file"
     split_force_category_on_exit_policy "$category" "$source" "$target"
@@ -13604,7 +13638,7 @@ interactive_split_force_on_exit_clear_app() {
     local app_file source_file app source
     app_file="/tmp/incus-egress-force-source-clear-app.$$"; source_file="/tmp/incus-egress-force-source.$$"
     choose_split_apps "$app_file" || { rm -f "$app_file" "$source_file"; return 0; }
-    choose_split_targets "$source_file" "需要取消规则的来源出口（可多选）" || { rm -f "$app_file" "$source_file"; return 0; }
+    choose_split_targets "$source_file" "需要取消规则的来源出口（实例出口，可多选）" normal || { rm -f "$app_file" "$source_file"; return 0; }
     app="$(cat "$app_file")"; source="$(cat "$source_file")"
     rm -f "$app_file" "$source_file"
     split_force_on_exit_clear_policy "$app" "$source"
@@ -13614,7 +13648,7 @@ interactive_split_force_on_exit_clear_category() {
     local category_file source_file category source
     category_file="/tmp/incus-egress-force-source-clear-category.$$"; source_file="/tmp/incus-egress-force-source.$$"
     choose_split_categories "$category_file" || { rm -f "$category_file" "$source_file"; return 0; }
-    choose_split_targets "$source_file" "需要取消规则的来源出口（可多选）" || { rm -f "$category_file" "$source_file"; return 0; }
+    choose_split_targets "$source_file" "需要取消规则的来源出口（实例出口，可多选）" normal || { rm -f "$category_file" "$source_file"; return 0; }
     category="$(cat "$category_file")"; source="$(cat "$source_file")"
     rm -f "$category_file" "$source_file"
     split_force_category_on_exit_clear_policy "$category" "$source"
@@ -14150,13 +14184,58 @@ interactive_sort_exits() {
     esac
 }
 
+choose_replace_new_exit() {
+    local exclude="$1" out_file="$2" scope="${3:-normal}" tmp pick target i=1 name mark table route4 route6 display
+    [ -n "$out_file" ] || return 1
+    tmp="$(mktemp)"
+    while IFS=$'\t' read -r name mark table route4 route6 display; do
+        [ "$name" != "$exclude" ] || continue
+        [ "$name" != "-" ] || continue
+        if [ "$scope" = "split-only" ]; then
+            is_split_only_exit "$name" || continue
+        else
+            is_split_only_exit "$name" && continue
+        fi
+        printf '%s\t%s\n' "$name" "${display:-$name}" >> "$tmp"
+    done < <(read_exit_rows)
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        if [ "$scope" = "split-only" ]; then
+            warn "暂无其他分流专用出口，请先在分流管理选择 18 添加。"
+        else
+            warn "没有可用于替换的新出口。请先通过 [3] 添加出口 添加新出口。"
+        fi
+        return 1
+    fi
+    printf '\n请选择替换目标（新出口，已添加好的出口）:\n'
+    if [ "$scope" = "split-only" ]; then
+        printf '  （旧出口是分流专用出口，新出口也只能是分流专用出口）\n'
+    else
+        printf '  （分流专用出口不在本列表，不会进入实例 out）\n'
+    fi
+    printf '  0. 返回上一步\n'
+    while IFS=$'\t' read -r name display; do
+        printf '  %s. %s\n' "$i" "${display:-$name}"
+        i=$((i + 1))
+    done < "$tmp"
+    read -r -p "请输入序号或出口名: " pick
+    case "$pick" in
+        ""|0) target="" ;;
+        *[!0-9]*) target="$(awk -F '\t' -v p="$pick" '$1 == p || $2 == p {print $1; exit}' "$tmp")" ;;
+        *) target="$(sed -n "${pick}p" "$tmp" | awk -F '\t' '{print $1}')" ;;
+    esac
+    rm -f "$tmp"
+    [ -n "$target" ] || return 1
+    printf '%s\n' "$target" > "$out_file"
+}
+
 interactive_replace_exit() {
-    local choice_file old new count=0
+    local choice_file old new scope count=0
     need_root
     load_config
     print_exit_summary
-    printf '\n【出口替换】先选择要替换的旧出口，再添加新出口。\n'
-    choice_file="/tmp/incus-egress-replace.$$"
+    printf '\n【出口替换】请先通过 [3] 添加出口 添加好新出口，再执行以下替换。\n'
+    choice_file="/tmp/incus-egress-replace-old.$$"
     if ! choose_host_exit "$choice_file"; then
         rm -f "$choice_file"
         pause_screen
@@ -14164,27 +14243,24 @@ interactive_replace_exit() {
     fi
     old="$(cat "$choice_file")"
     rm -f "$choice_file"
-    printf '\n现在添加替换用的新出口。\n'
-    REPLACE_EXIT_CONTEXT_OLD="$old"
-    REPLACE_EXIT_DUPLICATE_ACTION=""
-    REPLACE_EXIT_COMPLETED="false"
-    interactive_add_proxy_exit
-    REPLACE_EXIT_CONTEXT_OLD=""
-    REPLACE_EXIT_DUPLICATE_ACTION=""
-    if [ "$REPLACE_EXIT_COMPLETED" = "true" ]; then
-        REPLACE_EXIT_COMPLETED="false"
-        return 0
-    fi
-    REPLACE_EXIT_COMPLETED="false"
-    new="$(prompt_exit_name "请输入刚才添加的新出口名称（显示名或内部 ID）")"
-    if ! exit_exists "$new"; then
-        new="$(exit_name_by_display "$new")"
-    fi
-    if [ -z "$new" ] || ! exit_exists "$new"; then
-        warn "未找到新出口，替换已取消。"
+    if [ "$old" = "-" ]; then
+        warn "入口机直出不是可替换出口。"
         pause_screen
         return 0
     fi
+    choice_file="/tmp/incus-egress-replace-new.$$"
+    if is_split_only_exit "$old"; then
+        scope="split-only"
+    else
+        scope="normal"
+    fi
+    if ! choose_replace_new_exit "$old" "$choice_file" "$scope"; then
+        rm -f "$choice_file"
+        pause_screen
+        return 0
+    fi
+    new="$(cat "$choice_file")"
+    rm -f "$choice_file"
     if [ -f "$CONTAINERS_FILE" ]; then
         count="$(awk -F '\t' -v o="$old" 'NF && $1 !~ /^#/ && $5 == o {n++} END {print n+0}' "$CONTAINERS_FILE")"
     fi
