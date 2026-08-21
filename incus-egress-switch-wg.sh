@@ -343,20 +343,41 @@ ensure_entry_direct_dependencies() {
     entry_direct_python_ready || die "python3 自动安装失败，请手动安装后重试。"
 }
 
-# 持久化转发所需内核参数，避免宿主机重启后 fwmark 路由因转发/rp_filter 失效。
+# 持久化转发与高并发连接所需内核参数，避免宿主机重启后 fwmark 路由失效或高并发连接跟踪溢出。
 install_runtime_sysctls() {
     need_root
     need_cmd sysctl
     load_config
-    local tmp iface key
+    local tmp iface key k
+    local high_keys=(
+        "net.ipv4.ip_forward"
+        "net.ipv4.conf.all.src_valid_mark"
+        "net.ipv4.conf.all.rp_filter"
+        "net.ipv4.conf.default.rp_filter"
+        "net.ipv6.conf.all.forwarding"
+        "net.netfilter.nf_conntrack_max"
+        "net.netfilter.nf_conntrack_tcp_timeout_established"
+        "net.netfilter.nf_conntrack_tcp_timeout_time_wait"
+        "net.netfilter.nf_conntrack_tcp_timeout_close_wait"
+        "net.netfilter.nf_conntrack_tcp_timeout_fin_wait"
+        "net.core.somaxconn"
+        "net.core.netdev_max_backlog"
+        "net.ipv4.tcp_max_syn_backlog"
+        "net.ipv4.ip_local_port_range"
+        "net.ipv4.tcp_tw_reuse"
+        "net.core.rmem_max"
+        "net.core.wmem_max"
+        "net.ipv4.tcp_rmem"
+        "net.ipv4.tcp_wmem"
+        "fs.file-max"
+    )
     mkdir -p "$CONFIG_DIR"
+    modprobe nf_conntrack >/dev/null 2>&1 || true
     if [ ! -f "$SYSCTL_ORIGINAL_FILE" ]; then
         {
-            printf 'net.ipv4.ip_forward=%s\n' "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || printf 0)"
-            printf 'net.ipv4.conf.all.src_valid_mark=%s\n' "$(sysctl -n net.ipv4.conf.all.src_valid_mark 2>/dev/null || printf 0)"
-            printf 'net.ipv4.conf.all.rp_filter=%s\n' "$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || printf 0)"
-            printf 'net.ipv4.conf.default.rp_filter=%s\n' "$(sysctl -n net.ipv4.conf.default.rp_filter 2>/dev/null || printf 0)"
-            printf 'net.ipv6.conf.all.forwarding=%s\n' "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || printf 0)"
+            for k in "${high_keys[@]}"; do
+                sysctl -n "$k" >/dev/null 2>&1 && printf '%s=%s\n' "$k" "$(sysctl -n "$k" 2>/dev/null)"
+            done
             for iface in $BRIDGE_IFACES; do
                 valid_name "$iface" || continue
                 key="net.ipv4.conf.$iface.rp_filter"
@@ -368,12 +389,27 @@ install_runtime_sysctls() {
     fi
     tmp="$(mktemp)"
     cat > "$tmp" <<'EOF'
-# Managed by incus-egress-switch.
+# Managed by incus-egress-switch (High Concurrency & Egress Routing)
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.src_valid_mark = 1
 net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
 net.ipv6.conf.all.forwarding = 1
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 1200
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 10240 65535
+net.ipv4.tcp_tw_reuse = 1
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+fs.file-max = 2097152
 EOF
     for iface in $BRIDGE_IFACES; do
         valid_name "$iface" || continue
@@ -381,7 +417,7 @@ EOF
     done
     install -m 0644 "$tmp" "$SYSCTL_FILE"
     rm -f "$tmp"
-    sysctl -e -q -p "$SYSCTL_FILE" || warn "部分内核转发参数无法应用，请检查 $SYSCTL_FILE。"
+    sysctl -e -q -p "$SYSCTL_FILE" || warn "部分内核转发/高并发参数无法应用，请检查 $SYSCTL_FILE。"
 }
 
 restore_runtime_sysctls() {
@@ -389,11 +425,8 @@ restore_runtime_sysctls() {
     command -v sysctl >/dev/null 2>&1 || return 0
     local key value
     while IFS='=' read -r key value; do
-        case "$key" in
-            net.ipv4.ip_forward|net.ipv4.conf.all.src_valid_mark|net.ipv4.conf.all.rp_filter|net.ipv4.conf.default.rp_filter|net.ipv4.conf.*.rp_filter|net.ipv6.conf.all.forwarding)
-                [[ "$value" =~ ^[0-9]+$ ]] && sysctl -q -w "$key=$value" 2>/dev/null || true
-                ;;
-        esac
+        [ -n "$key" ] && [ -n "$value" ] || continue
+        sysctl -q -w "$key=$value" 2>/dev/null || true
     done < "$SYSCTL_ORIGINAL_FILE"
 }
 
@@ -831,6 +864,7 @@ load_config() {
     SPLIT_DNS_TIMEOUT="${SPLIT_DNS_TIMEOUT:-1}"
     SPLIT_DNS_WORKERS="${SPLIT_DNS_WORKERS:-4}"
     SPLIT_DNSMASQ_NFTSET="${SPLIT_DNSMASQ_NFTSET:-true}"
+    SPLIT_FORCE_CONTAINER_DNS="${SPLIT_FORCE_CONTAINER_DNS:-true}"
     SPLIT_DNS_SIDECAR_FALLBACK="${SPLIT_DNS_SIDECAR_FALLBACK:-true}"
     SPLIT_DNS_SIDECAR_PORT="${SPLIT_DNS_SIDECAR_PORT:-1053}"
     SPLIT_DNS_FORCE_SIDECAR="${SPLIT_DNS_FORCE_SIDECAR:-false}"
@@ -1217,6 +1251,9 @@ SPLIT_DNS_WORKERS="4"
 # 使用 Incus 网桥 dnsmasq 的 nftset 功能，动态补充域名及其子域名解析出的 IP。
 # 原生 dnsmasq 不支持时优先使用脚本专用兼容 DNS；组件不可用才退回静态缓存。
 SPLIT_DNSMASQ_NFTSET="true"
+
+# 是否强制拦截容器内 53 端口 DNS 请求并重定向至网桥 dnsmasq（防止容器自定义 DNS 绕过分流）。
+SPLIT_FORCE_CONTAINER_DNS="true"
 
 # Incus 自带 dnsmasq 不支持 nftset 时，自动启用脚本专用兼容 DNS。
 # 兼容服务只监听容器网桥的高位端口，并把查询转发回 Incus DNS。
@@ -1697,6 +1734,7 @@ ensure_runtime_config_defaults() {
     ensure_config_default SPLIT_DNS_TIMEOUT 1
     ensure_config_default SPLIT_DNS_WORKERS 4
     ensure_config_default SPLIT_DNSMASQ_NFTSET true
+    ensure_config_default SPLIT_FORCE_CONTAINER_DNS true
     ensure_config_default SPLIT_DNS_SIDECAR_FALLBACK true
     ensure_config_default SPLIT_DNS_SIDECAR_PORT 1053
     ensure_config_default SPLIT_DNS_FORCE_SIDECAR false
@@ -2290,6 +2328,7 @@ validate_runtime_config() {
     valid_bool_value "$ENTRY_DIRECT_SPEEDTEST" || die "ENTRY_DIRECT_SPEEDTEST 必须是 true 或 false"
     valid_bool_value "$PROXY_DIRECT_DEFAULT_MIGRATED" || die "PROXY_DIRECT_DEFAULT_MIGRATED 必须是 true 或 false"
     valid_bool_value "$SPLIT_DNSMASQ_NFTSET" || die "SPLIT_DNSMASQ_NFTSET 必须是 true 或 false"
+    valid_bool_value "$SPLIT_FORCE_CONTAINER_DNS" || die "SPLIT_FORCE_CONTAINER_DNS 必须是 true 或 false"
     valid_bool_value "$SPLIT_DNS_SIDECAR_FALLBACK" || die "SPLIT_DNS_SIDECAR_FALLBACK 必须是 true 或 false"
     valid_bool_value "$SPLIT_DNS_FORCE_SIDECAR" || die "SPLIT_DNS_FORCE_SIDECAR 必须是 true 或 false"
     valid_bool_value "$PROXY_DDNS_RESTART_ON_CHANGE" || die "PROXY_DDNS_RESTART_ON_CHANGE 必须是 true 或 false"
@@ -3154,9 +3193,8 @@ split_dns_health() {
 }
 
 build_split_dns_sidecar_redirect_rules() {
-    local generated iface v4 v6
+    local generated iface
     [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ] || return 0
-    split_dns_sidecar_available || return 0
     generated="$(mktemp)"
     build_split_dnsmasq_file "$generated"
     if [ ! -s "$generated" ]; then
@@ -3166,16 +3204,14 @@ build_split_dns_sidecar_redirect_rules() {
     rm -f "$generated"
     while IFS= read -r iface; do
         [ -n "$iface" ] || continue
-        incus_bridge_dnsmasq_supports_nftset "$iface" && continue
-        v4="$(split_bridge_dns_address "$iface" 4 || true)"
-        v6="$(split_bridge_dns_address "$iface" 6 || true)"
-        if [ -n "$v4" ]; then
-            printf '    iifname "%s" ip daddr %s udp dport 53 redirect to :%s\n' "$iface" "$v4" "$SPLIT_DNS_SIDECAR_PORT"
-            printf '    iifname "%s" ip daddr %s tcp dport 53 redirect to :%s\n' "$iface" "$v4" "$SPLIT_DNS_SIDECAR_PORT"
-        fi
-        if [ -n "$v6" ]; then
-            printf '    iifname "%s" ip6 daddr %s udp dport 53 redirect to :%s\n' "$iface" "$v6" "$SPLIT_DNS_SIDECAR_PORT"
-            printf '    iifname "%s" ip6 daddr %s tcp dport 53 redirect to :%s\n' "$iface" "$v6" "$SPLIT_DNS_SIDECAR_PORT"
+        if incus_bridge_dnsmasq_supports_nftset "$iface"; then
+            if [ "${SPLIT_FORCE_CONTAINER_DNS:-true}" = "true" ]; then
+                printf '    iifname "%s" udp dport 53 redirect to :53\n' "$iface"
+                printf '    iifname "%s" tcp dport 53 redirect to :53\n' "$iface"
+            fi
+        elif split_dns_sidecar_available; then
+            printf '    iifname "%s" udp dport 53 redirect to :%s\n' "$iface" "$SPLIT_DNS_SIDECAR_PORT"
+            printf '    iifname "%s" tcp dport 53 redirect to :%s\n' "$iface" "$SPLIT_DNS_SIDECAR_PORT"
         fi
     done < <(split_managed_dns_bridges)
 }
@@ -10008,6 +10044,27 @@ def clear_conntrack(container_ip):
     subprocess.run([CONNTRACK_BIN, "-D", "-s", container_ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
 
 
+def host_ping(target_ip, count=3, timeout=2):
+    try:
+        ip = ipaddress.ip_address(target_ip.strip())
+    except ValueError:
+        return None, "invalid IP address"
+    cmd = ["ping", "-c", str(count), "-W", str(timeout), "-n", str(ip)]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=count * timeout + 3)
+        out = res.stdout or ""
+    except Exception as exc:
+        return None, str(exc)
+    samples = []
+    for line in out.splitlines():
+        m = re.search(r"time=([0-9.]+)\s*ms", line)
+        if m:
+            samples.append(m.group(1))
+    if not samples:
+        return None, "timeout or unreachable"
+    return samples, ""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "IncusEgressSwitch/1.0"
 
@@ -10123,6 +10180,32 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/split-targets.txt":
             app_ref = (params.get("app") or [""])[0]
             text_response(self, 200, self.split_targets_text(container, exits, app_ref))
+        elif path in ("/host-ping", "/host-ping.txt"):
+            target_ip = (params.get("ip") or [""])[0].strip()
+            if not target_ip:
+                if path.endswith(".txt"):
+                    text_response(self, 400, "ERROR: missing ip\n")
+                else:
+                    response(self, 400, {"ok": False, "error": "缺少 ip 参数"})
+                return
+            samples, err = host_ping(target_ip)
+            if samples is None:
+                if path.endswith(".txt"):
+                    text_response(self, 200, "ERROR: %s\n" % err)
+                else:
+                    response(self, 200, {"ok": False, "error": err, "ip": target_ip})
+                return
+            if path.endswith(".txt"):
+                text_lines = "\n".join(samples) + "\n"
+                text_response(self, 200, text_lines)
+            else:
+                avg_val = sum(float(x) for x in samples) / len(samples)
+                response(self, 200, {
+                    "ok": True,
+                    "ip": target_ip,
+                    "samples": samples,
+                    "avg": "%.3f" % avg_val
+                })
         else:
             response(self, 404, {"ok": False, "error": "接口不存在"})
 
@@ -12177,14 +12260,14 @@ dns_probe() {
 
 ping_probe() {
     ip="$1"
-    [ -n "$ip" ] || { echo "出口 Ping: unavailable"; return 1; }
-    command -v ping >/dev/null 2>&1 || { echo "出口 Ping: 未安装 ping"; return 1; }
+    [ -n "$ip" ] || { echo "出口端内环延迟 (容器 -> 出口IP): unavailable"; return 1; }
+    command -v ping >/dev/null 2>&1 || { echo "出口端内环延迟 (容器 -> 出口IP): 未安装 ping"; return 1; }
     out="$(ping -c 3 -W 2 "$ip" 2>/dev/null || true)"
     if [ -z "$out" ]; then
-        echo "出口 Ping: unavailable"
+        echo "出口端内环延迟 (容器 -> 出口IP): unavailable"
         return 1
     fi
-    echo "出口 Ping:"
+    echo "出口端内环延迟 (容器 -> 出口IP):"
     printf '%s\n' "$out" | awk '
         /time=/ {
             v=$0
@@ -12196,6 +12279,33 @@ ping_probe() {
         }
         END {
             if (n > 0) printf "  平均 %.3fms\n", sum / n
+            else print "  unavailable"
+        }'
+}
+
+host_ping_probe() {
+    ip="$1"
+    [ -n "$ip" ] || { echo "宿主机直连延迟 (宿主机 -> 出口IP): unavailable"; return 1; }
+    echo "宿主机直连延迟 (宿主机 -> 出口IP):"
+    raw="$(api_raw "$API_URL/host-ping.txt?ip=$ip" 2>/dev/null || true)"
+    if [ -z "$raw" ]; then
+        echo "  unavailable"
+        return 1
+    fi
+    if printf '%s\n' "$raw" | grep -qiE "^(error|error:)"; then
+        echo "  unavailable (节点禁Ping/超时)"
+        return 1
+    fi
+    printf '%s\n' "$raw" | awk '
+        /^[0-9.]+[[:space:]]*$/ {
+            n++
+            v = $1
+            sum += v
+            printf "  #%d %sms\n", n, v
+        }
+        END {
+            if (n > 0) printf "  平均 %.3fms\n", sum / n
+            else print "  unavailable (节点禁Ping/超时)"
         }'
 }
 
@@ -12239,6 +12349,7 @@ exit_test() {
         "https://ifconfig.me/ip" || true)"
     if [ -n "$v4" ]; then
         echo "IPv4: $v4"
+        host_ping_probe "$v4"
         ping_probe "$v4"
         echo "DNS: 正常"
     else
