@@ -12,6 +12,7 @@ WG_CONF="/etc/wireguard/${WG_IFACE}.conf"
 NFT_FILE="$STATE_DIR/server.nft"
 NFT_TABLE="csh_wg_server"
 SYSCTL_FILE="/etc/sysctl.d/99-cloudshlii-wg-server.conf"
+SYSCTL_ORIGINAL_FILE="$STATE_DIR/sysctl-original.env"
 LOCK_FILE="/run/lock/cloudshlii-wg-server.lock"
 OPENRC_SERVICE="/etc/init.d/cloudshlii-wg-server"
 INSTALL_BIN="/usr/local/sbin/wg-egress"
@@ -238,7 +239,32 @@ PY
     printf '可以部署。WARN 项请按提示确认。\n'
 }
 
+save_original_sysctl() {
+    [ -f "$SYSCTL_ORIGINAL_FILE" ] && return 0
+    local tmp ipv4 ipv6
+    mkdir -p "$STATE_DIR"
+    ipv4="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+    ipv6="$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)"
+    tmp="$(mktemp "$STATE_DIR/.sysctl-original.XXXXXX")"
+    {
+        [ -n "$ipv4" ] && printf 'net.ipv4.ip_forward=%s\n' "$ipv4"
+        [ -n "$ipv6" ] && printf 'net.ipv6.conf.all.forwarding=%s\n' "$ipv6"
+    } > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$SYSCTL_ORIGINAL_FILE"
+}
+
+restore_original_sysctl() {
+    [ -f "$SYSCTL_ORIGINAL_FILE" ] || return 0
+    local key value
+    while IFS='=' read -r key value; do
+        [ -n "$key" ] && [ -n "$value" ] || continue
+        sysctl -q -w "$key=$value" 2>/dev/null || true
+    done < "$SYSCTL_ORIGINAL_FILE"
+}
+
 write_sysctl() {
+    save_original_sysctl
     cat > "$SYSCTL_FILE" <<'EOF'
 # Managed by cloudshlii WG egress server.
 net.ipv4.ip_forward = 1
@@ -368,7 +394,7 @@ restart_server() {
 
 install_server() {
     need_root; install_dependencies; lock
-    local port="${1:-}" address4="${2:-10.66.0.1/24}" address6="${3:--}" mtu="${4:-1380}" wan="${5:-}" tmp
+    local port="${1:-}" address4="${2:-10.66.0.1/24}" address6="${3:--}" mtu="${4:-1380}" wan="${5:-}" tmp key_tmp old_env="" fresh_install="true"
     [ "$port" != "random" ] || port="$(random_port "${WG_RANDOM_PORT_MIN:-20000}" "${WG_RANDOM_PORT_MAX:-65535}")"
     valid_port "$port" || { unlock; die "UDP 端口无效。"; }
     valid_address 4 "$address4" || { unlock; die "服务端 IPv4 隧道地址无效。"; }
@@ -376,11 +402,19 @@ install_server() {
     [ "$address4" != "-" ] || [ "$address6" != "-" ] || { unlock; die "至少启用一种隧道地址。"; }
     [[ "$mtu" =~ ^[0-9]+$ ]] && [ "$mtu" -ge 1280 ] && [ "$mtu" -le 9000 ] || { unlock; die "MTU 应为 1280-9000。"; }
     wan="${wan:-$(detect_wan)}"; valid_name "$wan" && ip link show "$wan" >/dev/null 2>&1 || { unlock; die "公网网卡无效。"; }
-    mkdir -p "$STATE_DIR" /etc/wireguard; chmod 700 "$STATE_DIR" /etc/wireguard
-    [ -s "$PRIVATE_KEY_FILE" ] || wg genkey > "$PRIVATE_KEY_FILE"
+    mkdir -p "$STATE_DIR" "$(dirname "$WG_CONF")"; chmod 700 "$STATE_DIR" "$(dirname "$WG_CONF")"
+    if [ ! -s "$PRIVATE_KEY_FILE" ]; then
+        key_tmp="$(mktemp)"
+        chmod 600 "$key_tmp"
+        wg genkey > "$key_tmp"
+        install -m 600 "$key_tmp" "$PRIVATE_KEY_FILE"
+        rm -f "$key_tmp"
+    fi
     chmod 600 "$PRIVATE_KEY_FILE"; wg pubkey < "$PRIVATE_KEY_FILE" > "$PUBLIC_KEY_FILE"; chmod 644 "$PUBLIC_KEY_FILE"
     [ -f "$PEERS_FILE" ] || printf '# 名称\t公钥\tIPv4\tIPv6\tPSK\n' > "$PEERS_FILE"
-    chmod 600 "$PEERS_FILE"; tmp="$(mktemp)"
+    chmod 600 "$PEERS_FILE"
+    if [ -f "$ENV_FILE" ]; then old_env="$(mktemp)"; cp -a "$ENV_FILE" "$old_env"; fresh_install="false"; fi
+    tmp="$(mktemp)"
     cat > "$tmp" <<EOF
 WG_LISTEN_PORT=$port
 WG_ADDRESS4=$address4
@@ -389,7 +423,18 @@ WG_MTU=$mtu
 WG_WAN_IFACE=$wan
 EOF
     install -m 600 "$tmp" "$ENV_FILE"; rm -f "$tmp"; write_sysctl
-    restart_server || { unlock; die "部署失败，已恢复旧配置。"; }
+    if ! restart_server; then
+        if [ -n "$old_env" ]; then install -m 600 "$old_env" "$ENV_FILE"; else rm -f "$ENV_FILE"; fi
+        if [ "$fresh_install" = "true" ]; then
+            rm -f "$SYSCTL_FILE"
+            restore_original_sysctl
+            rm -f "$SYSCTL_ORIGINAL_FILE"
+        fi
+        rm -f "$old_env"
+        unlock
+        die "部署失败，已恢复旧配置。"
+    fi
+    rm -f "$old_env"
     install_self; unlock
     printf '\n部署完成，请记住下面 3 项：\n'
     printf '  Endpoint端口 : %s/UDP\n' "$port"
@@ -415,6 +460,7 @@ add_peer() {
         [ "$n" = "$name" ] && continue
         [ "$p" != "$public" ] || { rm -f "$tmp" "$backup"; unlock; die "该公钥已由 Peer $n 使用。"; }
         [ "$address4" = "-" ] || [ "$a4" != "$address4" ] || { rm -f "$tmp" "$backup"; unlock; die "地址已由 Peer $n 使用。"; }
+        [ "$address6" = "-" ] || [ "$a6" != "$address6" ] || { rm -f "$tmp" "$backup"; unlock; die "地址已由 Peer $n 使用。"; }
         printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$p" "$a4" "$a6" "$old_psk" >> "$tmp"
     done < "$PEERS_FILE"
     printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$public" "$address4" "$address6" "$psk" >> "$tmp"
@@ -458,7 +504,9 @@ status_server() {
 uninstall_server() {
     need_root; lock; service_stop
     nft delete table inet "$NFT_TABLE" 2>/dev/null || true
-    rm -f "$WG_CONF" "$SYSCTL_FILE"; rm -rf "$STATE_DIR"; unlock
+    rm -f "$WG_CONF" "$SYSCTL_FILE"
+    restore_original_sysctl
+    rm -rf "$STATE_DIR"; unlock
     info "WG 出口已卸载；没有改动其他代理或 nftables 表。"
 }
 
