@@ -620,7 +620,7 @@ create_update_backup() {
     chmod 0700 "$UPDATE_BACKUP_PATH" || return 1
     UPDATE_BACKUP_ARCHIVE="$UPDATE_BACKUP_PATH/state.tar.gz"
 
-    for path in "$CONFIG_DIR" "$INSTALL_BIN" "$SHORTCUT_BIN" "$CONTROLLER_FILE" "$AUTOSYNC_FILE" "$OUT_CLIENT_FILE" \
+    for path in "$CONFIG_DIR" "$INSTALL_BIN" "$SHORTCUT_BIN" "$CONTROLLER_FILE" "$AUTOSYNC_FILE" "$OUT_CLIENT_FILE" "$SINGBOX_BIN" \
         "$SERVICE_FILE" "$AUTOSYNC_SERVICE" "$SYSCTL_FILE"; do
         if [ -e "$path" ] || [ -L "$path" ]; then
             if [[ "$path" != /* ]]; then
@@ -768,7 +768,10 @@ restore_update_backup() {
         "$SERVICE_FILE" "$AUTOSYNC_SERVICE" "$SYSCTL_FILE"
     rm -f -- "$service_dir"/${EXIT_SERVICE_PREFIX}-*.service 2>/dev/null || true
     rm -f -- "$service_dir"/${SPLIT_DNS_SIDECAR_SERVICE_PREFIX}-*.service 2>/dev/null || true
-    tar -C / -xzpf "$archive" || return 1
+    # Running processes may still hold the current executable open. Restore
+    # the core with rename, never by truncating a live executable (ETXTBSY).
+    restore_update_core "$archive" || return 1
+    tar -C / -xzpf "$archive" --exclude="${SINGBOX_BIN#/}" || return 1
     command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
 
     if command -v systemctl >/dev/null 2>&1 && [ -f "$backup/active-exits.txt" ]; then
@@ -840,6 +843,10 @@ update_health_check() {
             [ -n "$svc" ] || continue
             wait_unit_active "$svc" "$timeout" || { warn "更新前在线的出口服务未恢复: $svc"; return 1; }
         done < "$backup/active-exits.txt"
+    fi
+    if [ -x "$SINGBOX_BIN" ] && [ "$(singbox_core_version "$SINGBOX_BIN")" != "$SINGBOX_CORE_VERSION" ]; then
+        warn "更新后的 sing-box 核心未达到固定版本 $SINGBOX_CORE_VERSION。"
+        return 1
     fi
     return 0
 }
@@ -1892,6 +1899,11 @@ upgrade_config_and_components() {
         prepare_default_proxy_direct_bypass
         prepare_default_split_collision_bypass
         preflight_update_runtime
+        # Existing installations must also enforce the pinned core version.
+        # The update backup above contains the previous executable.
+        if [ -x "$SINGBOX_BIN" ] || find "$EXIT_DIR" -name config.json -type f -print 2>/dev/null | grep -q .; then
+            install_singbox_core
+        fi
         do_apply
         mkdir -p "$LIB_DIR" "$RUN_DIR"
         if [ "$source_path" != "$INSTALL_BIN" ]; then
@@ -4256,31 +4268,112 @@ singbox_arch() {
     esac
 }
 
-install_singbox_core() {
+singbox_core_version() {
+    local output
+    output="$("$1" version 2>/dev/null)" || return 0
+    awk '$1 == "sing-box" && $2 == "version" {print $3; exit}' <<< "$output"
+}
+
+restore_update_core() {
+    local archive="$1" stage
+    # Backwards compatible with old update backups that omitted the core.
+    if ! tar -tzf "$archive" | grep -Fx "${SINGBOX_BIN#/}" >/dev/null; then
+        return 0
+    fi
+    mkdir -p "$LIB_DIR" || return 1
+    stage="$(mktemp -d "$LIB_DIR/.singbox-restore.XXXXXX")" || return 1
+    if ! tar -C "$stage" -xzpf "$archive" "${SINGBOX_BIN#/}" ||
+        ! mv -fT -- "$stage/${SINGBOX_BIN#/}" "$SINGBOX_BIN"; then
+        rm -rf -- "$stage"
+        return 1
+    fi
+    rm -rf -- "$stage"
+}
+
+# A subshell confines the lock FD, EXIT cleanup and rollback state. Explicit
+# failures remain effective even when the caller uses `if install_...`.
+install_singbox_core() (
     need_root
     need_cmd curl
     need_cmd tar
-    need_cmd python3
-    local arch version="$SINGBOX_CORE_VERSION" tmp file url bin
-    if [ -x "$SINGBOX_BIN" ]; then
-        rm -f "$LEGACY_SINGBOX_BIN" 2>/dev/null || true
+    need_cmd flock
+    local arch version="$SINGBOX_CORE_VERSION" tmp="" file url bin conf name svc current
+    local core_lock_fd replaced=false had_core=false restart_started=false
+    local -a active_services=()
+    mkdir -p "$LIB_DIR" || return 1
+    exec {core_lock_fd}>"$LIB_DIR/.singbox-core.lock" || return 1
+    flock -x "$core_lock_fd" || return 1
+    current="$(singbox_core_version "$SINGBOX_BIN")"
+    if [ "$current" = "$version" ]; then
         return 0
     fi
+    # Do all downloads and config validation before touching the live binary.
     arch=$(singbox_arch) || die "暂不支持当前架构: $(uname -m)"
-    tmp=$(mktemp -d)
+    tmp=$(mktemp -d "$LIB_DIR/.singbox-update.XXXXXX") || return 1
+    cleanup_singbox_install() {
+        local rc=$? rollback_failed=0 unit
+        trap - EXIT
+        if [ "$rc" -ne 0 ] && [ "$replaced" = true ]; then
+            if [ "$had_core" = true ]; then
+                mv -fT -- "$tmp/previous" "$SINGBOX_BIN" || rollback_failed=1
+            else
+                rm -f -- "$SINGBOX_BIN" || rollback_failed=1
+            fi
+            if [ "$restart_started" = true ]; then
+                for unit in "${active_services[@]}"; do
+                    systemctl restart "$unit" >/dev/null 2>&1 || rollback_failed=1
+                    wait_unit_active "$unit" 15 || rollback_failed=1
+                done
+            fi
+            if [ "$rollback_failed" -eq 0 ]; then
+                warn "sing-box 核心替换失败，已恢复原核心和原在线出口。"
+            else
+                warn "sing-box 核心回滚未完全恢复，请检查出口服务和更新备份。"
+            fi
+        fi
+        if [ "$rollback_failed" -eq 0 ]; then
+            rm -rf -- "$tmp"
+        else
+            warn "核心恢复文件已保留: $tmp"
+        fi
+        exit "$rc"
+    }
+    trap cleanup_singbox_install EXIT
     file="sing-box-${version}-linux-${arch}.tar.gz"
     url="https://github.com/SagerNet/sing-box/releases/download/v${version}/${file}"
-    info "下载固定版本 sing-box v${version}..."
-    curl -fL --connect-timeout 20 --retry 2 -o "$tmp/$file" "$url"
-    tar -xzf "$tmp/$file" -C "$tmp"
-    bin=$(find "$tmp" -type f -name sing-box | head -1)
-    [ -n "$bin" ] || { rm -rf "$tmp"; die "压缩包内未找到 sing-box。"; }
-    mkdir -p "$LIB_DIR"
-    install -m 0755 "$bin" "$SINGBOX_BIN"
+    info "sing-box 当前版本 ${current:-未安装/无法识别}，准备固定版本 v${version}..."
+    curl -fL --connect-timeout 20 --max-time 180 --retry 2 -o "$tmp/$file" "$url" || return 1
+    bin="$tmp/sing-box-${version}-linux-${arch}/sing-box"
+    tar -xzf "$tmp/$file" -C "$tmp" "sing-box-${version}-linux-${arch}/sing-box" || return 1
+    [ -f "$bin" ] && [ ! -L "$bin" ] || { warn "压缩包中核心文件无效。"; return 1; }
+    chmod 0755 "$bin" || return 1
+    [ "$(singbox_core_version "$bin")" = "$version" ] || { warn "下载核心版本校验失败。"; return 1; }
+    for conf in "$EXIT_DIR"/*/config.json; do
+        [ -f "$conf" ] || continue
+        name="$(basename "$(dirname "$conf")")"
+        if ! "$bin" check -c "$conf" >/dev/null 2>&1; then
+            warn "固定版本无法通过出口 $name 的配置预检，原核心未改动。"
+            return 1
+        fi
+        svc="${EXIT_SERVICE_PREFIX}-${name}.service"
+        if unit_is_active "$svc"; then active_services+=("$svc"); fi
+    done
+    if [ -e "$SINGBOX_BIN" ]; then
+        cp -p -- "$SINGBOX_BIN" "$tmp/previous" || return 1
+        had_core=true
+    fi
+    mv -fT -- "$bin" "$SINGBOX_BIN" || return 1
+    replaced=true
+    for svc in "${active_services[@]}"; do
+        restart_started=true
+        systemctl restart "$svc" >/dev/null 2>&1 || return 1
+        # Type=simple can briefly report active before a bad process exits.
+        sleep 1
+        wait_unit_active "$svc" 15 || return 1
+    done
     rm -f "$LEGACY_SINGBOX_BIN" 2>/dev/null || true
-    rm -rf "$tmp"
-    info "脚本专用 sing-box 已安装: $SINGBOX_BIN"
-}
+    info "sing-box 已固定为 $version，已重新加载 ${#active_services[@]} 个原在线代理出口。"
+)
 
 write_resolved_guard() {
     local resolved_guard="$LIB_DIR/clear-resolved-link"
@@ -11012,6 +11105,19 @@ def managed_network_identity(inst):
     return guest_ifaces, configured_ips
 
 
+def is_guest_docker_address(iface, data, address):
+    # Incus reports guest bridges as "broadcast", just like eth0. Require a
+    # Docker-style name, no host-side veth identity and an RFC1918/ULA address.
+    # Never choose these addresses as the instance's host-facing source IP.
+    if iface != "docker0" and not re.fullmatch(r"br-[0-9a-f]{12}", iface):
+        return False
+    if str(data.get("host_name") or "").strip():
+        return False
+    ip = ipaddress.ip_address(address)
+    ranges = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
+    return any(ip in ipaddress.ip_network(cidr) for cidr in ranges)
+
+
 def pick_ip_from_state(state, managed_ifaces=None, configured_ips=None):
     network = state.get("network") or {}
     managed_ifaces = list(managed_ifaces or [])
@@ -11043,7 +11149,7 @@ def pick_ip_from_state(state, managed_ifaces=None, configured_ips=None):
             if iface in managed_ifaces:
                 if item not in managed_addresses:
                     managed_addresses.append(item)
-            elif item not in unexpected_addresses:
+            elif not is_guest_docker_address(iface, data, normalized) and item not in unexpected_addresses:
                 unexpected_addresses.append(item)
 
     if unexpected_addresses:
