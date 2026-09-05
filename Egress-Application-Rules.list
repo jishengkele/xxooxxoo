@@ -1,0 +1,1084 @@
+# Egress Application Rules
+# Catalog-Version: 2026.09.1
+# 用途：为 Incus/LXC 实例提供 AI 地区解锁及风险应用的精确分流目录。
+# 目录原则：只收录当前运营场景中的主流应用；每个应用只保留官方、第一方或应用专用域名。
+# 来源方法：优先官方网络文档与官方网站，社区规则仅用于交叉核对，并由生成器检查重复和跨应用域名覆盖。
+# 性能说明：导入目录不会解析全部应用；只有设置了策略的应用才进入 DNS 与 nftables。
+# 合规说明：所有应用本身均可用于合法目的，规则命中不代表用户违法或实施诈骗。
+# 规则类型：仅使用 DOMAIN、DOMAIN-SUFFIX、IP-CIDR、IP-CIDR6。
+# X 说明：显示名称采用 X（原 Twitter），同时保留仍在使用的 twitter.com、t.co、twimg.com 等域名。
+# OpenAI network recommendations: https://help.openai.com/en/articles/9247338
+# Google Gemini web app: https://support.google.com/gemini/answer/14886647
+# X Help: https://help.x.com/en/using-twitter/how-to-tweet-a-link.html
+# X video domain: https://help.x.com/en/using-x/x-videos
+# Telegram CIDR: https://core.telegram.org/resources/cidr.txt
+# Community cross-check: https://github.com/StricklandF/Filter/tree/main
+# Community cross-check: https://github.com/blackmatrix7/ios_rule_script/tree/master/rule
+# Generated: 2026-09-05
+# Rules: 251; categories: 7; applications: 97
+
+# ==============================================================================
+# 应用分类：人工智能与 AI 工具（10 个应用/规则集，44 条）
+# ==============================================================================
+
+# ############################################################################
+# 应用：OpenAI / ChatGPT（8 条）
+# APP-ID: openai_chatgpt
+# 来源：https://help.openai.com/en/articles/9247338
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（8 条）---
+DOMAIN-SUFFIX,ai.com
+DOMAIN-SUFFIX,chatgpt.com
+DOMAIN-SUFFIX,oaistatic.com
+DOMAIN-SUFFIX,oaistatsig.com
+DOMAIN-SUFFIX,oaiusercontent.com
+DOMAIN-SUFFIX,openai.com
+DOMAIN-SUFFIX,openaimerge.com
+DOMAIN-SUFFIX,sora.com
+
+# ############################################################################
+# 应用：Anthropic / Claude（7 条）
+# APP-ID: anthropic_claude
+# 来源：https://claude.ai/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（7 条）---
+DOMAIN-SUFFIX,anthropic.com
+DOMAIN-SUFFIX,clau.de
+DOMAIN-SUFFIX,claude.ai
+DOMAIN-SUFFIX,claude.com
+DOMAIN-SUFFIX,claudemcpclient.com
+DOMAIN-SUFFIX,claudemcpcontent.com
+DOMAIN-SUFFIX,claudeusercontent.com
+
+# ############################################################################
+# 应用：Google Gemini（11 条）
+# APP-ID: google_gemini
+# 来源：https://support.google.com/gemini/answer/14886647
+# ############################################################################
+
+# --- DOMAIN：精确域名（9 条）---
+DOMAIN,ai.google.dev
+DOMAIN,aistudio.google.com
+DOMAIN,alkalimakersuite-pa.clients6.google.com
+DOMAIN,bard.google.com
+DOMAIN,gemini.google.com
+DOMAIN,generativelanguage.googleapis.com
+DOMAIN,makersuite.google.com
+DOMAIN,notebooklm.google.com
+DOMAIN,proactivebackend-pa.googleapis.com
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,generativeai.google
+DOMAIN-SUFFIX,notebooklm.google
+
+# ############################################################################
+# 应用：Microsoft Copilot（4 条）
+# APP-ID: microsoft_copilot
+# 来源：https://copilot.microsoft.com/
+# ############################################################################
+
+# --- DOMAIN：精确域名（2 条）---
+DOMAIN,edgeservices.bing.com
+DOMAIN,sydney.bing.com
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,copilot.cloud.microsoft
+DOMAIN-SUFFIX,copilot.microsoft.com
+
+# ############################################################################
+# 应用：GitHub Copilot（3 条）
+# APP-ID: github_copilot
+# 来源：https://docs.github.com/en/copilot/reference/allowlist-reference
+# ############################################################################
+
+# --- DOMAIN：精确域名（2 条）---
+DOMAIN,api.githubcopilot.com
+DOMAIN,copilot-proxy.githubusercontent.com
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,githubcopilot.com
+
+# ############################################################################
+# 应用：Perplexity（2 条）
+# APP-ID: perplexity
+# 来源：https://www.perplexity.ai/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,perplexity.ai
+DOMAIN-SUFFIX,pplx.ai
+
+# ############################################################################
+# 应用：xAI / Grok（2 条）
+# APP-ID: xai_grok
+# 来源：https://grok.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,grok.com
+DOMAIN-SUFFIX,x.ai
+
+# ############################################################################
+# 应用：DeepSeek（2 条）
+# APP-ID: deepseek
+# 来源：https://www.deepseek.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,deepseek.ai
+DOMAIN-SUFFIX,deepseek.com
+
+# ############################################################################
+# 应用：Meta AI（1 条）
+# APP-ID: meta_ai
+# 来源：https://www.meta.ai/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,meta.ai
+
+# ############################################################################
+# 应用：Cursor（4 条）
+# APP-ID: cursor
+# 来源：https://www.cursor.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（4 条）---
+DOMAIN-SUFFIX,cursor-cdn.com
+DOMAIN-SUFFIX,cursor.com
+DOMAIN-SUFFIX,cursor.sh
+DOMAIN-SUFFIX,cursorapi.com
+
+# ==============================================================================
+# 应用分类：社交媒体与即时通讯（17 个应用/规则集，94 条）
+# ==============================================================================
+
+# ############################################################################
+# 应用：X（原 Twitter）（15 条）
+# APP-ID: x_twitter
+# 来源：https://help.x.com/en/using-twitter/how-to-tweet-a-link.html | https://help.x.com/en/using-x/x-videos
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（15 条）---
+DOMAIN-SUFFIX,periscope.tv
+DOMAIN-SUFFIX,pscp.tv
+DOMAIN-SUFFIX,t.co
+DOMAIN-SUFFIX,tweetdeck.com
+DOMAIN-SUFFIX,twimg.co
+DOMAIN-SUFFIX,twimg.com
+DOMAIN-SUFFIX,twitpic.com
+DOMAIN-SUFFIX,twitter.com
+DOMAIN-SUFFIX,twitteroauth.com
+DOMAIN-SUFFIX,twitterstat.us
+DOMAIN-SUFFIX,twtrdns.net
+DOMAIN-SUFFIX,twttr.com
+DOMAIN-SUFFIX,twttr.net
+DOMAIN-SUFFIX,twvid.com
+DOMAIN-SUFFIX,x.com
+
+# ############################################################################
+# 应用：Facebook / Messenger（8 条）
+# APP-ID: facebook_messenger
+# 来源：https://www.facebook.com/ | https://github.com/blackmatrix7/ios_rule_script/tree/master/rule/Clash/Facebook
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（8 条）---
+DOMAIN-SUFFIX,facebook.com
+DOMAIN-SUFFIX,facebook.net
+DOMAIN-SUFFIX,fb.com
+DOMAIN-SUFFIX,fb.me
+DOMAIN-SUFFIX,fbcdn.com
+DOMAIN-SUFFIX,fbcdn.net
+DOMAIN-SUFFIX,fbsbx.com
+DOMAIN-SUFFIX,messenger.com
+
+# ############################################################################
+# 应用：Instagram（3 条）
+# APP-ID: instagram
+# 来源：https://www.instagram.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（3 条）---
+DOMAIN-SUFFIX,cdninstagram.com
+DOMAIN-SUFFIX,instagr.am
+DOMAIN-SUFFIX,instagram.com
+
+# ############################################################################
+# 应用：Threads（1 条）
+# APP-ID: threads
+# 来源：https://www.threads.net/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,threads.net
+
+# ############################################################################
+# 应用：TikTok（7 条）
+# APP-ID: tiktok
+# 来源：https://www.tiktok.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（7 条）---
+DOMAIN-SUFFIX,ibytedtos.com
+DOMAIN-SUFFIX,muscdn.com
+DOMAIN-SUFFIX,musical.ly
+DOMAIN-SUFFIX,tiktok.com
+DOMAIN-SUFFIX,tiktokcdn-us.com
+DOMAIN-SUFFIX,tiktokcdn.com
+DOMAIN-SUFFIX,tiktokv.com
+
+# ############################################################################
+# 应用：Snapchat（4 条）
+# APP-ID: snapchat
+# 来源：https://www.snapchat.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（4 条）---
+DOMAIN-SUFFIX,sc-cdn.net
+DOMAIN-SUFFIX,snap.com
+DOMAIN-SUFFIX,snapchat.com
+DOMAIN-SUFFIX,snapkit.com
+
+# ############################################################################
+# 应用：WhatsApp（4 条）
+# APP-ID: whatsapp
+# 来源：https://www.whatsapp.com/ | https://github.com/StricklandF/Filter/blob/main/WhatsApp.list
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（4 条）---
+DOMAIN-SUFFIX,wa.me
+DOMAIN-SUFFIX,whatsapp.biz
+DOMAIN-SUFFIX,whatsapp.com
+DOMAIN-SUFFIX,whatsapp.net
+
+# ############################################################################
+# 应用：Telegram（21 条）
+# APP-ID: telegram
+# 来源：https://core.telegram.org/resources/cidr.txt
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（7 条）---
+DOMAIN-SUFFIX,t.me
+DOMAIN-SUFFIX,tdesktop.com
+DOMAIN-SUFFIX,telegra.ph
+DOMAIN-SUFFIX,telegram-cdn.org
+DOMAIN-SUFFIX,telegram.me
+DOMAIN-SUFFIX,telegram.org
+DOMAIN-SUFFIX,telesco.pe
+
+# --- IP-CIDR：IPv4 网段（9 条）---
+IP-CIDR,149.154.160.0/20,no-resolve
+IP-CIDR,185.76.151.0/24,no-resolve
+IP-CIDR,91.105.192.0/23,no-resolve
+IP-CIDR,91.108.12.0/22,no-resolve
+IP-CIDR,91.108.16.0/22,no-resolve
+IP-CIDR,91.108.20.0/22,no-resolve
+IP-CIDR,91.108.4.0/22,no-resolve
+IP-CIDR,91.108.56.0/22,no-resolve
+IP-CIDR,91.108.8.0/22,no-resolve
+
+# --- IP-CIDR6：IPv6 网段（5 条）---
+IP-CIDR6,2001:67c:4e8::/48,no-resolve
+IP-CIDR6,2001:b28:f23c::/48,no-resolve
+IP-CIDR6,2001:b28:f23d::/48,no-resolve
+IP-CIDR6,2001:b28:f23f::/48,no-resolve
+IP-CIDR6,2a0a:f280::/32,no-resolve
+
+# ############################################################################
+# 应用：Discord（8 条）
+# APP-ID: discord
+# 来源：https://discord.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（8 条）---
+DOMAIN-SUFFIX,dis.gd
+DOMAIN-SUFFIX,discord.com
+DOMAIN-SUFFIX,discord.gg
+DOMAIN-SUFFIX,discord.media
+DOMAIN-SUFFIX,discordapp.com
+DOMAIN-SUFFIX,discordapp.net
+DOMAIN-SUFFIX,discordcdn.com
+DOMAIN-SUFFIX,discordstatus.com
+
+# ############################################################################
+# 应用：Signal（4 条）
+# APP-ID: signal
+# 来源：https://signal.org/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（4 条）---
+DOMAIN-SUFFIX,signal.art
+DOMAIN-SUFFIX,signal.group
+DOMAIN-SUFFIX,signal.org
+DOMAIN-SUFFIX,whispersystems.org
+
+# ############################################################################
+# 应用：LINE（5 条）
+# APP-ID: line
+# 来源：https://line.me/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（5 条）---
+DOMAIN-SUFFIX,lin.ee
+DOMAIN-SUFFIX,line-apps.com
+DOMAIN-SUFFIX,line-cdn.net
+DOMAIN-SUFFIX,line-scdn.net
+DOMAIN-SUFFIX,line.me
+
+# ############################################################################
+# 应用：KakaoTalk（5 条）
+# APP-ID: kakaotalk
+# 来源：https://www.kakaocorp.com/page/service/service/KakaoTalk
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（5 条）---
+DOMAIN-SUFFIX,kakao.co.kr
+DOMAIN-SUFFIX,kakao.com
+DOMAIN-SUFFIX,kakaocdn.net
+DOMAIN-SUFFIX,kakaocorp.com
+DOMAIN-SUFFIX,kakaotalk.com
+
+# ############################################################################
+# 应用：Google Chat（2 条）
+# APP-ID: google_chat
+# 来源：https://chat.google.com/
+# ############################################################################
+
+# --- DOMAIN：精确域名（2 条）---
+DOMAIN,chat.google.com
+DOMAIN,chat.googleusercontent.com
+
+# ############################################################################
+# 应用：Zalo（2 条）
+# APP-ID: zalo
+# 来源：https://github.com/StricklandF/Filter/blob/main/Zalo.list
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,zalo.me
+DOMAIN-SUFFIX,zaloapp.com
+
+# ############################################################################
+# 应用：Viber（1 条）
+# APP-ID: viber
+# 来源：https://github.com/StricklandF/Filter/blob/main/Viber.list
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,viber.com
+
+# ############################################################################
+# 应用：imo（2 条）
+# APP-ID: imo
+# 来源：https://imo.im/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,imo.im
+DOMAIN-SUFFIX,imoapp.com
+
+# ############################################################################
+# 应用：BOTIM（2 条）
+# APP-ID: botim
+# 来源：https://botim.me/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,botim.com
+DOMAIN-SUFFIX,botim.me
+
+# ==============================================================================
+# 应用分类：交友与社交发现（12 个应用/规则集，21 条）
+# ==============================================================================
+
+# ############################################################################
+# 应用：Tinder（3 条）
+# APP-ID: tinder
+# 来源：https://tinder.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（3 条）---
+DOMAIN-SUFFIX,gotinder.com
+DOMAIN-SUFFIX,tinder.com
+DOMAIN-SUFFIX,tinderstatic.com
+
+# ############################################################################
+# 应用：Bumble（2 条）
+# APP-ID: bumble
+# 来源：https://bumble.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,bumble.com
+DOMAIN-SUFFIX,bumblecdn.com
+
+# ############################################################################
+# 应用：Hinge（2 条）
+# APP-ID: hinge
+# 来源：https://hinge.co/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,hinge.co
+DOMAIN-SUFFIX,hinge.com
+
+# ############################################################################
+# 应用：Badoo（2 条）
+# APP-ID: badoo
+# 来源：https://badoo.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,badoo.com
+DOMAIN-SUFFIX,badoocdn.com
+
+# ############################################################################
+# 应用：Tantan（1 条）
+# APP-ID: tantan
+# 来源：https://tantanapp.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,tantanapp.com
+
+# ############################################################################
+# 应用：Momo（1 条）
+# APP-ID: momo
+# 来源：https://www.immomo.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,immomo.com
+
+# ############################################################################
+# 应用：Soul（1 条）
+# APP-ID: soul
+# 来源：https://www.soulapp.cn/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,soulapp.cn
+
+# ############################################################################
+# 应用：Litmatch（1 条）
+# APP-ID: litmatch
+# 来源：https://www.litmatchapp.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,litmatchapp.com
+
+# ############################################################################
+# 应用：OkCupid（2 条）
+# APP-ID: okcupid
+# 来源：https://www.okcupid.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,okccdn.com
+DOMAIN-SUFFIX,okcupid.com
+
+# ############################################################################
+# 应用：Match（2 条）
+# APP-ID: match
+# 来源：https://www.match.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,match.com
+DOMAIN-SUFFIX,matchcdn.com
+
+# ############################################################################
+# 应用：Plenty of Fish（2 条）
+# APP-ID: plenty_of_fish
+# 来源：https://www.pof.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,plentyoffish.com
+DOMAIN-SUFFIX,pof.com
+
+# ############################################################################
+# 应用：Grindr（2 条）
+# APP-ID: grindr
+# 来源：https://www.grindr.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,grindr.com
+DOMAIN-SUFFIX,grindr.mobi
+
+# ==============================================================================
+# 应用分类：远程控制与技术支持工具（9 个应用/规则集，15 条）
+# ==============================================================================
+
+# ############################################################################
+# 应用：TeamViewer（3 条）
+# APP-ID: teamviewer
+# 来源：https://www.teamviewer.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（3 条）---
+DOMAIN-SUFFIX,teamviewer.cn
+DOMAIN-SUFFIX,teamviewer.com
+DOMAIN-SUFFIX,teamviewer.us
+
+# ############################################################################
+# 应用：AnyDesk（1 条）
+# APP-ID: anydesk
+# 来源：https://anydesk.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,anydesk.com
+
+# ############################################################################
+# 应用：RustDesk（1 条）
+# APP-ID: rustdesk
+# 来源：https://rustdesk.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,rustdesk.com
+
+# ############################################################################
+# 应用：ConnectWise ScreenConnect（2 条）
+# APP-ID: connectwise_screenconnect
+# 来源：https://screenconnect.connectwise.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,connectwise.com
+DOMAIN-SUFFIX,screenconnect.com
+
+# ############################################################################
+# 应用：Splashtop（2 条）
+# APP-ID: splashtop
+# 来源：https://www.splashtop.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,splashtop.com
+DOMAIN-SUFFIX,splashtop.eu
+
+# ############################################################################
+# 应用：LogMeIn / GoTo（3 条）
+# APP-ID: logmein_goto
+# 来源：https://www.goto.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（3 条）---
+DOMAIN-SUFFIX,goto.com
+DOMAIN-SUFFIX,gotomeeting.com
+DOMAIN-SUFFIX,logmein.com
+
+# ############################################################################
+# 应用：Zoho Assist（1 条）
+# APP-ID: zoho_assist
+# 来源：https://www.zoho.com/assist/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,zohoassist.com
+
+# ############################################################################
+# 应用：Chrome Remote Desktop（1 条）
+# APP-ID: chrome_remote_desktop
+# 来源：https://remotedesktop.google.com/
+# ############################################################################
+
+# --- DOMAIN：精确域名（1 条）---
+DOMAIN,remotedesktop.google.com
+
+# ############################################################################
+# 应用：Microsoft Quick Assist（1 条）
+# APP-ID: microsoft_quick_assist
+# 来源：https://learn.microsoft.com/en-us/windows/client-management/client-tools/quick-assist
+# ############################################################################
+
+# --- DOMAIN：精确域名（1 条）---
+DOMAIN,remoteassistance.support.services.microsoft.com
+
+# ==============================================================================
+# 应用分类：支付、汇款与数字银行（14 个应用/规则集，19 条）
+# ==============================================================================
+
+# ############################################################################
+# 应用：PayPal（3 条）
+# APP-ID: paypal
+# 来源：https://www.paypal.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（3 条）---
+DOMAIN-SUFFIX,paypal.com
+DOMAIN-SUFFIX,paypal.me
+DOMAIN-SUFFIX,paypalobjects.com
+
+# ############################################################################
+# 应用：Cash App（2 条）
+# APP-ID: cash_app
+# 来源：https://cash.app/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,cash.app
+DOMAIN-SUFFIX,cashapp.com
+
+# ############################################################################
+# 应用：Zelle（2 条）
+# APP-ID: zelle
+# 来源：https://www.zellepay.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,zelle.com
+DOMAIN-SUFFIX,zellepay.com
+
+# ############################################################################
+# 应用：Venmo（1 条）
+# APP-ID: venmo
+# 来源：https://venmo.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,venmo.com
+
+# ############################################################################
+# 应用：Wise / TransferWise（2 条）
+# APP-ID: wise_transferwise
+# 来源：https://wise.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,transferwise.com
+DOMAIN-SUFFIX,wise.com
+
+# ############################################################################
+# 应用：Revolut（1 条）
+# APP-ID: revolut
+# 来源：https://www.revolut.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,revolut.com
+
+# ############################################################################
+# 应用：Skrill（1 条）
+# APP-ID: skrill
+# 来源：https://www.skrill.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,skrill.com
+
+# ############################################################################
+# 应用：Neteller（1 条）
+# APP-ID: neteller
+# 来源：https://www.neteller.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,neteller.com
+
+# ############################################################################
+# 应用：Payoneer（1 条）
+# APP-ID: payoneer
+# 来源：https://www.payoneer.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,payoneer.com
+
+# ############################################################################
+# 应用：Western Union（1 条）
+# APP-ID: western_union
+# 来源：https://www.westernunion.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,westernunion.com
+
+# ############################################################################
+# 应用：MoneyGram（1 条）
+# APP-ID: moneygram
+# 来源：https://www.moneygram.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,moneygram.com
+
+# ############################################################################
+# 应用：Paysafecard（1 条）
+# APP-ID: paysafecard
+# 来源：https://www.paysafecard.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,paysafecard.com
+
+# ############################################################################
+# 应用：Remitly（1 条）
+# APP-ID: remitly
+# 来源：https://www.remitly.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,remitly.com
+
+# ############################################################################
+# 应用：Airwallex（1 条）
+# APP-ID: airwallex
+# 来源：https://www.airwallex.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,airwallex.com
+
+# ==============================================================================
+# 应用分类：加密货币交易所（17 个应用/规则集，34 条）
+# ==============================================================================
+
+# ############################################################################
+# 应用：Binance（含 Wallet / Pay）（6 条）
+# APP-ID: binance
+# 来源：https://github.com/StricklandF/Filter/blob/main/Binance.list
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（6 条）---
+DOMAIN-SUFFIX,binance.com
+DOMAIN-SUFFIX,binance.info
+DOMAIN-SUFFIX,binance.me
+DOMAIN-SUFFIX,binance.us
+DOMAIN-SUFFIX,bnbstatic.com
+DOMAIN-SUFFIX,bntrace.com
+
+# ############################################################################
+# 应用：Coinbase（含 Wallet / Payments）（2 条）
+# APP-ID: coinbase
+# 来源：https://www.coinbase.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,coinbase.com
+DOMAIN-SUFFIX,coinbaseassets.com
+
+# ############################################################################
+# 应用：OKX（含 Wallet）（2 条）
+# APP-ID: okx
+# 来源：https://github.com/blackmatrix7/ios_rule_script/tree/master/rule/Clash/OKX
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,okcoin.com
+DOMAIN-SUFFIX,okx.com
+
+# ############################################################################
+# 应用：Bybit（3 条）
+# APP-ID: bybit
+# 来源：https://www.bybit.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（3 条）---
+DOMAIN-SUFFIX,bybit.com
+DOMAIN-SUFFIX,bybitglobal.com
+DOMAIN-SUFFIX,bytick.com
+
+# ############################################################################
+# 应用：Bitget（含 Wallet）（2 条）
+# APP-ID: bitget
+# 来源：https://www.bitget.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,bitget.com
+DOMAIN-SUFFIX,bitgetapp.com
+
+# ############################################################################
+# 应用：HTX / Huobi（2 条）
+# APP-ID: htx_huobi
+# 来源：https://www.htx.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,htx.com
+DOMAIN-SUFFIX,huobi.com
+
+# ############################################################################
+# 应用：Kraken（2 条）
+# APP-ID: kraken
+# 来源：https://github.com/StricklandF/Filter/blob/main/Kraken.list
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,kraken.com
+DOMAIN-SUFFIX,kraken.tech
+
+# ############################################################################
+# 应用：KuCoin（2 条）
+# APP-ID: kucoin
+# 来源：https://www.kucoin.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,kucoin.com
+DOMAIN-SUFFIX,kucoin.plus
+
+# ############################################################################
+# 应用：Gate.io（2 条）
+# APP-ID: gate_io
+# 来源：https://www.gate.io/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,gate.com
+DOMAIN-SUFFIX,gate.io
+
+# ############################################################################
+# 应用：Crypto.com（含 Onchain / Pay）（2 条）
+# APP-ID: crypto_com
+# 来源：https://crypto.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,crypto.com
+DOMAIN-SUFFIX,crypto.org
+
+# ############################################################################
+# 应用：MEXC（2 条）
+# APP-ID: mexc
+# 来源：https://github.com/StricklandF/Filter/blob/main/MEXC.list
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,mexc.co
+DOMAIN-SUFFIX,mexc.com
+
+# ############################################################################
+# 应用：Gemini Exchange（1 条）
+# APP-ID: gemini_exchange
+# 来源：https://www.gemini.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,gemini.com
+
+# ############################################################################
+# 应用：Bitstamp（2 条）
+# APP-ID: bitstamp
+# 来源：https://www.bitstamp.net/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,bitstamp.com
+DOMAIN-SUFFIX,bitstamp.net
+
+# ############################################################################
+# 应用：Bitfinex（1 条）
+# APP-ID: bitfinex
+# 来源：https://www.bitfinex.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,bitfinex.com
+
+# ############################################################################
+# 应用：Upbit（1 条）
+# APP-ID: upbit
+# 来源：https://upbit.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,upbit.com
+
+# ############################################################################
+# 应用：Bithumb（1 条）
+# APP-ID: bithumb
+# 来源：https://www.bithumb.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,bithumb.com
+
+# ############################################################################
+# 应用：CoinEx（1 条）
+# APP-ID: coinex
+# 来源：https://www.coinex.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,coinex.com
+
+# ==============================================================================
+# 应用分类：加密货币钱包与链上应用（18 个应用/规则集，24 条）
+# ==============================================================================
+
+# ############################################################################
+# 应用：MetaMask（1 条）
+# APP-ID: metamask
+# 来源：https://metamask.io/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,metamask.io
+
+# ############################################################################
+# 应用：Trust Wallet（1 条）
+# APP-ID: trust_wallet
+# 来源：https://github.com/StricklandF/Filter/blob/main/TrustWallet.list
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,trustwallet.com
+
+# ############################################################################
+# 应用：TronLink（2 条）
+# APP-ID: tronlink
+# 来源：https://www.tronlink.org/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,tronlink.info
+DOMAIN-SUFFIX,tronlink.org
+
+# ############################################################################
+# 应用：Phantom（2 条）
+# APP-ID: phantom
+# 来源：https://phantom.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,phantom.app
+DOMAIN-SUFFIX,phantom.com
+
+# ############################################################################
+# 应用：Ledger（2 条）
+# APP-ID: ledger
+# 来源：https://www.ledger.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,ledger.com
+DOMAIN-SUFFIX,ledgerwallet.com
+
+# ############################################################################
+# 应用：Trezor（1 条）
+# APP-ID: trezor
+# 来源：https://trezor.io/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,trezor.io
+
+# ############################################################################
+# 应用：Exodus（1 条）
+# APP-ID: exodus
+# 来源：https://www.exodus.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,exodus.com
+
+# ############################################################################
+# 应用：Blockchain.com（2 条）
+# APP-ID: blockchain_com
+# 来源：https://www.blockchain.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,blockchain.com
+DOMAIN-SUFFIX,blockchain.info
+
+# ############################################################################
+# 应用：TokenPocket（1 条）
+# APP-ID: tokenpocket
+# 来源：https://www.tokenpocket.pro/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,tokenpocket.pro
+
+# ############################################################################
+# 应用：imToken（2 条）
+# APP-ID: imtoken
+# 来源：https://token.im/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,imtoken.com
+DOMAIN-SUFFIX,token.im
+
+# ############################################################################
+# 应用：Safe / Gnosis Safe（2 条）
+# APP-ID: safe_gnosis_safe
+# 来源：https://safe.global/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（2 条）---
+DOMAIN-SUFFIX,gnosis-safe.io
+DOMAIN-SUFFIX,safe.global
+
+# ############################################################################
+# 应用：Uniswap（1 条）
+# APP-ID: uniswap
+# 来源：https://uniswap.org/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,uniswap.org
+
+# ############################################################################
+# 应用：PancakeSwap（1 条）
+# APP-ID: pancakeswap
+# 来源：https://pancakeswap.finance/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,pancakeswap.finance
+
+# ############################################################################
+# 应用：1inch（1 条）
+# APP-ID: oneinch
+# 来源：https://1inch.io/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,1inch.io
+
+# ############################################################################
+# 应用：BitPay（1 条）
+# APP-ID: bitpay
+# 来源：https://bitpay.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,bitpay.com
+
+# ############################################################################
+# 应用：MoonPay（1 条）
+# APP-ID: moonpay
+# 来源：https://www.moonpay.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,moonpay.com
+
+# ############################################################################
+# 应用：Ramp Network（1 条）
+# APP-ID: ramp_network
+# 来源：https://ramp.network/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,ramp.network
+
+# ############################################################################
+# 应用：Transak（1 条）
+# APP-ID: transak
+# 来源：https://transak.com/
+# ############################################################################
+
+# --- DOMAIN-SUFFIX：域名后缀（1 条）---
+DOMAIN-SUFFIX,transak.com
+
