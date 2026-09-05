@@ -4156,54 +4156,126 @@ print(name[:48].strip(".-_") or ("%s-%s" % (prefix, digest)))
 PY
 }
 
-parse_ss_link() {
-    local link="$1"
-    python3 - "$link" <<'PY'
+ss_node_info() {
+    # Share credential validation between link import, manual input and replacement.
+    # Never include the supplied link/password in errors.
+    python3 - "$@" <<'PY'
 import base64
+import binascii
 import sys
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
-link = sys.argv[1].strip()
-if not link.startswith("ss://"):
-    raise SystemExit("不是有效的 ss:// 链接")
+KEY_SIZES = {
+    "2022-blake3-aes-128-gcm": 16,
+    "2022-blake3-aes-256-gcm": 32,
+    "2022-blake3-chacha20-poly1305": 32,
+}
+# Keep the other methods accepted by the pinned sing-box 1.13.21 core available
+# for existing users; the interactive menu highlights the six tested variants.
+METHODS = set(KEY_SIZES) | {
+    "none", "aes-128-gcm", "aes-192-gcm", "aes-256-gcm",
+    "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305",
+    "aes-128-ctr", "aes-192-ctr", "aes-256-ctr",
+    "aes-128-cfb", "aes-192-cfb", "aes-256-cfb",
+    "rc4-md5", "chacha20-ietf", "xchacha20",
+}
 
-fragment = ""
-if "#" in link:
-    link, fragment = link.split("#", 1)
-    fragment = unquote(fragment)
+class NodeError(Exception):
+    pass
 
-body = link[5:]
-method = password = host = port = ""
+def has_control(value):
+    return any(ord(char) < 32 or ord(char) == 127 for char in value)
+
+def validate_credentials(method, password):
+    if method not in METHODS:
+        raise NodeError("SS 加密方式无效或不受固定核心 1.13.21 支持。")
+    if not password:
+        raise NodeError("SS 密码/密钥不能为空。")
+    if has_control(password):
+        raise NodeError("SS 密码/密钥不能包含制表符、换行或其他控制字符。")
+    if method not in KEY_SIZES:
+        return
+    keys = password.split(":")
+    if method == "2022-blake3-chacha20-poly1305" and len(keys) != 1:
+        raise NodeError("SS2022 ChaCha20 仅支持单组密钥，不支持冒号分隔的身份密钥链。")
+    for key in keys:
+        try:
+            decoded = base64.b64decode(key, validate=True)
+        except (ValueError, binascii.Error):
+            raise NodeError("SS2022 密钥必须是标准 Base64 编码（保留末尾的 =），不能填写普通密码。") from None
+        if len(decoded) != KEY_SIZES[method]:
+            raise NodeError("该 SS2022 加密方式要求每组密钥 Base64 解码后为 %d 字节。" % KEY_SIZES[method])
 
 def b64decode_text(value):
-    value = value.replace("-", "+").replace("_", "/")
-    value += "=" * (-len(value) % 4)
-    return base64.b64decode(value).decode()
+    try:
+        value += "=" * (-len(value) % 4)
+        return base64.b64decode(value, altchars=b"-_", validate=True).decode("utf-8")
+    except (ValueError, UnicodeError, binascii.Error):
+        raise NodeError("SS 链接的 Base64 用户信息或完整节点编码无效。") from None
 
-if "@" in body:
-    userinfo_b64, server = body.rsplit("@", 1)
-    userinfo = b64decode_text(userinfo_b64)
-    if ":" not in userinfo:
-        raise SystemExit("SS 用户信息缺少 method:password")
-    method, password = userinfo.split(":", 1)
-    if server.startswith("["):
-        host, rest = server[1:].split("]", 1)
-        port = rest.lstrip(":").split("?", 1)[0]
+def reject_plugin(query):
+    if any(parse_qs(query, keep_blank_values=True).get("plugin", [])):
+        raise NodeError("当前 SS 出口尚不支持 plugin 混淆/传输插件，不能忽略插件参数导入。")
+
+def parse_link(link):
+    link = link.strip()
+    if not link.startswith("ss://"):
+        raise NodeError("不是有效的 ss:// 链接。")
+    body, _, fragment = link[5:].partition("#")
+    body, _, query = body.partition("?")
+    reject_plugin(query)
+    if "@" in body:
+        userinfo, server = body.rsplit("@", 1)
+        # SIP002 uses percent-encoded method:password for AEAD-2022. Also
+        # accept Base64 userinfo emitted by existing node exporters.
+        userinfo = unquote(userinfo, errors="strict")
+        if ":" not in userinfo:
+            userinfo = b64decode_text(userinfo)
     else:
-        host, port = server.rsplit(":", 1)
-        port = port.split("?", 1)[0]
-else:
-    decoded = b64decode_text(body)
-    if "@" not in decoded:
-        raise SystemExit("SS 链接缺少服务器信息")
-    userinfo, server = decoded.rsplit("@", 1)
+        decoded = b64decode_text(body)
+        if "@" not in decoded:
+            raise NodeError("SS 链接缺少服务器信息。")
+        userinfo, server = decoded.rsplit("@", 1)
+    if ":" not in userinfo:
+        raise NodeError("SS 用户信息缺少 method:password。")
     method, password = userinfo.split(":", 1)
-    host, port = server.rsplit(":", 1)
-    port = port.split("?", 1)[0]
+    validate_credentials(method, password)
+    if has_control(server):
+        raise NodeError("SS 服务器地址不能包含控制字符。")
+    parts = urlsplit("//" + server)
+    reject_plugin(parts.query)
+    if parts.username is not None or parts.fragment or parts.path not in ("", "/"):
+        raise NodeError("SS 服务器信息无效；仅允许地址、端口和可选的末尾 /。")
+    host, port = parts.hostname, parts.port
+    if not host or not port or any(char.isspace() for char in host):
+        raise NodeError("SS 链接缺少有效地址或端口（1-65535）。")
+    # TSV is the interface to Bash. Keep the display name in one field, and
+    # preserve password punctuation/colons exactly rather than shifting fields.
+    display = " ".join(unquote(fragment, errors="strict").split()) or host.replace(".", "-")
+    if has_control(display):
+        raise NodeError("SS 节点名称不能包含控制字符。")
+    return [display, method, password, host, str(port)]
 
-display = fragment or host.replace(".", "-")
-print("\t".join([display, method, password, host, port]))
+try:
+    if sys.argv[1] == "credentials":
+        validate_credentials(sys.argv[2], sys.argv[3])
+    elif sys.argv[1] == "link":
+        print("\t".join(parse_link(sys.argv[2])))
+    else:
+        raise NodeError("SS 节点处理模式无效。")
+except NodeError as exc:
+    raise SystemExit(str(exc)) from None
+except (ValueError, UnicodeError, IndexError):
+    raise SystemExit("SS 链接格式无效，请检查地址、端口和 URL 编码。") from None
 PY
+}
+
+parse_ss_link() {
+    ss_node_info link "$1"
+}
+
+validate_ss_credentials() {
+    ss_node_info credentials "${1:-}" "${2:-}"
 }
 
 parse_socks_link() {
@@ -5339,18 +5411,17 @@ start_proxy_exit() {
 
 add_ss_exit_values() {
     need_root
-    load_config
-    write_default_config
     need_cmd python3
-    need_cmd systemctl
-    need_cmd ip
     local display="$1" method="$2" password="$3" server="$4" port="$5" name="${6:-}" idx mark table tun existing
     display="$(normalize_display_name "$display")"
     server="$(normalize_proxy_host "$server")"
     valid_proxy_host "$server" || die "SS 地址无效，请填写纯 IP 或域名/DDNS，不要带协议、端口或路径: $server"
-    [ -n "$method" ] || die "SS 加密方式不能为空。"
-    [ -n "$password" ] || die "SS 密码不能为空。"
+    validate_ss_credentials "$method" "$password" || die "SS 密码/密钥校验失败，未添加或替换出口。"
     validate_port "$port" || die "SS 端口无效: $port"
+    load_config
+    write_default_config
+    need_cmd systemctl
+    need_cmd ip
     existing="$(exit_name_by_display "$display")"
     if [ -n "$existing" ]; then
         if replace_exit_duplicate_action "$existing" "$display"; then
@@ -6929,6 +7000,9 @@ replace_proxy_exit_in_place() {
     local name="$1" protocol="$2" display="$3" server="$4" port="$5" method="${6:-}" password="${7:-}" username="${8:-}"
     local row mark table route4 route6 tun service
     need_root
+    if [ "$protocol" = "shadowsocks" ]; then
+        validate_ss_credentials "$method" "$password" || die "SS 密码/密钥校验失败，原出口未改动。"
+    fi
     load_config
     write_default_config
     row="$(exit_row "$name")"
@@ -13190,10 +13264,25 @@ prompt_optional_secret() {
 }
 
 prompt_ss_method() {
-    local method
-    printf '常用加密方式: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305\n' >&2
-    method="$(prompt_default "请输入加密方式名称" "chacha20-ietf-poly1305")"
-    printf '%s\n' "$method"
+    local choice
+    printf '%s\n' \
+        '请选择 SS 加密方式（也可直接输入其他核心支持的加密方式名称）：' \
+        '  1. SS AEAD      aes-128-gcm' \
+        '  2. SS AEAD      aes-256-gcm' \
+        '  3. SS AEAD      chacha20-ietf-poly1305（默认）' \
+        '  4. SS2022       2022-blake3-aes-128-gcm' \
+        '  5. SS2022       2022-blake3-aes-256-gcm' \
+        '  6. SS2022       2022-blake3-chacha20-poly1305' >&2
+    choice="$(prompt_default "加密方式编号或名称" "3")"
+    case "$choice" in
+        1) printf 'aes-128-gcm\n' ;;
+        2) printf 'aes-256-gcm\n' ;;
+        3) printf 'chacha20-ietf-poly1305\n' ;;
+        4) printf '2022-blake3-aes-128-gcm\n' ;;
+        5) printf '2022-blake3-aes-256-gcm\n' ;;
+        6) printf '2022-blake3-chacha20-poly1305\n' ;;
+        *) printf '%s\n' "$choice" ;;
+    esac
 }
 
 confirm_yes() {
@@ -13405,8 +13494,8 @@ interactive_add_proxy_exit() {
     load_config
     write_default_config
     printf '\n请选择要添加的出口类型:\n'
-    printf '  1. SS 链接导入\n'
-    printf '  2. SS 手动输入\n'
+    printf '  1. SS / SS2022 链接导入\n'
+    printf '  2. SS / SS2022 手动输入\n'
     printf '  3. SK5 链接导入\n'
     printf '  4. SK5 手动输入\n'
     printf '  5. VLESS+TCP 链接导入\n'
@@ -13418,7 +13507,7 @@ interactive_add_proxy_exit() {
     case "$choice" in
         0) return 0 ;;
         1)
-            printf '\n请粘贴 SS 节点链接，格式类似 ss://...#名称。\n'
+            printf '\n请粘贴 SS / SS2022 节点链接，格式类似 ss://...#名称。\n'
             link="$(prompt_required "SS 节点链接")"
             parsed=$(parse_ss_link "$link") || { warn "SS 链接解析失败。"; pause_screen; return 0; }
             # 链接导入时直接采用节点链接 # 后面的名称；没有 # 名称时解析器会用地址生成兜底名称。
@@ -13431,8 +13520,16 @@ interactive_add_proxy_exit() {
             name="$(prompt_exit_name "自定义出口显示名，容器里 out use 会用这个名字，例如 美国-SS")"
             server="$(prompt_proxy_host "地址 / DDNS 域名")"
             port="$(prompt_proxy_port "端口")"
-            password="$(prompt_required_secret "密码")"
             method="$(prompt_ss_method)"
+            case "$method" in
+                2022-blake3-aes-128-gcm)
+                    printf '请输入服务端提供的 Base64 密钥（每组解码后 16 字节），不要填写普通密码。\n' >&2
+                    ;;
+                2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305)
+                    printf '请输入服务端提供的 Base64 密钥（每组解码后 32 字节），不要填写普通密码。\n' >&2
+                    ;;
+            esac
+            password="$(prompt_required_secret "密码 / SS2022 Base64 密钥")"
             add_ss_exit_values "$name" "$method" "$password" "$server" "$port"
             ;;
         3)
@@ -16070,8 +16167,9 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       安装宿主机基础依赖、控制器和 API 服务；不会扫描或接管容器。
 
   $0 add-ss 'ss://...#name'
-      添加一个 Shadowsocks 节点出口；链接导入会使用 # 后面解析出的节点名称。
+      添加 SS AEAD / Shadowsocks 2022 节点出口；链接导入会使用 # 后面解析出的节点名称。
       手动添加可写: add-ss 自定义名称 地址/DDNS域名 端口 密码 [加密方式]
+      SS2022 密码字段填写服务端 Base64 密钥；支持 AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305 三种 2022 方法。
       添加出口只写入并启动出口信息，不会自动同步容器；需要同步请执行 sync-enable。
 
   $0 add-sk5 socks5://user:pass@host:port#name
