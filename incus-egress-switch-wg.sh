@@ -62,7 +62,7 @@ SPLIT_DNS_SIDECAR_SERVICE_PREFIX="$APP_NAME-dns-sidecar"
 UPDATE_BACKUP_ROOT="${EGRESS_UPDATE_BACKUP_ROOT:-/var/backups/$APP_NAME}"
 LAST_UPDATE_FILE="$CONFIG_DIR/last-update.tsv"
 DEFAULT_UPDATE_SCRIPT_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/incus-egress-switch-wg.sh"
-DEFAULT_SPLIT_RULE_BUNDLE_URL="https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Egress-Application-Rules.list"
+DEFAULT_SPLIT_RULE_BUNDLE_URL="https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Egress-Application-Rules.list"
 PROXY_TUN_MTU=1400
 PROXY_DIRECT_APP_ID="__proxy_direct"
 # Google 的 Gemini 与 YouTube 移动端 API 会返回重叠的共享前端 IP。
@@ -1709,7 +1709,7 @@ is_legacy_default_split_rule_url() {
         "https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Scam-Abuse-Risk.list" | \
         "https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Scam-Abuse-Core.list" | \
         "https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Scam-Abuse-Core.list" | \
-        "https://raw.githubusercontent.com/jishengkele/xxooxxoo/main/Egress-Application-Rules.list")
+        "https://raw.githubusercontent.com/0xdabiaoge/VPS-Tool/main/Egress-Application-Rules.list")
             return 0
             ;;
         *)
@@ -1724,7 +1724,7 @@ migrate_default_split_rule_url() {
     current="$(awk -F '=' '
         $1 == "SPLIT_RULE_BUNDLE_URL" {
             value = substr($0, index($0, "=") + 1)
-            gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", value)
+            gsub(/^[[:space:]"\047]+|[[:space:]"\047]+$/, "", value)
             print value
             exit
         }
