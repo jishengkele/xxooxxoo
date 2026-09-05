@@ -2108,7 +2108,7 @@ require_split_only_targets() {
     local list="${1:-}" item
     while IFS= read -r item; do
         [ "$item" = "-" ] && continue
-        is_split_only_exit "$item" || die "出口 '$(display_exit_name "$item")' 不是分流专用出口；普通应用/分类分流只能选择在分流管理添加的出口。"
+        is_split_only_exit "$item" || die "出口 '$(display_exit_name "$item")' 不是分流专用出口；应用/分类分流只能选择入口机直出或在分流管理添加的专用出口。"
     done < <(split_target_list_each "$list")
 }
 
@@ -14122,7 +14122,7 @@ choose_split_categories() {
 }
 
 split_target_candidate_rows() {
-    # scope: all | split-only；输出 内部ID<TAB>显示名（不含入口机行）
+    # scope: all | split-only | normal；输出 内部ID<TAB>显示名（不含入口机行）
     local scope="${1:-all}" name display
     read_exit_rows | while IFS=$'\t' read -r name _mark _table _r4 _r6 display; do
         [ -n "$name" ] || continue
@@ -14159,19 +14159,12 @@ choose_split_target() {
     [ -n "$out_file" ] || return 1
     tmp="$(mktemp)"
     split_target_candidate_rows "$scope" > "$tmp"
-    if [ ! -s "$tmp" ] && { [ "$scope" = "split-only" ] || [ "$scope" = "normal" ]; }; then
-        rm -f "$tmp"
-        case "$scope" in
-            split-only) warn "暂无分流专用出口，请先在分流管理选择 18 添加。" ;;
-            normal) warn "暂无普通出口（当前出口均为分流专用出口），请先通过 [3] 添加出口。" ;;
-        esac
-        return 1
-    fi
+    # 入口机直出是内置目标，不依赖已添加出口；候选节点为空也必须保留选择入口。
     printf '\n请选择%s:\n' "$prompt_label"
     if [ "$scope" = "split-only" ]; then
-        printf '  （仅列出分流专用出口；普通应用/分类分流只能使用分流专用出口）\n'
+        printf '  （可选入口机直出或分流专用出口；无需先添加节点）\n'
     elif [ "$scope" = "normal" ]; then
-        printf '  （仅列出实例出口；分流专用出口不会出现在本列表）\n'
+        printf '  （可选入口机直出或实例出口；分流专用出口不会出现在本列表）\n'
     fi
     printf '  0. 返回上一步\n'
     printf '  1. 入口机直出\n'
@@ -14190,7 +14183,7 @@ choose_split_target() {
             if [ -n "$target" ] && [ "$target" != "-" ]; then
                 if [ "$scope" = "split-only" ] && ! is_split_only_exit "$target"; then
                     rm -f "$tmp"
-                    warn "出口 '$(display_exit_name "$target")' 不是分流专用出口，普通分流只能选择分流专用出口。"
+                    warn "出口 '$(display_exit_name "$target")' 不是分流专用出口，普通分流只能选择入口机直出或分流专用出口。"
                     return 1
                 fi
                 if [ "$scope" = "normal" ] && is_split_only_exit "$target"; then
@@ -14216,19 +14209,12 @@ choose_split_targets() {
         printf -- '-\t入口机直出\n'
         split_target_candidate_rows "$scope"
     } > "$tmp"
-    if { [ "$scope" = "split-only" ] || [ "$scope" = "normal" ]; } && [ "$(awk 'NR > 1' "$tmp" | wc -l)" -eq 0 ]; then
-        rm -f "$tmp"
-        case "$scope" in
-            split-only) warn "暂无分流专用出口，请先在分流管理选择 18 添加。" ;;
-            normal) warn "暂无普通出口（当前出口均为分流专用出口），请先通过 [3] 添加出口。" ;;
-        esac
-        return 1
-    fi
+    # 第一行始终是入口机直出；只有这一行时仍是有效候选列表。
     printf '\n请选择%s:\n' "$prompt_label"
     if [ "$scope" = "split-only" ]; then
-        printf '  （仅列出分流专用出口；普通应用/分类分流只能使用分流专用出口）\n'
+        printf '  （可选入口机直出或分流专用出口；无需先添加节点）\n'
     elif [ "$scope" = "normal" ]; then
-        printf '  （仅列出实例出口；分流专用出口不会出现在本列表）\n'
+        printf '  （可选入口机直出或实例出口；分流专用出口不会出现在本列表）\n'
     fi
     printf '  0. 返回上一步\n'
     i=1
@@ -14253,7 +14239,7 @@ choose_split_targets() {
         if [ -n "$target" ] && [ "$target" != "-" ]; then
             if [ "$scope" = "split-only" ] && ! is_split_only_exit "$target"; then
                 rm -f "$tmp"
-                warn "出口 '$(display_exit_name "$target")' 不是分流专用出口，普通分流只能选择分流专用出口。"
+                warn "出口 '$(display_exit_name "$target")' 不是分流专用出口，普通分流只能选择入口机直出或分流专用出口。"
                 return 1
             fi
             if [ "$scope" = "normal" ] && is_split_only_exit "$target"; then
@@ -14360,7 +14346,7 @@ interactive_split_set_app() {
     app_file="/tmp/incus-egress-split-app.$$"
     target_file="/tmp/incus-egress-split-target.$$"
     choose_split_app "$app_file" || { rm -f "$app_file" "$target_file"; return 0; }
-    choose_split_targets "$target_file" "应用候选出口（仅分流专用出口）" split-only || { rm -f "$app_file" "$target_file"; return 0; }
+    choose_split_targets "$target_file" "应用候选出口（入口机直出或分流专用出口）" split-only || { rm -f "$app_file" "$target_file"; return 0; }
     app="$(cat "$app_file")"
     target="$(cat "$target_file")"
     rm -f "$app_file" "$target_file"
@@ -14372,7 +14358,7 @@ interactive_split_set_category() {
     category_file="/tmp/incus-egress-split-category.$$"
     target_file="/tmp/incus-egress-split-target.$$"
     choose_split_category "$category_file" || { rm -f "$category_file" "$target_file"; return 0; }
-    choose_split_targets "$target_file" "分类候选出口（仅分流专用出口）" split-only || { rm -f "$category_file" "$target_file"; return 0; }
+    choose_split_targets "$target_file" "分类候选出口（入口机直出或分流专用出口）" split-only || { rm -f "$category_file" "$target_file"; return 0; }
     category="$(cat "$category_file")"
     target="$(cat "$target_file")"
     rm -f "$category_file" "$target_file"
@@ -14402,7 +14388,7 @@ interactive_split_force_app() {
     app_file="/tmp/incus-egress-force-app.$$"
     target_file="/tmp/incus-egress-force-target.$$"
     choose_split_app "$app_file" || { rm -f "$app_file" "$target_file"; return 0; }
-    choose_split_target "$target_file" "强制分流目标（仅分流专用出口）" split-only || { rm -f "$app_file" "$target_file"; return 0; }
+    choose_split_target "$target_file" "强制分流目标（入口机直出或分流专用出口）" split-only || { rm -f "$app_file" "$target_file"; return 0; }
     app="$(cat "$app_file")"
     target="$(cat "$target_file")"
     rm -f "$app_file" "$target_file"
@@ -14414,7 +14400,7 @@ interactive_split_force_category() {
     category_file="/tmp/incus-egress-force-category.$$"
     target_file="/tmp/incus-egress-force-target.$$"
     choose_split_categories "$category_file" || { rm -f "$category_file" "$target_file"; return 0; }
-    choose_split_target "$target_file" "强制分类目标（仅分流专用出口）" split-only || { rm -f "$category_file" "$target_file"; return 0; }
+    choose_split_target "$target_file" "强制分类目标（入口机直出或分流专用出口）" split-only || { rm -f "$category_file" "$target_file"; return 0; }
     category="$(cat "$category_file")"
     target="$(cat "$target_file")"
     rm -f "$category_file" "$target_file"
@@ -14444,7 +14430,7 @@ interactive_split_force_on_exit_app() {
     app_file="/tmp/incus-egress-force-source-app.$$"; source_file="/tmp/incus-egress-force-source.$$"; target_file="/tmp/incus-egress-force-target.$$"
     choose_split_apps "$app_file" || { rm -f "$app_file" "$source_file" "$target_file"; return 0; }
     choose_split_targets "$source_file" "来源出口（实例出口，可多选）" normal || { rm -f "$app_file" "$source_file" "$target_file"; return 0; }
-    choose_split_target "$target_file" "强制分流目标（单选，仅分流专用出口）" split-only || { rm -f "$app_file" "$source_file" "$target_file"; return 0; }
+    choose_split_target "$target_file" "强制分流目标（单选，入口机直出或分流专用出口）" split-only || { rm -f "$app_file" "$source_file" "$target_file"; return 0; }
     app="$(cat "$app_file")"; source="$(cat "$source_file")"; target="$(cat "$target_file")"
     rm -f "$app_file" "$source_file" "$target_file"
     split_force_on_exit_policy "$app" "$source" "$target"
@@ -14455,7 +14441,7 @@ interactive_split_force_on_exit_category() {
     category_file="/tmp/incus-egress-force-source-category.$$"; source_file="/tmp/incus-egress-force-source.$$"; target_file="/tmp/incus-egress-force-target.$$"
     choose_split_categories "$category_file" || { rm -f "$category_file" "$source_file" "$target_file"; return 0; }
     choose_split_targets "$source_file" "来源出口（实例出口，可多选）" normal || { rm -f "$category_file" "$source_file" "$target_file"; return 0; }
-    choose_split_target "$target_file" "强制分流目标（单选，仅分流专用出口）" split-only || { rm -f "$category_file" "$source_file" "$target_file"; return 0; }
+    choose_split_target "$target_file" "强制分流目标（单选，入口机直出或分流专用出口）" split-only || { rm -f "$category_file" "$source_file" "$target_file"; return 0; }
     category="$(cat "$category_file")"; source="$(cat "$source_file")"; target="$(cat "$target_file")"
     rm -f "$category_file" "$source_file" "$target_file"
     split_force_category_on_exit_policy "$category" "$source" "$target"
