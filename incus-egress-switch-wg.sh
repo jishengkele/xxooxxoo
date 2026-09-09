@@ -1126,7 +1126,7 @@ write_default_split_apps() {
     if [ ! -f "$SPLIT_APPS_FILE" ]; then
         cat > "$SPLIT_APPS_FILE" <<'EOF'
 # app_id  显示名  分类  GitHub目录  启用
-# 请先在“分流管理”执行 1. 同步应用目录。
+# 请先在“分流管理”执行 2 -> 1. 同步应用目录。
 # GitHub 应用会由脚本自动发现；自定义规则会以 custom: 前缀保存，不会被更新覆盖。
 EOF
         chmod 600 "$SPLIT_APPS_FILE"
@@ -8198,7 +8198,7 @@ split_catalog_ready() {
 
 split_require_catalog() {
     split_catalog_ready && return 0
-    die "尚未同步应用目录。请先进入“分流管理”选择 1，或执行: $0 split-fetch"
+    die "尚未同步应用目录。请先进入“分流管理”选择 2 -> 1，或执行: $0 split-fetch"
 }
 
 split_parse_policy_apps() {
@@ -8922,7 +8922,7 @@ split_sync() {
         if [ "$mode" = "--auto" ]; then
             return 0
         fi
-        die "尚未同步应用目录。请先进入“分流管理”选择 1，或执行: $0 split-fetch"
+        die "尚未同步应用目录。请先进入“分流管理”选择 2 -> 1，或执行: $0 split-fetch"
     fi
     now="$(date +%s)"
     if [ "$mode" = "--auto" ] && [ -f "$SPLIT_LAST_SYNC_FILE" ]; then
@@ -9916,7 +9916,7 @@ split_list() {
     if split_catalog_ready; then
         printf '应用目录: 已同步\n'
     else
-        printf '应用目录: 未同步，请先执行“分流管理 -> 1. 同步应用目录”。\n'
+        printf '应用目录: 未同步，请先执行“分流管理 -> 2. 应用目录与规则更新 -> 1. 同步应用目录”。\n'
     fi
     if [ -f "$SPLIT_CATALOG_FILE" ]; then
         printf '目录同步: %s\n' "$(date -d "@$(cat "$SPLIT_CATALOG_FILE" 2>/dev/null || printf 0)" '+%F %T' 2>/dev/null || cat "$SPLIT_CATALOG_FILE")"
@@ -13947,7 +13947,7 @@ choose_split_app() {
     local out_file="$1" tmp all_tmp cat_tmp filter_tmp pick target i app display category remote enabled selected_category
     [ -n "$out_file" ] || return 1
     if ! split_catalog_ready; then
-        warn "尚未同步应用目录，请先在分流管理选择 1。"
+        warn "尚未同步应用目录，请先在分流管理选择 2 -> 1。"
         return 1
     fi
     all_tmp="$(mktemp)"
@@ -14017,7 +14017,7 @@ choose_split_category() {
     local out_file="$1" tmp pick target i
     [ -n "$out_file" ] || return 1
     if ! split_catalog_ready; then
-        warn "尚未同步应用目录，请先在分流管理选择 1。"
+        warn "尚未同步应用目录，请先在分流管理选择 2 -> 1。"
         return 1
     fi
     tmp="$(mktemp)"
@@ -14044,7 +14044,7 @@ choose_split_category_or_custom() {
     local out_file="$1" tmp pick target i category app_count manual_idx
     [ -n "$out_file" ] || return 1
     if ! split_catalog_ready; then
-        warn "尚未同步应用目录，请先在分流管理选择 1。"
+        warn "尚未同步应用目录，请先在分流管理选择 2 -> 1。"
         return 1
     fi
     tmp="$(mktemp)"
@@ -14470,7 +14470,7 @@ interactive_split_force_on_exit_clear_category() {
 interactive_split_add_custom() {
     local display category category_file tmp line
     if ! split_catalog_ready; then
-        warn "尚未同步应用目录，请先选择 1 同步应用目录。"
+        warn "尚未同步应用目录，请先选择 2 -> 1 同步应用目录。"
         return 0
     fi
     display="$(prompt_required "请输入自定义应用名，例如: 公司后台")"
@@ -14553,7 +14553,7 @@ print_split_header() {
  按类型应用数量:
 EOF
     if ! split_catalog_ready; then
-        printf '  尚未同步应用目录，请先选择 1 同步应用目录。\n'
+        printf '  尚未同步应用目录，请先选择 2 -> 1 同步应用目录。\n'
         printf '%s\n' '============================================================'
         return 0
     fi
@@ -14612,53 +14612,196 @@ EOF
     printf '%s\n' '============================================================'
 }
 
-interactive_split_menu() {
+print_split_menu_summary() {
+    local total categories app_policies category_policies force_apps force_categories force_on_exit force_category_on_exit split_exits
+    local catalog_sync rule_sync catalog_state
+    total="$(read_split_apps | awk 'END {print NR + 0}')"
+    categories="$(read_split_apps | awk -F '\t' '{seen[$3]=1} END {n=0; for (c in seen) n++; print n+0}')"
+    app_policies="$(read_split_policies | awk 'END {print NR + 0}')"
+    category_policies="$(read_split_category_policies | awk 'END {print NR + 0}')"
+    force_apps="$(read_force_split_policies | awk 'END {print NR + 0}')"
+    force_categories="$(read_force_split_category_policies | awk 'END {print NR + 0}')"
+    force_on_exit="$(read_force_on_exit_policies | awk 'END {print NR + 0}')"
+    force_category_on_exit="$(read_force_category_on_exit_policies | awk 'END {print NR + 0}')"
+    split_exits="$(split_only_exit_names | awk 'NF {n++} END {print n + 0}')"
+    if [ -f "$SPLIT_CATALOG_FILE" ]; then
+        catalog_sync="$(date -d "@$(cat "$SPLIT_CATALOG_FILE" 2>/dev/null || printf 0)" '+%F %T' 2>/dev/null || cat "$SPLIT_CATALOG_FILE")"
+    else
+        catalog_sync="从未"
+    fi
+    if [ -f "$SPLIT_LAST_SYNC_FILE" ]; then
+        rule_sync="$(date -d "@$(cat "$SPLIT_LAST_SYNC_FILE" 2>/dev/null || printf 0)" '+%F %T' 2>/dev/null || cat "$SPLIT_LAST_SYNC_FILE")"
+    else
+        rule_sync="从未"
+    fi
+    if split_catalog_ready; then
+        catalog_state="已获取"
+    else
+        catalog_state="未获取"
+    fi
+    cat <<EOF
+============================================================
+                    分流管理
+============================================================
+ 应用目录 : $catalog_state（应用 $total / 分类 $categories）
+ 普通分流 : 分类 $category_policies / 应用 $app_policies
+ 全局强制 : 分类 $force_categories / 应用 $force_apps
+ 按出口强制: 分类 $force_category_on_exit / 应用 $force_on_exit
+ 分流专用出口: $split_exits
+ 目录同步 : $catalog_sync
+ 规则更新 : $rule_sync
+------------------------------------------------------------
+EOF
+    if ! split_catalog_ready; then
+        printf ' [提示] 尚未同步应用目录，请先选择 2 -> 1。\n'
+        printf '%s\n' '------------------------------------------------------------'
+    fi
+}
+
+interactive_split_clear_screen() {
+    if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ] && command -v clear >/dev/null 2>&1; then
+        clear
+    fi
+}
+
+interactive_split_catalog_menu() {
     local choice
-    need_root
-    load_config
-    write_default_config
     while true; do
-        if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ] && command -v clear >/dev/null 2>&1; then
-            clear
-        fi
-        print_split_header
-        cat <<EOF
-  1. 同步单文件应用目录与规则缓存
-  2. 更新已启用分流规则
-  3. 查看应用分流状态
-  4. 设置单个应用候选出口
-  5. 按分类批量设置候选出口
-  6. 添加自定义分流规则
-  7. 取消单个应用分流
-  8. 取消分类分流
-  9. 设置强制单应用分流
-  10. 设置强制分类分流
-  11. 取消强制单应用分流
-  12. 取消强制分类分流
-  13. 一键清空全部分流规则
-  14. 设置按当前出口强制单应用分流
-  15. 设置按当前出口强制分类分流
-  16. 取消按当前出口强制单应用分流
-  17. 取消按当前出口强制分类分流
-  18. 添加分流专用出口（仅用于分流，不进实例 out）
-  0. 返回主菜单
+        interactive_split_clear_screen
+        cat <<'EOF'
+============================================================
+                应用目录与规则更新
+============================================================
+  1. 同步应用目录与规则缓存
+  2. 更新已启用的分流规则
+  0. 返回上一级
 ============================================================
 EOF
         read -r -p "请输入序号: " choice
         case "$choice" in
             1) split_fetch_all_rules catalog; pause_screen ;;
             2) split_sync --force; pause_screen ;;
-            3) split_list; pause_screen ;;
-            4) interactive_split_set_app; pause_screen ;;
-            5) interactive_split_set_category; pause_screen ;;
+            0|"") return 0 ;;
+            *) warn "无效选项，请重新输入。"; sleep 1 ;;
+        esac
+    done
+}
+
+interactive_split_regular_menu() {
+    local choice
+    while true; do
+        interactive_split_clear_screen
+        cat <<'EOF'
+============================================================
+                    普通应用分流
+============================================================
+  1. 设置单个应用候选出口
+  2. 按分类批量设置候选出口
+  3. 取消单个应用分流
+  4. 取消分类分流
+  0. 返回上一级
+============================================================
+EOF
+        read -r -p "请输入序号: " choice
+        case "$choice" in
+            1) interactive_split_set_app; pause_screen ;;
+            2) interactive_split_set_category; pause_screen ;;
+            3) interactive_split_clear_app; pause_screen ;;
+            4) interactive_split_clear_category; pause_screen ;;
+            0|"") return 0 ;;
+            *) warn "无效选项，请重新输入。"; sleep 1 ;;
+        esac
+    done
+}
+
+interactive_split_force_menu() {
+    local choice
+    while true; do
+        interactive_split_clear_screen
+        cat <<'EOF'
+============================================================
+                    全局强制分流
+============================================================
+ 无论实例当前使用什么出口，命中规则都会走指定分流目标。
+------------------------------------------------------------
+  1. 设置强制单应用分流
+  2. 设置强制分类分流
+  3. 取消强制单应用分流
+  4. 取消强制分类分流
+  0. 返回上一级
+============================================================
+EOF
+        read -r -p "请输入序号: " choice
+        case "$choice" in
+            1) interactive_split_force_app; pause_screen ;;
+            2) interactive_split_force_category; pause_screen ;;
+            3) interactive_split_force_clear_app; pause_screen ;;
+            4) interactive_split_force_clear_category; pause_screen ;;
+            0|"") return 0 ;;
+            *) warn "无效选项，请重新输入。"; sleep 1 ;;
+        esac
+    done
+}
+
+interactive_split_force_on_exit_menu() {
+    local choice
+    while true; do
+        interactive_split_clear_screen
+        cat <<'EOF'
+============================================================
+             按实例当前出口强制分流
+============================================================
+ 只有实例当前出口匹配所选来源出口时，规则才会生效。
+------------------------------------------------------------
+  1. 设置单应用规则
+  2. 设置分类规则
+  3. 取消单应用规则
+  4. 取消分类规则
+  0. 返回上一级
+============================================================
+EOF
+        read -r -p "请输入序号: " choice
+        case "$choice" in
+            1) interactive_split_force_on_exit_app; pause_screen ;;
+            2) interactive_split_force_on_exit_category; pause_screen ;;
+            3) interactive_split_force_on_exit_clear_app; pause_screen ;;
+            4) interactive_split_force_on_exit_clear_category; pause_screen ;;
+            0|"") return 0 ;;
+            *) warn "无效选项，请重新输入。"; sleep 1 ;;
+        esac
+    done
+}
+
+interactive_split_menu() {
+    local choice
+    need_root
+    load_config
+    write_default_config
+    while true; do
+        interactive_split_clear_screen
+        print_split_menu_summary
+        cat <<EOF
+  1. 查看完整分流状态
+  2. 应用目录与规则更新
+  3. 普通应用分流
+  4. 全局强制分流
+  5. 按实例当前出口强制分流
+  6. 添加自定义分流规则
+  7. 添加分流专用出口（仅用于分流，不进实例 out）
+  8. 清空全部分流规则
+  0. 返回主菜单
+============================================================
+EOF
+        read -r -p "请输入序号: " choice
+        case "$choice" in
+            1) split_list; pause_screen ;;
+            2) interactive_split_catalog_menu ;;
+            3) interactive_split_regular_menu ;;
+            4) interactive_split_force_menu ;;
+            5) interactive_split_force_on_exit_menu ;;
             6) interactive_split_add_custom; pause_screen ;;
-            7) interactive_split_clear_app; pause_screen ;;
-            8) interactive_split_clear_category; pause_screen ;;
-            9) interactive_split_force_app; pause_screen ;;
-            10) interactive_split_force_category; pause_screen ;;
-            11) interactive_split_force_clear_app; pause_screen ;;
-            12) interactive_split_force_clear_category; pause_screen ;;
-            13)
+            7) interactive_add_split_only_exit ;;
+            8)
                 if confirm_yes "确认清空全部分流规则吗？这会删除应用/分类/强制分流、容器覆盖、规则缓存和自定义分流规则，但保留应用目录"; then
                     split_clear_all_rules
                 else
@@ -14666,11 +14809,6 @@ EOF
                 fi
                 pause_screen
                 ;;
-            14) interactive_split_force_on_exit_app; pause_screen ;;
-            15) interactive_split_force_on_exit_category; pause_screen ;;
-            16) interactive_split_force_on_exit_clear_app; pause_screen ;;
-            17) interactive_split_force_on_exit_clear_category; pause_screen ;;
-            18) interactive_add_split_only_exit ;;
             0) return 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -15014,7 +15152,7 @@ choose_replace_new_exit() {
     if [ ! -s "$tmp" ]; then
         rm -f "$tmp"
         if [ "$scope" = "split-only" ]; then
-            warn "暂无其他分流专用出口，请先在分流管理选择 18 添加。"
+            warn "暂无其他分流专用出口，请先在分流管理选择 7 添加。"
         else
             warn "没有可用于替换的新出口。请先通过 [3] 添加出口 添加新出口。"
         fi
