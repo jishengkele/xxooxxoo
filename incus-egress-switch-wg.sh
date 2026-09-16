@@ -180,10 +180,25 @@ need_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "缺少必要命令: $1"
 }
 
+# Incus 管理面异常时，任何辅助功能都不能无限等待 Unix socket。
+# 使用命令超时并追加强制终止宽限，避免周期任务堆积。
+incus_safe() {
+    local seconds="${AUTO_COMMAND_TIMEOUT:-30}"
+    case "$seconds" in
+        ''|*[!0-9]*) seconds=30 ;;
+    esac
+    [ "$seconds" -ge 5 ] 2>/dev/null || seconds=5
+    command -v timeout >/dev/null 2>&1 || {
+        warn "缺少 timeout 命令，已拒绝执行可能无限阻塞的 Incus 操作。"
+        return 127
+    }
+    timeout --signal=TERM --kill-after=2s "${seconds}s" incus "$@"
+}
+
 install_host_dependencies() {
     need_root
     local missing="" still_missing="" cmd
-    for cmd in install python3 systemctl ip tc nft incus curl tar gzip awk mktemp flock sysctl conntrack sha256sum; do
+    for cmd in install python3 systemctl ip tc nft incus curl tar gzip awk mktemp flock timeout sysctl conntrack sha256sum; do
         command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
     done
     [ -n "$missing" ] || { info "宿主机基础依赖已满足。"; return 0; }
@@ -204,7 +219,7 @@ install_host_dependencies() {
         warn "未识别包管理器，请手动安装缺失命令后重试:$missing"
     fi
 
-    for cmd in install python3 systemctl ip tc nft incus curl tar gzip awk mktemp flock sysctl conntrack sha256sum; do
+    for cmd in install python3 systemctl ip tc nft incus curl tar gzip awk mktemp flock timeout sysctl conntrack sha256sum; do
         command -v "$cmd" >/dev/null 2>&1 || still_missing="$still_missing $cmd"
     done
     [ -z "$still_missing" ] || die "依赖安装后仍缺少命令:$still_missing"
@@ -2731,7 +2746,7 @@ split_managed_dns_bridges() {
     for iface in $BRIDGE_IFACES; do
         [ -n "$iface" ] || continue
         [ -d "$INCUS_NETWORKS_DIR/$iface" ] || continue
-        incus network show "$iface" >/dev/null 2>&1 || continue
+        incus_safe network show "$iface" >/dev/null 2>&1 || continue
         printf '%s\n' "$iface"
     done
 }
@@ -2783,8 +2798,8 @@ split_dns_sidecar_available() {
 split_bridge_dns_address() {
     local iface="$1" family="$2" value
     case "$family" in
-        4) value="$(incus network get "$iface" ipv4.address 2>/dev/null || true)" ;;
-        6) value="$(incus network get "$iface" ipv6.address 2>/dev/null || true)" ;;
+        4) value="$(incus_safe network get "$iface" ipv4.address 2>/dev/null || true)" ;;
+        6) value="$(incus_safe network get "$iface" ipv6.address 2>/dev/null || true)" ;;
         *) return 1 ;;
     esac
     case "$value" in ""|none|auto) return 1 ;; esac
@@ -2799,7 +2814,7 @@ split_bridge_dns_address() {
 
 split_bridge_dns_domain() {
     local iface="$1" value
-    value="$(incus network get "$iface" dns.domain 2>/dev/null || true)"
+    value="$(incus_safe network get "$iface" dns.domain 2>/dev/null || true)"
     case "$value" in ""|none) return 1 ;; esac
     valid_domain_name "$value" || return 1
     printf '%s\n' "$value"
@@ -3022,7 +3037,7 @@ set_incus_network_raw_dnsmasq() {
     local iface="$1" file="$2" value
     value="$(cat "$file")"
     # 使用 Incus 当前推荐的 key=value 形式；配置加载失败不能再以旧语法重复提交同一坏配置。
-    incus network set "$iface" "raw.dnsmasq=$value" >/dev/null
+    incus_safe network set "$iface" "raw.dnsmasq=$value" >/dev/null
 }
 
 wait_incus_bridge_dnsmasq_running() {
@@ -3042,7 +3057,7 @@ clear_split_dnsmasq_reference() {
     text_files_identical "$current" "$base" && return 0
     set_incus_network_raw_dnsmasq "$iface" "$base" || return 1
     verify="$(mktemp)"
-    if ! incus network get "$iface" raw.dnsmasq > "$verify" 2>/dev/null; then
+    if ! incus_safe network get "$iface" raw.dnsmasq > "$verify" 2>/dev/null; then
         rm -f "$verify"
         return 1
     fi
@@ -3061,7 +3076,7 @@ remove_split_dnsmasq_integration() {
         [ -n "$iface" ] || continue
         current="$(mktemp)"
         base="$(mktemp)"
-        if ! incus network get "$iface" raw.dnsmasq > "$current" 2>/dev/null; then
+        if ! incus_safe network get "$iface" raw.dnsmasq > "$current" 2>/dev/null; then
             rm -f "$current" "$base"
             continue
         fi
@@ -3101,7 +3116,7 @@ apply_split_dnsmasq_nftsets() {
         base="$(mktemp)"
         desired="$(mktemp)"
         [ -f "$config_file" ] && cp "$config_file" "$old_config" || : > "$old_config"
-        if ! incus network get "$iface" raw.dnsmasq > "$current" 2>/dev/null; then
+        if ! incus_safe network get "$iface" raw.dnsmasq > "$current" 2>/dev/null; then
             rm -f "$old_config" "$current" "$base" "$desired" "$generated"
             warn "读取网桥 $iface 的 raw.dnsmasq 配置失败。"
             return 1
@@ -3284,7 +3299,7 @@ for item in payload.get("nftables") or []:
                 reason="网桥 $iface 的原生 nftset 配置缺失或过期"
                 break
             fi
-            current="$(incus network get "$iface" raw.dnsmasq 2>/dev/null || true)"
+            current="$(incus_safe network get "$iface" raw.dnsmasq 2>/dev/null || true)"
             if ! printf '%s\n' "$current" | grep -Fq "# rules-sha256=$generated_hash" ||
                 ! printf '%s\n' "$current" | grep -Fq "conf-file=$config_file"; then
                 reason="网桥 $iface 的 raw.dnsmasq 未加载当前 nftset 配置"
@@ -7976,7 +7991,7 @@ list_running_container_identities() {
     for project in $AUTO_PROJECTS; do
         [ -n "$project" ] || continue
         json="$(mktemp)"
-        if ! incus --project "$project" list --format json > "$json" 2>/dev/null; then
+        if ! incus_safe --project "$project" list --format json > "$json" 2>/dev/null; then
             rm -f "$json"
             warn "读取 Incus project=$project 的容器状态失败。"
             return 1
@@ -10956,6 +10971,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tempfile
@@ -11052,16 +11068,47 @@ def file_lock(path, exclusive=True):
         yield
 
 
+@contextmanager
+def try_file_lock(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def run(cmd, check=True, capture=True, input_data=None, timeout=None):
-    result = subprocess.run(
+    effective_timeout = AUTO_COMMAND_TIMEOUT if timeout is None else timeout
+    proc = subprocess.Popen(
         cmd,
-        input=input_data,
         stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
         text=True,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
-        timeout=AUTO_COMMAND_TIMEOUT if timeout is None else timeout,
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(input=input_data, timeout=effective_timeout)
+    except subprocess.TimeoutExpired as exc:
+        # incus CLI may leave a blocked child behind when the daemon socket is
+        # wedged. Kill the whole process group so later scans cannot pile up.
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=2)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        raise subprocess.TimeoutExpired(cmd, effective_timeout, output=exc.output, stderr=exc.stderr) from exc
+    result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     if check and result.returncode != 0:
         stderr = (result.stderr or "").strip()
         raise RuntimeError("%s failed%s" % (" ".join(cmd), ": " + stderr if stderr else ""))
@@ -11793,8 +11840,12 @@ def inject_clients(inst_rows, state, verify=False):
 
 
 def reconcile(force_client_check=False, force_ip_refresh=False):
-    # 服务实例与手工 --once 共用该锁，避免同一宿主机同时启动两轮高开销扫描/注入。
-    with file_lock(RECONCILE_LOCK_FILE):
+    # 服务实例与手工 --once 共用非阻塞锁。已有一轮执行时直接跳过，避免
+    # systemd/人工任务在 Incus 管理面卡住期间排队并形成进程堆积。
+    with try_file_lock(RECONCILE_LOCK_FILE) as acquired:
+        if not acquired:
+            log("已有一轮自动同步正在执行，本轮已跳过")
+            return False
         return reconcile_locked(force_client_check=force_client_check, force_ip_refresh=force_ip_refresh)
 
 
@@ -12015,7 +12066,16 @@ def maybe_sync_split_rules(force=False):
     if not force and now - last < max(SPLIT_UPDATE_INTERVAL, 60):
         return
     log("开始检查应用分流规则更新")
-    result = subprocess.run([MANAGER_BIN, "split-sync", "--auto"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        result = run(
+            [MANAGER_BIN, "split-sync", "--auto"],
+            check=False,
+            capture=True,
+            timeout=max(AUTO_COMMAND_TIMEOUT, 90),
+        )
+    except subprocess.TimeoutExpired:
+        log("应用分流规则更新超时，本轮已终止并清理子进程")
+        return
     output = (result.stdout or "").strip()
     if output:
         for line in output.splitlines()[-20:]:
@@ -12176,7 +12236,13 @@ def watch_events():
     last_sync = 0.0
     while True:
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
             assert proc.stdout is not None
             for line in proc.stdout:
                 if any(word in line.lower() for word in ("instance", "container", "created", "deleted", "started", "stopped", "renamed")):
@@ -15445,7 +15511,7 @@ include_cleanup_instance() {
 
 list_project_container_names() {
     local project="$1"
-    incus --project "$project" list --format json 2>/dev/null | python3 -c '
+    incus_safe --project "$project" list --format json 2>/dev/null | python3 -c '
 import json
 import sys
 
@@ -15480,7 +15546,7 @@ cleanup_container_clients() {
             include_cleanup_instance "$project" "$name" || continue
             for path in "$AUTO_CLIENT_PATH" "$AUTO_TOKEN_PATH"; do
                 [ -n "$path" ] || continue
-                incus --project "$project" file delete "$name$path" >/dev/null 2>&1 || true
+                incus_safe --project "$project" file delete "$name$path" >/dev/null 2>&1 || true
             done
             count=$((count + 1))
         done < <(list_project_container_names "$project")
