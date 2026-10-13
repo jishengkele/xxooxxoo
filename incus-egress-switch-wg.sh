@@ -863,6 +863,7 @@ update_health_check() {
         warn "更新后的 sing-box 核心未达到固定版本 $SINGBOX_CORE_VERSION。"
         return 1
     fi
+    bridge_dhcp_health_check || { warn "更新后 Incus 原生 DHCP/DNS 健康检查失败。"; return 1; }
     return 0
 }
 
@@ -927,6 +928,7 @@ load_config() {
     AUTO_CLIENT_VERIFY_INTERVAL="${AUTO_CLIENT_VERIFY_INTERVAL:-300}"
     AUTO_STATE_REFRESH_INTERVAL="${AUTO_STATE_REFRESH_INTERVAL:-300}"
     AUTO_DATAPLANE_VERIFY_INTERVAL="${AUTO_DATAPLANE_VERIFY_INTERVAL:-30}"
+    AUTO_BRIDGE_HEALTH_INTERVAL="${AUTO_BRIDGE_HEALTH_INTERVAL:-60}"
     AUTO_UPSTREAM_HEALTH_INTERVAL="${AUTO_UPSTREAM_HEALTH_INTERVAL:-30}"
     UPSTREAM_DNS_CONFIRMATIONS="${UPSTREAM_DNS_CONFIRMATIONS:-2}"
     WG_HANDSHAKE_WARN_AGE="${WG_HANDSHAKE_WARN_AGE:-180}"
@@ -1363,6 +1365,9 @@ AUTO_STATE_REFRESH_INTERVAL="300"
 # nftables 容器映射与策略路由的轻量巡检间隔。
 # 只读取小型源 IP 集合和 ip rule；发现缺失或错配时才重建数据面。
 AUTO_DATAPLANE_VERIFY_INTERVAL="30"
+
+# 独立检查 Incus 原生 DHCP/DNS；不依赖应用分流或 sidecar 是否启用。
+AUTO_BRIDGE_HEALTH_INTERVAL="60"
 
 # 上游出口巡检间隔。按“出口”检查而不是按“实例”检查，因此实例数量不会增加巡检开销。
 # WG 域名 Endpoint 连续确认变化后会原地刷新 Peer；单 IP 的 sing-box DDNS 变化后只重启对应出口服务。
@@ -1814,6 +1819,7 @@ ensure_runtime_config_defaults() {
     ensure_config_default AUTO_INSTALL_CLIENT true
     ensure_config_default AUTO_CLIENT_VERIFY_INTERVAL 300
     ensure_config_default AUTO_DATAPLANE_VERIFY_INTERVAL 30
+    ensure_config_default AUTO_BRIDGE_HEALTH_INTERVAL 60
     ensure_config_default AUTO_UPSTREAM_HEALTH_INTERVAL 30
     ensure_config_default UPSTREAM_DNS_CONFIRMATIONS 2
     ensure_config_default WG_HANDSHAKE_WARN_AGE 180
@@ -2427,6 +2433,7 @@ validate_runtime_config() {
         die "SPLIT_DNS_SIDECAR_PORT 必须是 1024-65535 的整数"
     [[ "$CONCURRENCY_WARN_PERCENT" =~ ^[0-9]+$ ]] && [ "$CONCURRENCY_WARN_PERCENT" -ge 50 ] && [ "$CONCURRENCY_WARN_PERCENT" -le 99 ] || die "并发健康告警阈值必须是 50-99: $CONCURRENCY_WARN_PERCENT"
     [[ "$AUTO_UPSTREAM_HEALTH_INTERVAL" =~ ^[0-9]+$ ]] && [ "$AUTO_UPSTREAM_HEALTH_INTERVAL" -ge 15 ] && [ "$AUTO_UPSTREAM_HEALTH_INTERVAL" -le 3600 ] || die "上游巡检间隔必须是 15-3600 秒"
+    [[ "$AUTO_BRIDGE_HEALTH_INTERVAL" =~ ^[0-9]+$ ]] && [ "$AUTO_BRIDGE_HEALTH_INTERVAL" -ge 15 ] && [ "$AUTO_BRIDGE_HEALTH_INTERVAL" -le 3600 ] || die "原生 DHCP/DNS 巡检间隔必须是 15-3600 秒"
     [[ "$UPSTREAM_DNS_CONFIRMATIONS" =~ ^[0-9]+$ ]] && [ "$UPSTREAM_DNS_CONFIRMATIONS" -ge 1 ] && [ "$UPSTREAM_DNS_CONFIRMATIONS" -le 5 ] || die "DDNS 变化确认次数必须是 1-5"
     [[ "$WG_HANDSHAKE_WARN_AGE" =~ ^[0-9]+$ ]] && [ "$WG_HANDSHAKE_WARN_AGE" -ge 60 ] && [ "$WG_HANDSHAKE_WARN_AGE" -le 86400 ] || die "WG 握手告警阈值必须是 60-86400 秒"
     [[ "$WG_ENDPOINT_RECOVERY_GRACE" =~ ^[0-9]+$ ]] && [ "$WG_ENDPOINT_RECOVERY_GRACE" -ge 30 ] && [ "$WG_ENDPOINT_RECOVERY_GRACE" -le 3600 ] || die "WG Endpoint 恢复宽限必须是 30-3600 秒"
@@ -2766,12 +2773,153 @@ incus_dnsmasq_pid_from_file() {
     printf '%s\n' "$pid"
 }
 
+# Incus 7.3 的重载只 SIGKILL 主进程，TCP 查询子进程可能继续持有监听
+# socket。只处理同一网络命名空间、实际 dnsmasq 二进制、指定网桥和
+# 指定 raw 文件的进程；PID 重用和其他网桥/服务都不能被误处理。
+incus_dnsmasq_process_control() {
+    local iface="$1" action="$2"
+    python3 - "$iface" "$INCUS_NETWORKS_DIR/$iface" "$action" <<'PY'
+import ipaddress
+import os
+import pathlib
+import re
+import signal
+import sys
+import time
+
+iface, network_dir, action = sys.argv[1:4]
+raw_file = os.path.join(network_dir, "dnsmasq.raw")
+host_netns = os.stat("/proc/self/ns/net").st_ino
+
+
+def option(args, name):
+    for index, value in enumerate(args):
+        if value.startswith(name + "="):
+            return value.split("=", 1)[1]
+        if value == name and index + 1 < len(args):
+            return args[index + 1]
+    return ""
+
+
+def identity(pid):
+    try:
+        base = pathlib.Path("/proc") / str(pid)
+        exe = os.readlink(base / "exe").removesuffix(" (deleted)")
+        if os.path.basename(exe) != "dnsmasq":
+            return None
+        if os.stat(base / "ns/net").st_ino != host_netns:
+            return None
+        args = (base / "cmdline").read_bytes().decode().rstrip("\0").split("\0")
+        if option(args, "--interface") != iface or option(args, "--conf-file") != raw_file:
+            return None
+        stat = (base / "stat").read_text().rsplit(")", 1)[1].split()
+        if stat[0] == "Z":
+            return None
+        return (stat[19], os.getpgid(pid), exe, args)
+    except (OSError, ValueError, UnicodeError):
+        return None
+
+
+def main_pid():
+    try:
+        text = pathlib.Path(network_dir, "dnsmasq.pid").read_text().strip()
+        match = re.search(r"^pid:\s*(\d+)\s*$", text, re.M)
+        pid = int(match.group(1)) if match else int(text)
+        return pid if identity(pid) else 0
+    except (OSError, ValueError):
+        return 0
+
+
+def family():
+    found = {}
+    for entry in pathlib.Path("/proc").iterdir():
+        if entry.name.isdigit():
+            pid = int(entry.name)
+            value = identity(pid)
+            if value:
+                found[pid] = value
+    return found
+
+
+if action == "stop":
+    found = family()
+    groups = {value[1] for value in found.values()}
+    for pid, value in found.items():
+        if identity(pid) == value:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + 2
+    remaining = {}
+    while True:
+        remaining = {pid: value for pid, value in family().items() if value[1] in groups}
+        if not remaining or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    for pid, value in remaining.items():
+        if identity(pid) == value:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + 1
+    while any(value[1] in groups for value in family().values()):
+        if time.monotonic() >= deadline:
+            raise SystemExit("指定网桥的旧 dnsmasq 进程未退出")
+        time.sleep(0.05)
+    raise SystemExit(0)
+
+pid = main_pid()
+if not pid:
+    raise SystemExit("网桥 %s 的 Incus 原生 dnsmasq 未运行" % iface)
+value = identity(pid)
+if action == "binary":
+    print(value[2])
+elif action == "health":
+    args = value[3]
+    ranges = [args[index + 1] for index, arg in enumerate(args[:-1]) if arg == "--dhcp-range"]
+    ranges += [arg.split("=", 1)[1] for arg in args if arg.startswith("--dhcp-range=")]
+    dhcp4 = False
+    for entry in ranges:
+        try:
+            dhcp4 |= ipaddress.ip_address(entry.split(",", 1)[0]).version == 4
+        except ValueError:
+            pass
+    if dhcp4:
+        sockets = set()
+        for fd in pathlib.Path("/proc", str(pid), "fd").iterdir():
+            try:
+                target = os.readlink(fd)
+                if target.startswith("socket:["):
+                    sockets.add(target[8:-1])
+            except OSError:
+                pass
+        listening = False
+        for table in ("udp", "udp6"):
+            try:
+                lines = pathlib.Path("/proc/net", table).read_text().splitlines()[1:]
+            except FileNotFoundError:
+                continue
+            for line in lines:
+                fields = line.split()
+                if len(fields) > 9 and int(fields[1].split(":")[1], 16) == 67 and fields[9] in sockets:
+                    listening = True
+        if not listening:
+            raise SystemExit("网桥 %s 的原生 DHCP 未监听 UDP 67" % iface)
+else:
+    raise SystemExit("未知 dnsmasq 进程操作")
+PY
+}
+
+incus_bridge_dnsmasq_healthy() {
+    incus_dnsmasq_process_control "$1" health
+}
+
 incus_bridge_dnsmasq_binary() {
-    local iface pid_file pid binary
+    local iface binary
     iface="$1"
-    pid_file="$INCUS_NETWORKS_DIR/$iface/dnsmasq.pid"
-    pid="$(incus_dnsmasq_pid_from_file "$pid_file")" || return 1
-    binary="$(readlink -f "/proc/$pid/exe" 2>/dev/null)"
+    binary="$(incus_dnsmasq_process_control "$iface" binary 2>/dev/null)" || return 1
     [ -n "$binary" ] && [ -x "$binary" ] || return 1
     printf '%s\n' "$binary"
 }
@@ -2921,6 +3069,8 @@ apply_split_dns_sidecar_one() {
     local tmp_config tmp_unit config_changed="false" unit_changed="false" nftset_changed="false"
     local -a upstreams=()
     split_dns_sidecar_available || return 1
+    [[ "$SPLIT_DNS_SIDECAR_PORT" =~ ^[0-9]+$ ]] &&
+        [ "$SPLIT_DNS_SIDECAR_PORT" -ge 1024 ] && [ "$SPLIT_DNS_SIDECAR_PORT" -le 65535 ] || return 1
     valid_name "$iface" || return 1
     v4="$(split_bridge_dns_address "$iface" 4 || true)"
     v6="$(split_bridge_dns_address "$iface" 6 || true)"
@@ -3034,27 +3184,111 @@ text_files_identical() {
 }
 
 set_incus_network_raw_dnsmasq() {
-    local iface="$1" file="$2" value
+    local iface="$1" file="$2" value current
     value="$(cat "$file")"
+    current="$(incus_safe network get "$iface" raw.dnsmasq)" || return 1
+    if [ "$current" = "$value" ]; then
+        incus_bridge_dnsmasq_healthy "$iface" >/dev/null 2>&1 || recover_incus_bridge_dnsmasq "$iface"
+        return $?
+    fi
     # 使用 Incus 当前推荐的 key=value 形式；配置加载失败不能再以旧语法重复提交同一坏配置。
-    incus_safe network set "$iface" "raw.dnsmasq=$value" >/dev/null
+    incus_dnsmasq_process_control "$iface" stop || return 1
+    if ! incus_safe network set "$iface" "raw.dnsmasq=$value" >/dev/null; then
+        recover_incus_bridge_dnsmasq "$iface" || warn "网桥 $iface 的原生 DHCP/DNS 恢复失败。"
+        return 1
+    fi
+    wait_incus_bridge_dnsmasq_running "$iface"
 }
 
 wait_incus_bridge_dnsmasq_running() {
-    local iface="$1" remaining=40
+    local iface="$1" remaining=40 required
+    if incus_bridge_dnsmasq_required "$iface"; then
+        :
+    else
+        required=$?
+        [ "$required" -eq 1 ] && return 0
+        return 1
+    fi
     while [ "$remaining" -gt 0 ]; do
-        incus_bridge_dnsmasq_binary "$iface" >/dev/null 2>&1 && return 0
+        incus_bridge_dnsmasq_healthy "$iface" >/dev/null 2>&1 && return 0
         sleep 0.25
         remaining=$((remaining - 1))
     done
     return 1
 }
 
+# 使用无功能影响的临时注释触发 Incus 重建，随后恢复原 raw.dnsmasq。
+# 不重启 Incus/实例，不改 IP/DHCP 配置，不结束不属于该网桥的服务。
+recover_incus_bridge_dnsmasq() {
+    local iface="$1" original marker failed=0
+    incus_bridge_dnsmasq_healthy "$iface" >/dev/null 2>&1 && return 0
+    original="$(incus_safe network get "$iface" raw.dnsmasq)" || return 1
+    marker="$original"$'\n'"# $APP_NAME native DHCP recovery $$ $(date +%s)"
+    incus_dnsmasq_process_control "$iface" stop || return 1
+    if ! incus_safe network set "$iface" "raw.dnsmasq=$marker" >/dev/null ||
+        ! wait_incus_bridge_dnsmasq_running "$iface"; then
+        failed=1
+    fi
+    # 即使启动失败也恢复原配置，避免修复标记长期积累。
+    if ! incus_dnsmasq_process_control "$iface" stop ||
+        ! incus_safe network set "$iface" "raw.dnsmasq=$original" >/dev/null ||
+        ! wait_incus_bridge_dnsmasq_running "$iface"; then
+        return 1
+    fi
+    [ "$failed" -eq 0 ] || warn "网桥 $iface 首次恢复未成功，原配置恢复后原生 DHCP/DNS 已运行。"
+    info "网桥 $iface 的 Incus 原生 DHCP/DNS 已恢复。"
+}
+
+bridge_dhcp_health_check() {
+    local iface v4 v6
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        v4="$(incus_safe network get "$iface" ipv4.address)" || return 1
+        v6="$(incus_safe network get "$iface" ipv6.address)" || return 1
+        [ -n "$v4" ] && [ "$v4" != none ] || {
+            [ -n "$v6" ] && [ "$v6" != none ] || continue
+        }
+        incus_bridge_dnsmasq_healthy "$iface" || return 1
+    done < <(split_managed_dns_bridges)
+}
+
+incus_bridge_dnsmasq_required() {
+    local v4 v6
+    v4="$(incus_safe network get "$1" ipv4.address)" || return 2
+    v6="$(incus_safe network get "$1" ipv6.address)" || return 2
+    [ -n "$v4" ] && [ "$v4" != none ] || { [ -n "$v6" ] && [ "$v6" != none ]; }
+}
+
+bridge_dhcp_health() {
+    need_root
+    load_config
+    local repair="${1:-}" iface v4 v6 reason failed=0
+    if reason="$(bridge_dhcp_health_check 2>&1)"; then
+        return 0
+    fi
+    [ "$repair" = --repair ] || { printf '%s\n' "$reason" >&2; return 1; }
+    state_lock_acquire
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        v4="$(incus_safe network get "$iface" ipv4.address)" || { failed=1; continue; }
+        v6="$(incus_safe network get "$iface" ipv6.address)" || { failed=1; continue; }
+        [ -n "$v4" ] && [ "$v4" != none ] || {
+            [ -n "$v6" ] && [ "$v6" != none ] || continue
+        }
+        if ! incus_bridge_dnsmasq_healthy "$iface" >/dev/null 2>&1; then
+            warn "网桥 $iface 原生 DHCP/DNS 异常，正在单独恢复。"
+            recover_incus_bridge_dnsmasq "$iface" || failed=1
+        fi
+    done < <(split_managed_dns_bridges)
+    state_lock_release
+    [ "$failed" -eq 0 ] && bridge_dhcp_health_check
+}
+
 # 从 raw.dnsmasq 解除本脚本的 conf-file 引用后必须回读确认，并确认
 # Incus dnsmasq 已恢复。调用者只有在本函数成功后才能删除被引用文件。
 clear_split_dnsmasq_reference() {
     local iface="$1" current="$2" base="$3" verify
-    text_files_identical "$current" "$base" && return 0
+    text_files_identical "$current" "$base" && { wait_incus_bridge_dnsmasq_running "$iface"; return $?; }
     set_incus_network_raw_dnsmasq "$iface" "$base" || return 1
     verify="$(mktemp)"
     if ! incus_safe network get "$iface" raw.dnsmasq > "$verify" 2>/dev/null; then
@@ -3098,7 +3332,7 @@ remove_split_dnsmasq_integration() {
 
 apply_split_dnsmasq_nftsets() {
     local generated generated_hash iface network_dir config_file old_config current base desired
-    local file_changed raw_changed changed=0 sidecar_applied=0 static_count=0 sidecar_failed="false" sidecar_ready
+    local file_changed raw_changed changed=0 sidecar_applied=0 static_count=0 sidecar_failed="false" sidecar_ready required
     if [ "${SPLIT_DNSMASQ_NFTSET:-true}" != "true" ]; then
         remove_split_dnsmasq_integration
         return $?
@@ -3120,6 +3354,21 @@ apply_split_dnsmasq_nftsets() {
             rm -f "$old_config" "$current" "$base" "$desired" "$generated"
             warn "读取网桥 $iface 的 raw.dnsmasq 配置失败。"
             return 1
+        fi
+        if incus_bridge_dnsmasq_required "$iface"; then
+            if ! incus_bridge_dnsmasq_healthy "$iface" >/dev/null 2>&1 &&
+                ! recover_incus_bridge_dnsmasq "$iface"; then
+                rm -f "$old_config" "$current" "$base" "$desired" "$generated"
+                warn "网桥 $iface 原生 DHCP/DNS 未恢复，已中止动态分流切换。"
+                return 1
+            fi
+        else
+            required=$?
+            if [ "$required" -ne 1 ]; then
+                rm -f "$old_config" "$current" "$base" "$desired" "$generated"
+                warn "无法确认网桥 $iface 的 DHCP/DNS 配置，已中止切换。"
+                return 1
+            fi
         fi
         strip_split_dnsmasq_block "$current" "$base"
         if ! incus_bridge_dnsmasq_supports_nftset "$iface"; then
@@ -3226,7 +3475,7 @@ for _attempt in range(2):
         if len(response) < 12:
             continue
         response_id, flags = struct.unpack("!HH", response[:4])
-        if response_id == txid and flags & 0x8000:
+        if response_id == txid and flags & 0x8000 and flags & 0x000F == 0:
             raise SystemExit(0)
     except OSError:
         pass
@@ -3239,6 +3488,7 @@ PY
 split_dns_health_check() {
     local generated generated_hash live_sets expected_set iface network_dir config_file current nftset_file unit_file
     local v4 v6 server family port chain total=0 reason=""
+    bridge_dhcp_health_check || return 1
     [ "${ENABLE_SPLIT_RULES:-true}" = "true" ] || return 0
     [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ] || return 0
     generated="$(mktemp)"
@@ -3349,6 +3599,9 @@ split_dns_health() {
     load_config
     write_default_config
     local repair="${1:-}" reason
+    if [ "$repair" = --repair ]; then
+        bridge_dhcp_health --repair || return 1
+    fi
     if reason="$(split_dns_health_check 2>&1)"; then
         return 0
     fi
@@ -11021,6 +11274,7 @@ AUTO_INSTALL_CLIENT = os.environ.get("AUTO_INSTALL_CLIENT", CFG.get("AUTO_INSTAL
 AUTO_CLIENT_VERIFY_INTERVAL = int(os.environ.get("AUTO_CLIENT_VERIFY_INTERVAL", CFG.get("AUTO_CLIENT_VERIFY_INTERVAL", "300")))
 AUTO_STATE_REFRESH_INTERVAL = int(os.environ.get("AUTO_STATE_REFRESH_INTERVAL", CFG.get("AUTO_STATE_REFRESH_INTERVAL", "300")))
 AUTO_DATAPLANE_VERIFY_INTERVAL = max(5, int(os.environ.get("AUTO_DATAPLANE_VERIFY_INTERVAL", CFG.get("AUTO_DATAPLANE_VERIFY_INTERVAL", "30"))))
+AUTO_BRIDGE_HEALTH_INTERVAL = max(15, int(os.environ.get("AUTO_BRIDGE_HEALTH_INTERVAL", CFG.get("AUTO_BRIDGE_HEALTH_INTERVAL", "60"))))
 AUTO_UPSTREAM_HEALTH_INTERVAL = max(0, int(os.environ.get("AUTO_UPSTREAM_HEALTH_INTERVAL", CFG.get("AUTO_UPSTREAM_HEALTH_INTERVAL", "30"))))
 AUTO_REPAIR_BACKOFF_MAX = max(60, int(os.environ.get("AUTO_REPAIR_BACKOFF_MAX", CFG.get("AUTO_REPAIR_BACKOFF_MAX", "300"))))
 AUTO_CLIENT_PATH = os.environ.get("AUTO_CLIENT_PATH", CFG.get("AUTO_CLIENT_PATH", "/usr/local/bin/out"))
@@ -11055,6 +11309,7 @@ SPLIT_LAST_SYNC_FILE = os.path.join(CONFIG_DIR, "split", "last-sync")
 SPLIT_LAST_DNS_REFRESH_FILE = os.path.join(CONFIG_DIR, "split", "last-dns-refresh")
 SPLIT_LAST_DNS_HEALTH_FILE = os.path.join(CONFIG_DIR, "split", "last-dns-health")
 SPLIT_DNS_HEALTH_STATE_FILE = os.path.join(CONFIG_DIR, "split", "dns-health-state.json")
+BRIDGE_HEALTH_STATE_FILE = os.path.join(CONFIG_DIR, "bridge-health-state.json")
 UPSTREAM_HEALTH_STATE_FILE = os.path.join(CONFIG_DIR, "upstream-health-state.json")
 SPLIT_CONTAINER_POLICIES_FILE = os.path.join(CONFIG_DIR, "split", "container-policies.tsv")
 RECONCILE_EVENT = threading.Event()
@@ -12116,6 +12371,39 @@ def maybe_refresh_split_dns(force=False):
         log("本地域名分流刷新失败，退出码: %s" % result.returncode)
 
 
+def maybe_check_bridge_health(force=False):
+    """Native DHCP must remain healthy even with split DNS disabled or using a sidecar."""
+    now = time.time()
+    state = load_json_state(BRIDGE_HEALTH_STATE_FILE)
+    try:
+        failures = max(0, int(state.get("failures", 0) or 0))
+        last_attempt = float(state.get("last_attempt", 0) or 0)
+    except (TypeError, ValueError):
+        failures, last_attempt = 0, 0.0
+    interval = repair_retry_delay(failures) if failures else AUTO_BRIDGE_HEALTH_INTERVAL
+    if not force and now - last_attempt < interval:
+        return
+    state["last_attempt"] = now
+    save_json_state(BRIDGE_HEALTH_STATE_FILE, state, "bridge-health.")
+    try:
+        result = run([MANAGER_BIN, "bridge-dhcp-health", "--repair"],
+                     check=False, capture=True, timeout=max(AUTO_COMMAND_TIMEOUT, 120))
+        for output in (result.stdout or "", result.stderr or ""):
+            for line in output.strip().splitlines()[-10:]:
+                log("bridge-dhcp-health: %s" % line)
+        if result.returncode == 0:
+            state["failures"] = 0
+            state["last_success"] = now
+        else:
+            state["failures"] = failures + 1
+            log("原生 DHCP/DNS 巡检失败（连续 %s 次），%s 秒后重试" % (
+                state["failures"], repair_retry_delay(state["failures"])))
+    except Exception as exc:
+        state["failures"] = failures + 1
+        log("原生 DHCP/DNS 巡检异常，稍后重试: %s" % exc)
+    save_json_state(BRIDGE_HEALTH_STATE_FILE, state, "bridge-health.")
+
+
 def maybe_check_split_dns_health(force=False):
     if not ENABLE_SPLIT_RULES or SPLIT_DNS_HEALTH_INTERVAL <= 0:
         return
@@ -12264,6 +12552,7 @@ def main():
     args = parser.parse_args()
     os.makedirs(CONFIG_DIR, exist_ok=True)
     if args.once:
+        maybe_check_bridge_health(force=True)
         maybe_sync_split_rules(force=False)
         maybe_refresh_split_dns(force=False)
         maybe_check_split_dns_health(force=True)
@@ -12282,6 +12571,7 @@ def main():
             if delay > 0:
                 time.sleep(delay)
         try:
+            maybe_check_bridge_health(force=False)
             maybe_sync_split_rules(force=False)
             maybe_refresh_split_dns(force=False)
             maybe_check_split_dns_health(force=False)
@@ -15916,6 +16206,7 @@ show_status_patrols() {
     local autosync_state="$CONFIG_DIR/autosync-state.json"
     local dns_state="$CONFIG_DIR/split/dns-health-state.json"
     local upstream_state="$UPSTREAM_HEALTH_STATE_FILE"
+    local bridge_state="$CONFIG_DIR/bridge-health-state.json"
     local component_state nft_state autosync_service api_service pending_state
     component_state="$(component_build_status)"
     if command -v systemctl >/dev/null 2>&1; then
@@ -15948,9 +16239,10 @@ show_status_patrols() {
     printf '  自动同步周期: %ss  数据面巡检: %ss  分流 DNS: %ss  上游出口: %ss（真实探测 %ss）  退避上限: %ss\n' \
         "$AUTO_INTERVAL" "$AUTO_DATAPLANE_VERIFY_INTERVAL" "$SPLIT_DNS_HEALTH_INTERVAL" \
         "$AUTO_UPSTREAM_HEALTH_INTERVAL" "$UPSTREAM_PROBE_INTERVAL" "$AUTO_REPAIR_BACKOFF_MAX"
+    printf '  Incus 原生 DHCP/DNS 巡检: %ss（独立于应用分流）\n' "$AUTO_BRIDGE_HEALTH_INTERVAL"
 
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "$autosync_state" "$dns_state" "$upstream_state" <<'PY'
+        python3 - "$autosync_state" "$dns_state" "$upstream_state" "$bridge_state" <<'PY'
 import datetime
 import json
 import os
@@ -15977,6 +16269,7 @@ def stamp(value):
 
 
 autosync_path, dns_path, upstream_path = sys.argv[1:4]
+bridge = load(sys.argv[4])
 autosync = load(autosync_path)
 dns = load(dns_path)
 upstream = load(upstream_path)
@@ -15986,6 +16279,11 @@ injected_count = len(injected) if isinstance(injected, dict) else 0
 skipped_count = len(skipped) if isinstance(skipped, dict) else 0
 dataplane_failures = autosync.get("dataplane_verify_failures", 0) or 0
 dns_failures = dns.get("failures", 0) or 0
+
+print("\nIncus 原生 DHCP/DNS 自动巡检:")
+print("  最近尝试: %s" % stamp(bridge.get("last_attempt")))
+print("  最近成功: %s" % stamp(bridge.get("last_success")))
+print("  连续失败: %s" % (bridge.get("failures", 0) or 0))
 
 print("\n数据面自动巡检:")
 print("  最近尝试: %s" % stamp(autosync.get("last_dataplane_verify_attempt")))
@@ -16462,6 +16760,7 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       单次下载最新规则合集，并重新解析已经设置策略的应用/分类；后台默认 3 天更新一次。
 
   $0 split-dns-health [--repair]
+  $0 bridge-dhcp-health [--repair]
       检查分流动态 DNS、nftset 配置、兼容服务和 DNS 响应；--repair 会自动恢复。
 
   $0 upstream-health [--repair]
@@ -16749,6 +17048,9 @@ case "$command_name" in
         ;;
     split-dns-health)
         split_dns_health "$@"
+        ;;
+    bridge-dhcp-health)
+        bridge_dhcp_health "$@"
         ;;
     upstream-health|exit-health)
         upstream_health "$@"
