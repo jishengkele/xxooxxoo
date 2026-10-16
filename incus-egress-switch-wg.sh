@@ -4782,6 +4782,8 @@ EOF
 }
 
 proxy_direct_bt_pt_rule_lines() {
+    # ubits.club 的第三方优选 CNAME 会指向 OKX/Coinbase 等站点；
+    # 将其解析结果加入全局 IP 直连集合会误伤这些站点，因此不纳入默认规则。
     cat <<'EOF'
 # BT 客户端与公共 Tracker
 DOMAIN-SUFFIX,bittorrent.com
@@ -4929,7 +4931,6 @@ DOMAIN-SUFFIX,tjupt.org
 DOMAIN-SUFFIX,torrentleech.cc
 DOMAIN-SUFFIX,torrentleech.org
 DOMAIN-SUFFIX,totheglory.im
-DOMAIN-SUFFIX,ubits.club
 DOMAIN-SUFFIX,uhdbits.org
 DOMAIN-SUFFIX,ultrahd.net
 DOMAIN-SUFFIX,wintersakura.net
