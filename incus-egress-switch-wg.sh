@@ -31,6 +31,7 @@ INCUS_NETWORKS_DIR="${EGRESS_INCUS_NETWORKS_DIR:-/var/lib/incus/networks}"
 RUN_DIR="/run/$APP_NAME"
 RULE_STATE_FILE="$RUN_DIR/ip-rules.state"
 NFT_STATE_FILE="$RUN_DIR/nft.state"
+SPLIT_DNS_STATE_FILE="$RUN_DIR/split-dns.state"
 STATE_LOCK_FILE="$CONFIG_DIR/.state.lock"
 APPLY_LOCK_FILE="$RUN_DIR/apply.lock"
 PENDING_NFT_FILE="$CONFIG_DIR/.nft-apply-pending"
@@ -144,6 +145,7 @@ apply_lock_release() {
 }
 
 split_cache_lock_acquire() {
+    local wait_seconds="${1:-}"
     if [ "$SPLIT_CACHE_LOCK_DEPTH" -gt 0 ]; then
         SPLIT_CACHE_LOCK_DEPTH=$((SPLIT_CACHE_LOCK_DEPTH + 1))
         return 0
@@ -151,7 +153,12 @@ split_cache_lock_acquire() {
     mkdir -p "$SPLIT_DIR"
     need_cmd flock
     exec {SPLIT_CACHE_LOCK_FD}>"$SPLIT_CACHE_LOCK_FILE"
-    flock -x "$SPLIT_CACHE_LOCK_FD"
+    local -a options=(-x)
+    [ -z "$wait_seconds" ] || options+=(-w "$wait_seconds")
+    if ! flock "${options[@]}" "$SPLIT_CACHE_LOCK_FD"; then
+        exec {SPLIT_CACHE_LOCK_FD}>&-
+        return 1
+    fi
     SPLIT_CACHE_LOCK_DEPTH=1
 }
 
@@ -530,6 +537,14 @@ unit_is_enabled() {
     command -v systemctl >/dev/null 2>&1 && systemctl is-enabled --quiet "$1" </dev/null
 }
 
+restart_managed_service() {
+    local unit="$1"
+    shift
+    # 管理员主动重启不应耗尽服务自动重启的限额。
+    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+    systemctl restart "$@" "$unit"
+}
+
 wait_unit_active() {
     local unit="$1" timeout="${2:-30}" deadline
     deadline=$((SECONDS + timeout))
@@ -746,12 +761,12 @@ restore_update_service_state() {
         systemctl disable "$APP_NAME-autosync.service" >/dev/null 2>&1 || true
     fi
     if [ "$main_active" = "true" ]; then
-        systemctl restart "$APP_NAME.service" >/dev/null 2>&1 || failed=1
+        restart_managed_service "$APP_NAME.service" >/dev/null 2>&1 || failed=1
     else
         systemctl stop "$APP_NAME.service" >/dev/null 2>&1 || true
     fi
     if [ "$autosync_active" = "true" ]; then
-        systemctl restart "$APP_NAME-autosync.service" >/dev/null 2>&1 || failed=1
+        restart_managed_service "$APP_NAME-autosync.service" >/dev/null 2>&1 || failed=1
     else
         systemctl stop "$APP_NAME-autosync.service" >/dev/null 2>&1 || true
     fi
@@ -893,6 +908,7 @@ load_config() {
     PROXY_KERNEL_DIRECT_BYPASS="${PROXY_KERNEL_DIRECT_BYPASS:-true}"
     ENTRY_DIRECT_SOFTWARE="${ENTRY_DIRECT_SOFTWARE:-true}"
     ENTRY_DIRECT_BT_PT="${ENTRY_DIRECT_BT_PT:-true}"
+    BLOCK_BT_PT_DOMAINS="${BLOCK_BT_PT_DOMAINS:-false}"
     ENTRY_DIRECT_SPEEDTEST="${ENTRY_DIRECT_SPEEDTEST:-true}"
     PROXY_DIRECT_DEFAULT_MIGRATED="${PROXY_DIRECT_DEFAULT_MIGRATED:-false}"
     CONCURRENCY_WARN_PERCENT="${CONCURRENCY_WARN_PERCENT:-80}"
@@ -1273,6 +1289,8 @@ PROXY_KERNEL_DIRECT_BYPASS="true"
 # 三组内置入口机直连规则。关闭某组后，该组流量会继续匹配容器当前出口。
 ENTRY_DIRECT_SOFTWARE="true"
 ENTRY_DIRECT_BT_PT="true"
+# 按域名拒绝 BT/PT 与公共 Tracker 的 DNS 解析，优先于 BT/PT 默认直连。
+BLOCK_BT_PT_DOMAINS="false"
 ENTRY_DIRECT_SPEEDTEST="true"
 
 # 新默认值的一次性迁移标记。请勿手工删除，否则下次安全更新会再次恢复默认直出。
@@ -1507,6 +1525,9 @@ mark_split_only_exit() {
     exit_exists "$n" || die "未知出口: $n"
     ensure_split_only_file
     if ! is_split_only_exit "$n"; then
+        if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" != "true" ] && is_proxy_exit "$n"; then
+            patch_proxy_exit_config "$n" "-" "-" "-" true
+        fi
         printf '%s\n' "$n" >> "$SPLIT_ONLY_EXITS_FILE"
         chmod 600 "$SPLIT_ONLY_EXITS_FILE"
     fi
@@ -1788,6 +1809,7 @@ ensure_runtime_config_defaults() {
     ensure_config_default PROXY_KERNEL_DIRECT_BYPASS true
     ensure_config_default ENTRY_DIRECT_SOFTWARE true
     ensure_config_default ENTRY_DIRECT_BT_PT true
+    ensure_config_default BLOCK_BT_PT_DOMAINS false
     ensure_config_default ENTRY_DIRECT_SPEEDTEST true
     migrate_proxy_direct_default
     ensure_config_default PROXY_DIRECT_DEFAULT_MIGRATED true
@@ -1943,11 +1965,12 @@ upgrade_config_and_components() {
         write_client_file
         write_service
         refresh_existing_exit_service_hooks
+        refresh_split_only_proxy_configs
         systemctl daemon-reload
         systemctl enable "$APP_NAME.service" >/dev/null
-        systemctl restart "$APP_NAME.service"
+        restart_managed_service "$APP_NAME.service"
         if [ "$autosync_was_active" = "true" ]; then
-            systemctl restart "$APP_NAME-autosync.service"
+            restart_managed_service "$APP_NAME-autosync.service"
         else
             systemctl stop "$APP_NAME-autosync.service" 2>/dev/null || true
         fi
@@ -1962,7 +1985,7 @@ upgrade_config_and_components() {
         installed_hash="$(script_sha256 "$INSTALL_BIN")"
         info "安全更新完成：配置项、脚本组件、systemd 和数据面均已通过健康检查。"
         info "版本确认: $installed_before_hash -> $installed_hash"
-        info "固定更新命令: sbout update-github && sbout upgrade"
+        info "GitHub 安全更新命令: sbout update-github"
         info "现有出口、容器授权、token、限速、分流策略和自定义规则均已保留。"
         info "更新前备份: $UPDATE_BACKUP_PATH"
         return 0
@@ -2418,6 +2441,7 @@ validate_runtime_config() {
     valid_bool_value "$PROXY_KERNEL_DIRECT_BYPASS" || die "PROXY_KERNEL_DIRECT_BYPASS 必须是 true 或 false"
     valid_bool_value "$ENTRY_DIRECT_SOFTWARE" || die "ENTRY_DIRECT_SOFTWARE 必须是 true 或 false"
     valid_bool_value "$ENTRY_DIRECT_BT_PT" || die "ENTRY_DIRECT_BT_PT 必须是 true 或 false"
+    valid_bool_value "$BLOCK_BT_PT_DOMAINS" || die "BLOCK_BT_PT_DOMAINS 必须是 true 或 false"
     valid_bool_value "$ENTRY_DIRECT_SPEEDTEST" || die "ENTRY_DIRECT_SPEEDTEST 必须是 true 或 false"
     valid_bool_value "$PROXY_DIRECT_DEFAULT_MIGRATED" || die "PROXY_DIRECT_DEFAULT_MIGRATED 必须是 true 或 false"
     valid_bool_value "$SPLIT_DNSMASQ_NFTSET" || die "SPLIT_DNSMASQ_NFTSET 必须是 true 或 false"
@@ -2530,8 +2554,23 @@ route_spec_value() {
     return 1
 }
 
+apply_wireguard_bridge_routes() {
+    local table="$1" bridge prefix routes protocol=198
+    # Mark-aware reverse-path validation also looks up guest source addresses
+    # in the exit table. Keep connected bridge routes ahead of its WG default.
+    ip -4 route flush table "$table" proto "$protocol" 2>/dev/null || true
+    for bridge in $BRIDGE_IFACES; do
+        ip link show "$bridge" >/dev/null 2>&1 || continue
+        routes="$(ip -4 route show table main dev "$bridge" proto kernel scope link)" || return 1
+        while read -r prefix _; do
+            [[ "$prefix" == */* ]] && is_ipv4 "${prefix%/*}" || continue
+            ip -4 route replace "$prefix" dev "$bridge" scope link proto "$protocol" table "$table" || return 1
+        done <<< "$routes"
+    done
+}
+
 apply_default_route() {
-    local family="$1" table="$2" spec="$3" via="" dev="" route_cmd
+    local family="$1" table="$2" spec="$3" via="" dev="" route_cmd rp_all rp_dev rp_key
     local -a cmd
     case "$spec" in ""|none|-) return 0 ;; esac
     via="$(route_spec_value "$spec" via || true)"
@@ -2551,6 +2590,20 @@ apply_default_route() {
     if [ -n "$dev" ] && ! ip link show "$dev" >/dev/null 2>&1; then
         warn "出口设备 $dev 尚未就绪，table $table 已进入阻断保护，流量不会回落到入口机。"
         return 0
+    fi
+    if [[ "$family" == 4 && "$dev" == cwg-* ]]; then
+        apply_wireguard_bridge_routes "$table" || return 1
+        # WireGuard replies can enter via the tunnel while the main reverse
+        # route points to the WAN. Linux uses the maximum of all and interface.
+        rp_key="net.ipv4.conf.$dev.rp_filter"
+        rp_all="$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)" || rp_all=""
+        rp_dev="$(sysctl -n "$rp_key" 2>/dev/null)" || rp_dev=""
+        if [[ "$rp_all" =~ ^[01]$ && "$rp_dev" =~ ^[01]$ && ( "$rp_all" == 1 || "$rp_dev" == 1 ) ]]; then
+            if ! sysctl -q -w "$rp_key=2"; then
+                warn "WireGuard 接口 $dev 无法放宽反向路径检查，已保留不可达兜底。"
+                return 1
+            fi
+        fi
     fi
     cmd=("${route_cmd[@]}" add default "${cmd[@]}" metric 10 table "$table")
     if ! "${cmd[@]}"; then
@@ -2677,7 +2730,6 @@ nft_elements_from_file() {
 
 build_split_dnsmasq_file() {
     local out="$1" app raw safe kind domain
-    : > "$out"
     while IFS=$'\t' read -r app _target; do
         [ -n "$app" ] || continue
         raw="$(split_raw_file "$app")"
@@ -2691,8 +2743,8 @@ build_split_dnsmasq_file() {
             domain="${domain#.}"
             domain="${domain%.}"
             valid_domain_name "$domain" || continue
-            printf 'nftset=/%s/4#inet#%s#split4_%s\n' "$domain" "$NFT_TABLE" "$safe" >> "$out"
-            printf 'nftset=/%s/6#inet#%s#split6_%s\n' "$domain" "$NFT_TABLE" "$safe" >> "$out"
+            printf '%s\t4#inet#%s#split4_%s\n' "$domain" "$NFT_TABLE" "$safe"
+            printf '%s\t6#inet#%s#split6_%s\n' "$domain" "$NFT_TABLE" "$safe"
         done < <(awk -F ',' '
             /^[[:space:]]*#/ || NF < 2 {next}
             {
@@ -2703,8 +2755,34 @@ build_split_dnsmasq_file() {
                 if (kind == "DOMAIN" || kind == "DOMAIN-SUFFIX") print kind "\t" value
             }
         ' "$raw")
-    done < <(read_enabled_split_app_ids)
-    sort -u -o "$out" "$out"
+    done < <(read_enabled_split_app_ids) | LC_ALL=C sort -u | awk -F '\t' '
+        {
+            if (!($1 in targets)) domains[++total]=$1
+            targets[$1]=targets[$1] (targets[$1] ? "," : "") $2
+        }
+        END {
+            for (i=1; i<=total; i++) {
+                domain=domains[i]
+                all=targets[domain]
+                parent=domain
+                # dnsmasq 选最具体的域名。把匹配的上级域名集合也写入，
+                # 避免显式子域规则使上级分流规则失去该子域的地址。
+                while (sub(/^[^.]+\./, "", parent))
+                    if (parent in targets) all=all "," targets[parent]
+                count=split(all, specs, ",")
+                line=""
+                for (j=1; j<=count; j++) {
+                    spec=specs[j]
+                    if (seen[spec] != i) {
+                        line=line (line ? "," : "") spec
+                        seen[spec]=i
+                    }
+                }
+                # 同一域名只发出一条指令，同时包含所有 IPv4/IPv6 集合。
+                print "nftset=/" domain "/" line
+            }
+        }
+    ' > "$out"
 }
 
 split_dnsmasq_supported() {
@@ -2753,7 +2831,11 @@ split_managed_dns_bridges() {
     for iface in $BRIDGE_IFACES; do
         [ -n "$iface" ] || continue
         [ -d "$INCUS_NETWORKS_DIR/$iface" ] || continue
-        incus_safe network show "$iface" >/dev/null 2>&1 || continue
+        if ! incus_safe network show "$iface" >/dev/null 2>&1; then
+            [ "${1:-}" = --strict ] || continue
+            warn "无法读取 Incus 网桥 $iface 的状态。"
+            return 1
+        fi
         printf '%s\n' "$iface"
     done
 }
@@ -3124,6 +3206,7 @@ apply_split_dns_sidecar_one() {
         printf 'user=%s\n' "$user"
         printf 'group=%s\n' "$group"
         printf 'conf-file=%s\n' "$nftset_file"
+        bt_pt_dns_block_rules
     } > "$tmp_config"
     cat > "$tmp_unit" <<EOF
 [Unit]
@@ -3240,7 +3323,8 @@ recover_incus_bridge_dnsmasq() {
 }
 
 bridge_dhcp_health_check() {
-    local iface v4 v6
+    local iface v4 v6 bridges
+    bridges="$(split_managed_dns_bridges --strict)" || return 1
     while IFS= read -r iface; do
         [ -n "$iface" ] || continue
         v4="$(incus_safe network get "$iface" ipv4.address)" || return 1
@@ -3249,7 +3333,7 @@ bridge_dhcp_health_check() {
             [ -n "$v6" ] && [ "$v6" != none ] || continue
         }
         incus_bridge_dnsmasq_healthy "$iface" || return 1
-    done < <(split_managed_dns_bridges)
+    done <<< "$bridges"
 }
 
 incus_bridge_dnsmasq_required() {
@@ -3262,11 +3346,12 @@ incus_bridge_dnsmasq_required() {
 bridge_dhcp_health() {
     need_root
     load_config
-    local repair="${1:-}" iface v4 v6 reason failed=0
+    local repair="${1:-}" iface v4 v6 reason bridges failed=0
     if reason="$(bridge_dhcp_health_check 2>&1)"; then
         return 0
     fi
     [ "$repair" = --repair ] || { printf '%s\n' "$reason" >&2; return 1; }
+    bridges="$(split_managed_dns_bridges --strict)" || return 1
     state_lock_acquire
     while IFS= read -r iface; do
         [ -n "$iface" ] || continue
@@ -3279,7 +3364,7 @@ bridge_dhcp_health() {
             warn "网桥 $iface 原生 DHCP/DNS 异常，正在单独恢复。"
             recover_incus_bridge_dnsmasq "$iface" || failed=1
         fi
-    done < <(split_managed_dns_bridges)
+    done <<< "$bridges"
     state_lock_release
     [ "$failed" -eq 0 ] && bridge_dhcp_health_check
 }
@@ -3333,12 +3418,14 @@ remove_split_dnsmasq_integration() {
 apply_split_dnsmasq_nftsets() {
     local generated generated_hash iface network_dir config_file old_config current base desired
     local file_changed raw_changed changed=0 sidecar_applied=0 static_count=0 sidecar_failed="false" sidecar_ready required
-    if [ "${SPLIT_DNSMASQ_NFTSET:-true}" != "true" ]; then
+    if [ "${SPLIT_DNSMASQ_NFTSET:-true}" != "true" ] && [ "${BLOCK_BT_PT_DOMAINS:-false}" != "true" ]; then
         remove_split_dnsmasq_integration
         return $?
     fi
     generated="$(mktemp)"
-    build_split_dnsmasq_file "$generated"
+    if [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ]; then
+        build_split_dnsmasq_file "$generated"
+    fi
     generated_hash="$(sha256sum "$generated" | awk '{print $1}')"
     mkdir -p "$SPLIT_DNSMASQ_DIR"
     while IFS= read -r iface; do
@@ -3371,7 +3458,7 @@ apply_split_dnsmasq_nftsets() {
             fi
         fi
         strip_split_dnsmasq_block "$current" "$base"
-        if ! incus_bridge_dnsmasq_supports_nftset "$iface"; then
+        if [ "${SPLIT_DNSMASQ_NFTSET:-true}" != "true" ] || ! incus_bridge_dnsmasq_supports_nftset "$iface"; then
             sidecar_ready="false"
             if [ -s "$generated" ] && split_dns_sidecar_available; then
                 if apply_split_dns_sidecar_one "$iface" "$generated"; then
@@ -3384,6 +3471,7 @@ apply_split_dnsmasq_nftsets() {
             else
                 remove_split_dns_sidecar_one "$iface"
             fi
+            append_split_dnsmasq_block "$base" "" ""
             if ! clear_split_dnsmasq_reference "$iface" "$current" "$base"; then
                 if [ "$sidecar_ready" != "true" ]; then
                     nft flush chain inet "$NFT_TABLE" dns_sidecar_prerouting 2>/dev/null || true
@@ -3403,13 +3491,9 @@ apply_split_dnsmasq_nftsets() {
         fi
         cp "$base" "$desired"
         if [ -s "$generated" ]; then
-            [ ! -s "$desired" ] || printf '\n' >> "$desired"
-            printf '# BEGIN %s nftset\n' "$APP_NAME" >> "$desired"
-            # conf-file 路径本身不会变化。把内容哈希写进 raw.dnsmasq，
-            # 让 Incus 只在规则实际变化时重启一次 dnsmasq 并重新读取文件。
-            printf '# rules-sha256=%s\n' "$generated_hash" >> "$desired"
-            printf 'conf-file=%s\n' "$config_file" >> "$desired"
-            printf '# END %s nftset\n' "$APP_NAME" >> "$desired"
+            append_split_dnsmasq_block "$desired" "$config_file" "$generated_hash"
+        else
+            append_split_dnsmasq_block "$desired" "" ""
         fi
         file_changed="false"
         raw_changed="false"
@@ -3441,7 +3525,15 @@ apply_split_dnsmasq_nftsets() {
     done < <(split_managed_dns_bridges)
     rm -f "$generated"
     if [ "$sidecar_failed" = "true" ]; then
-        nft flush chain inet "$NFT_TABLE" dns_sidecar_prerouting 2>/dev/null || true
+        if [ "${BLOCK_BT_PT_DOMAINS:-false}" = "true" ]; then
+            {
+                printf 'flush chain inet %s dns_sidecar_prerouting\n' "$NFT_TABLE"
+                build_split_dns_sidecar_redirect_rules native-only |
+                    sed "s/^ */add rule inet $NFT_TABLE dns_sidecar_prerouting /"
+            } | nft -f - || return 1
+        else
+            nft flush chain inet "$NFT_TABLE" dns_sidecar_prerouting 2>/dev/null || true
+        fi
         remove_split_dns_sidecars
         sidecar_applied=0
         warn "兼容 DNS 启动或切换失败，已自动取消 DNS 重定向并使用静态缓存。"
@@ -3451,18 +3543,33 @@ apply_split_dnsmasq_nftsets() {
     [ "$static_count" -eq 0 ] || warn "$static_count 个网桥缺少可用的动态 DNS 组件，已使用静态缓存分流。"
 }
 
+append_split_dnsmasq_block() {
+    local output="$1" config_file="$2" hash="$3"
+    [ -n "$config_file" ] || [ "${BLOCK_BT_PT_DOMAINS:-false}" = "true" ] || return 0
+    {
+        [ ! -s "$output" ] || printf '\n'
+        printf '# BEGIN %s nftset\n' "$APP_NAME"
+        if [ -n "$config_file" ]; then
+            # 规则内容变化时触发 Incus 重新读取 conf-file。
+            printf '# rules-sha256=%s\nconf-file=%s\n' "$hash" "$config_file"
+        fi
+        bt_pt_dns_block_rules
+        printf '# END %s nftset\n' "$APP_NAME"
+    } >> "$output"
+}
+
 split_dns_probe() {
-    local server="$1" port="$2" family="$3"
-    python3 - "$server" "$port" "$family" <<'PY'
+    local server="$1" port="$2" family="$3" domain="${4:-example.com}" expected="${5:-0}"
+    python3 - "$server" "$port" "$family" "$domain" "$expected" <<'PY'
 import random
 import socket
 import struct
 import sys
 
-server, raw_port, family = sys.argv[1:4]
+server, raw_port, family, domain, expected = sys.argv[1:6]
 port = int(raw_port)
 txid = random.SystemRandom().randrange(0, 65536)
-question = b"".join(bytes((len(label),)) + label for label in b"example.com".split(b".")) + b"\0"
+question = b"".join(bytes((len(label),)) + label for label in domain.encode("idna").split(b".")) + b"\0"
 packet = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0) + question + struct.pack("!HH", 1, 1)
 sock_family = socket.AF_INET6 if family == "6" else socket.AF_INET
 address = (server, port, 0, 0) if sock_family == socket.AF_INET6 else (server, port)
@@ -3475,7 +3582,7 @@ for _attempt in range(2):
         if len(response) < 12:
             continue
         response_id, flags = struct.unpack("!HH", response[:4])
-        if response_id == txid and flags & 0x8000 and flags & 0x000F == 0:
+        if response_id == txid and flags & 0x8000 and flags & 0x000F == int(expected):
             raise SystemExit(0)
     except OSError:
         pass
@@ -3485,10 +3592,31 @@ raise SystemExit(1)
 PY
 }
 
+bt_pt_dns_block_health() {
+    local bridges iface server family
+    [ "${BLOCK_BT_PT_DOMAINS:-false}" = "true" ] || return 0
+    bridges="$(split_managed_dns_bridges --strict)" || return 1
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        family=4
+        if ! server="$(split_bridge_dns_address "$iface" 4)"; then
+            family=6
+            server="$(split_bridge_dns_address "$iface" 6)" || return 1
+        fi
+        if ! split_dns_probe "$server" 53 "$family" qbittorrent.org 3 ||
+            { split_dns_sidecar_running "$iface" &&
+              ! split_dns_probe "$server" "$SPLIT_DNS_SIDECAR_PORT" "$family" qbittorrent.org 3; }; then
+            printf '网桥 %s 未拒绝 BT/PT 域名解析\n' "$iface" >&2
+            return 1
+        fi
+    done <<< "$bridges"
+}
+
 split_dns_health_check() {
     local generated generated_hash live_sets expected_set iface network_dir config_file current nftset_file unit_file
     local v4 v6 server family port chain total=0 reason=""
     bridge_dhcp_health_check || return 1
+    bt_pt_dns_block_health || return 1
     [ "${ENABLE_SPLIT_RULES:-true}" = "true" ] || return 0
     [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ] || return 0
     generated="$(mktemp)"
@@ -3520,7 +3648,7 @@ for item in payload.get("nftables") or []:
             reason="动态 DNS 对应的 nft 集合缺失: $expected_set"
             break
         fi
-    done < <(awk -F '#' '/^nftset=/{print $4}' "$generated" | sort -u)
+    done < <(awk -F '/' '/^nftset=/{count=split($NF, specs, ","); for(i=1;i<=count;i++){split(specs[i], fields, "#"); print fields[4]}}' "$generated" | sort -u)
     rm -f "$live_sets"
     if [ -n "$reason" ]; then
         rm -f "$generated"
@@ -3631,26 +3759,28 @@ split_dns_health() {
 }
 
 build_split_dns_sidecar_redirect_rules() {
-    local generated iface
-    [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ] || return 0
-    generated="$(mktemp)"
-    build_split_dnsmasq_file "$generated"
-    if [ ! -s "$generated" ]; then
+    local mode="${1:-}" generated iface port dynamic=false
+    if [ "$mode" != native-only ] && [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ]; then
+        generated="$(mktemp)"
+        build_split_dnsmasq_file "$generated"
+        [ ! -s "$generated" ] || dynamic=true
         rm -f "$generated"
-        return 0
     fi
-    rm -f "$generated"
+    [ "$dynamic" = "true" ] || [ "${BLOCK_BT_PT_DOMAINS:-false}" = "true" ] || return 0
     while IFS= read -r iface; do
         [ -n "$iface" ] || continue
-        if incus_bridge_dnsmasq_supports_nftset "$iface"; then
-            if [ "${SPLIT_FORCE_CONTAINER_DNS:-true}" = "true" ]; then
-                printf '    iifname "%s" udp dport 53 redirect to :53\n' "$iface"
-                printf '    iifname "%s" tcp dport 53 redirect to :53\n' "$iface"
-            fi
-        elif split_dns_sidecar_available; then
-            printf '    iifname "%s" udp dport 53 redirect to :%s\n' "$iface" "$SPLIT_DNS_SIDECAR_PORT"
-            printf '    iifname "%s" tcp dport 53 redirect to :%s\n' "$iface" "$SPLIT_DNS_SIDECAR_PORT"
+        port=""
+        if [ "$dynamic" = "true" ] && ! incus_bridge_dnsmasq_supports_nftset "$iface" &&
+            split_dns_sidecar_available; then
+            port="$SPLIT_DNS_SIDECAR_PORT"
+        elif [ "${BLOCK_BT_PT_DOMAINS:-false}" = "true" ] ||
+            { [ "$dynamic" = "true" ] && [ "${SPLIT_FORCE_CONTAINER_DNS:-true}" = "true" ] &&
+              incus_bridge_dnsmasq_supports_nftset "$iface"; }; then
+            port=53
         fi
+        [ -n "$port" ] || continue
+        printf '    iifname "%s" udp dport 53 redirect to :%s\n' "$iface" "$port"
+        printf '    iifname "%s" tcp dport 53 redirect to :%s\n' "$iface" "$port"
     done < <(split_managed_dns_bridges)
 }
 
@@ -3664,10 +3794,12 @@ build_nft_file() {
     local split4="" split6="" split4_line="" split6_line=""
     local block_unmanaged6_line=""
     local dns_sidecar_rules="" dns_sidecar_chain=""
+    local wg_snat_rules="" wg_snat_chain=""
     local split_sets="" split_rules="" force_split_rules="" conditional_force_rules="" container_split_rules="" proxy_direct_rules="" split_collision_rules="" bridge_expr app target policy_targets safe v4file v6file domains_file v4elems v6elems v4elements_line v6elements_line split_mark
     local container cip source category display app_category remote enabled
     local force_sources="" force_src_sets="" src_safe line4 line6
     declare -A force4_src=() force6_src=()
+    declare -A marks_by_exit=()
     local tunnel_mss_rules="" tunnel_mss_seen=$'\n' exit_name exit_route4 exit_route6 exit_route exit_dev exit_conf tunnel_mtu tunnel_mtu_default tunnel_mss _exit_mark _exit_table _exit_display
     bridge_expr="$(bridge_set_expr)"
     dns_sidecar_rules="$(build_split_dns_sidecar_redirect_rules)"
@@ -3683,6 +3815,17 @@ $dns_sidecar_rules
     # TCP 三次握手和小包可以正常，但 HTTPS/REALITY 或大流量会在较大报文阶段超时、断流。
     # 同时处理 SYN 与 SYN+ACK；按隧道 MTU 减去 IPv6+TCP 头部 60 字节，IPv4 也安全适用。
     while IFS=$'\t' read -r exit_name _exit_mark _exit_table exit_route4 exit_route6 _exit_display; do
+        marks_by_exit[$exit_name]="$_exit_mark"
+        # Incus can SNAT its bridge to a fixed WAN address. Translate packets
+        # selected for WireGuard first so the remote peer sees the tunnel IP.
+        case "$exit_route4" in
+            dev:cwg-*) wg_snat_rules="$wg_snat_rules    meta nfproto ipv4 iifname { $bridge_expr } oifname \"${exit_route4#dev:}\" meta mark $_exit_mark masquerade
+" ;;
+        esac
+        case "$exit_route6" in
+            dev:cwg-*) wg_snat_rules="$wg_snat_rules    meta nfproto ipv6 iifname { $bridge_expr } oifname \"${exit_route6#dev:}\" meta mark $_exit_mark masquerade
+" ;;
+        esac
         for exit_route in "$exit_route4" "$exit_route6"; do
             case "$exit_route" in
                 dev:cwg-*|dev:csh-*) exit_dev="${exit_route#dev:}" ;;
@@ -3715,6 +3858,13 @@ $dns_sidecar_rules
 "
         done
     done < <(read_exit_rows)
+    if [ -n "$wg_snat_rules" ]; then
+        wg_snat_chain="
+  chain wireguard_postrouting {
+    type nat hook postrouting priority srcnat - 5; policy accept;
+$wg_snat_rules  }
+"
+    fi
     while IFS=$'\t' read -r name ip token allowed current; do
         if is_ipv4 "$ip"; then
             comma=""
@@ -3731,7 +3881,7 @@ $dns_sidecar_rules
                 split4="${split4}${comma}${ip}"
                 continue
             fi
-            mark="$(exit_mark "$current")"
+            mark="${marks_by_exit[$current]:-}"
             [ -n "$mark" ] || continue
             comma=""
             [ -n "$elems4" ] && comma=", "
@@ -3752,7 +3902,7 @@ $dns_sidecar_rules
                 split6="${split6}${comma}${ip}"
                 continue
             fi
-            mark="$(exit_mark "$current")"
+            mark="${marks_by_exit[$current]:-}"
             [ -n "$mark" ] || continue
             comma=""
             [ -n "$elems6" ] && comma=", "
@@ -4102,7 +4252,7 @@ $elems4_line
 $elems6_line
   }
 $force_src_sets$split_sets
-$dns_sidecar_chain
+$dns_sidecar_chain$wg_snat_chain
 
   chain prerouting {
     # 晚于常见的 mangle(-150) 链执行，避免宿主机已有回程/默认出口规则覆盖容器自选出口标记。
@@ -4125,32 +4275,108 @@ $tunnel_mss_rules  }
 EOF
 }
 
+apply_wireguard_bridge_routes_for_exits() {
+    local _name _mark table route4 _route6 _display
+    while IFS=$'\t' read -r _name _mark table route4 _route6 _display; do
+        case "$route4" in
+            dev:cwg-*) apply_wireguard_bridge_routes "$table" || return 1 ;;
+        esac
+    done < <(read_exit_rows)
+}
+
 apply_nftables() {
-    local preserve_pending="${1:-false}" tmp batch
+    local preserve_pending="${1:-false}" tmp batch dns_config live
+    apply_wireguard_bridge_routes_for_exits || return 1
     tmp="$(mktemp)"
     batch="$(mktemp)"
+    dns_config="$(mktemp)"
+    live="$(mktemp)"
     build_nft_file "$tmp"
+    if [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ]; then
+        build_split_dnsmasq_file "$dns_config"
+    fi
     if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
         printf 'delete table inet %s\n' "$NFT_TABLE" > "$batch"
     fi
     cat "$tmp" >> "$batch"
+    if [ "${PRESERVE_LEARNED_SPLIT_DNS:-true}" = "true" ] &&
+        [ -s "$dns_config" ] && [ -s "$SPLIT_DNS_STATE_FILE" ] && [ -s "$NFT_STATE_FILE" ] &&
+        nft -j list table inet "$NFT_TABLE" > "$live" 2>/dev/null; then
+        if ! preserve_split_dns_elements "$live" "$tmp" "$dns_config" >> "$batch"; then
+            rm -f "$tmp" "$batch" "$dns_config" "$live"
+            return 1
+        fi
+    fi
     # delete + create 位于同一个 nft transaction；校验或提交失败时旧表保持不变。
     if ! nft -c -f "$batch"; then
-        rm -f "$tmp" "$batch"
+        rm -f "$tmp" "$batch" "$dns_config" "$live"
         return 1
     fi
     if ! nft -f "$batch"; then
-        rm -f "$tmp" "$batch"
+        rm -f "$tmp" "$batch" "$dns_config" "$live"
         return 1
     fi
     mkdir -p "$RUN_DIR"
-    cp "$tmp" "$NFT_STATE_FILE"
     if ! apply_split_dnsmasq_nftsets; then
-        rm -f "$tmp" "$batch"
+        rm -f "$tmp" "$batch" "$dns_config" "$live"
         return 1
     fi
+    cp "$tmp" "$NFT_STATE_FILE"
+    cp "$dns_config" "$SPLIT_DNS_STATE_FILE"
     [ "$preserve_pending" = "true" ] || rm -f "$PENDING_NFT_FILE"
-    rm -f "$tmp" "$batch"
+    rm -f "$tmp" "$batch" "$dns_config" "$live"
+}
+
+preserve_split_dns_elements() {
+    python3 - "$NFT_TABLE" "$1" "$NFT_STATE_FILE" "$2" "$SPLIT_DNS_STATE_FILE" "$3" <<'PY'
+from collections import defaultdict
+import ipaddress
+import json
+from pathlib import Path
+import re
+import sys
+
+table, live_path, old_nft, new_nft, old_dns, new_dns = sys.argv[1:]
+
+def dns_domains(path):
+    by_set = defaultdict(set)
+    for line in Path(path).read_text().splitlines():
+        if not line.startswith("nftset=/"):
+            continue
+        _, domain, specs = line.split("/", 2)
+        for spec in specs.split(","):
+            by_set[spec.rsplit("#", 1)[1]].add(domain)
+    return by_set
+
+def split_sets(path):
+    return dict(re.findall(r"^  set (split[46]_\w+) \{\n(.*?)^  \}", Path(path).read_text(), re.M | re.S))
+
+previous_dns, desired_dns = dns_domains(old_dns), dns_domains(new_dns)
+previous_sets, desired_sets = split_sets(old_nft), split_sets(new_nft)
+for item in json.loads(Path(live_path).read_text())["nftables"]:
+    live = item.get("set")
+    if not live:
+        continue
+    name = live["name"]
+    # 只有静态地址和匹配域名都一致，才继承 dnsmasq 已经加入的单个 IP。
+    if (name not in desired_dns or desired_dns[name] != previous_dns.get(name)
+            or name not in desired_sets or desired_sets[name] != previous_sets.get(name)):
+        continue
+    static_match = re.search(r"elements = \{(.*?)\}", desired_sets[name])
+    static = [ipaddress.ip_network(x.strip()) for x in static_match[1].split(",")] if static_match else []
+    learned = []
+    for value in live.get("elem", []):
+        if not isinstance(value, str):
+            continue
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            continue
+        if not any(address in network for network in static):
+            learned.append(str(address))
+    if learned:
+        print("add element inet %s %s { %s }" % (table, name, ", ".join(learned)))
+PY
 }
 
 apply_guard_table() {
@@ -4295,6 +4521,18 @@ do_apply_exit_route() {
     apply_default_route 6 "$table" "$route6"
     apply_lock_release
     state_lock_release
+}
+
+do_apply_wireguard_bridge_routes() {
+    need_root
+    load_config
+    state_lock_acquire
+    apply_lock_acquire
+    local status=0
+    apply_wireguard_bridge_routes_for_exits || status=$?
+    apply_lock_release
+    state_lock_release
+    return "$status"
 }
 
 gen_token() {
@@ -4782,8 +5020,8 @@ EOF
 }
 
 proxy_direct_bt_pt_rule_lines() {
-    # ubits.club 的第三方优选 CNAME 会指向 OKX/Coinbase 等站点；
-    # 将其解析结果加入全局 IP 直连集合会误伤这些站点，因此不纳入默认规则。
+    # ubits.club 与 hitpt.com 的解析可能与交易所共用 CDN 地址，
+    # 将其加入全局 IP 直连集合会误伤业务流量，因此不纳入默认规则。
     cat <<'EOF'
 # BT 客户端与公共 Tracker
 DOMAIN-SUFFIX,bittorrent.com
@@ -4865,7 +5103,6 @@ DOMAIN-SUFFIX,hdvideo.one
 DOMAIN-SUFFIX,hdzone.me
 DOMAIN-SUFFIX,hhan.club
 DOMAIN-SUFFIX,hhanclub.top
-DOMAIN-SUFFIX,hitpt.com
 DOMAIN-SUFFIX,hudbt.hust.edu.cn
 DOMAIN-SUFFIX,ianon.app
 DOMAIN-SUFFIX,icc2022.com
@@ -5026,13 +5263,26 @@ EOF
 
 proxy_direct_any_enabled() {
     [ "${ENTRY_DIRECT_SOFTWARE:-true}" = "true" ] ||
-        [ "${ENTRY_DIRECT_BT_PT:-true}" = "true" ] ||
+        entry_direct_bt_pt_enabled ||
         [ "${ENTRY_DIRECT_SPEEDTEST:-true}" = "true" ]
+}
+
+entry_direct_bt_pt_enabled() {
+    [ "${ENTRY_DIRECT_BT_PT:-true}" = "true" ] && [ "${BLOCK_BT_PT_DOMAINS:-false}" != "true" ]
+}
+
+bt_pt_dns_block_rules() {
+    [ "${BLOCK_BT_PT_DOMAINS:-false}" = "true" ] || return 0
+    {
+        proxy_direct_bt_pt_rule_lines
+        # 这两个站点的共享 CDN 地址不得进直连集合，仍可按域名屏蔽。
+        printf '%s\n' DOMAIN-SUFFIX,ubits.club DOMAIN-SUFFIX,hitpt.com
+    } | awk -F ',' '/^DOMAIN(-SUFFIX)?,/ {print "local=/" $2 "/"}' | LC_ALL=C sort -u
 }
 
 proxy_direct_enabled_rule_lines() {
     [ "${ENTRY_DIRECT_SOFTWARE:-true}" = "true" ] && proxy_direct_software_rule_lines
-    [ "${ENTRY_DIRECT_BT_PT:-true}" = "true" ] && proxy_direct_bt_pt_rule_lines
+    entry_direct_bt_pt_enabled && proxy_direct_bt_pt_rule_lines
     [ "${ENTRY_DIRECT_SPEEDTEST:-true}" = "true" ] && proxy_direct_speedtest_rule_lines
     return 0
 }
@@ -5105,13 +5355,14 @@ clear_proxy_direct_resolved_cache() {
 }
 
 split_parse_proxy_direct_rules() {
+    local mode="${1:-refresh}"
     local workers="${SPLIT_DNS_WORKERS:-4}"
     [[ "$workers" =~ ^[0-9]+$ ]] || workers=4
     [ "$workers" -ge 12 ] || workers=12
     # 内置直连三组共用一个缓存，数量明显大于单个应用；提高专用上限，
     # 确保不支持 dnsmasq nftset 的入口机也能获得完整静态解析结果。
     SPLIT_DOMAIN_RESOLVE_LIMIT=600 SPLIT_DNS_WORKERS="$workers" \
-        split_parse_app_rules "$PROXY_DIRECT_APP_ID"
+        split_parse_app_rules "$PROXY_DIRECT_APP_ID" "$mode" "$SPLIT_RESOLVED_DIR/$PROXY_DIRECT_APP_ID.answers.json"
 }
 
 ensure_proxy_direct_rule_source() {
@@ -5131,6 +5382,7 @@ ensure_proxy_direct_rule_source() {
 }
 
 prepare_proxy_direct_rule_cache() {
+    local mode="${1:-refresh}"
     split_cache_lock_acquire
     ensure_proxy_direct_rule_source
     if ! proxy_direct_any_enabled; then
@@ -5138,11 +5390,27 @@ prepare_proxy_direct_rule_cache() {
         split_cache_lock_release
         return 0
     fi
-    if ! split_parse_proxy_direct_rules; then
+    if ! split_parse_proxy_direct_rules "$mode"; then
         split_cache_lock_release
         return 1
     fi
     split_cache_lock_release
+}
+
+proxy_direct_native_dns_ready() {
+    local iface bridges
+    [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ] || return 1
+    bridges="$(split_managed_dns_bridges --strict)" || return 1
+    [ -n "$bridges" ] || return 1
+    # 非 Incus 网桥无法通过本脚本的动态 DNS 插件补充 IP。
+    for iface in $BRIDGE_IFACES; do
+        if ip link show dev "$iface" >/dev/null 2>&1; then
+            grep -Fxq "$iface" <<< "$bridges" || return 1
+        fi
+    done
+    while IFS= read -r iface; do
+        incus_bridge_dnsmasq_supports_nftset "$iface" || return 1
+    done <<< "$bridges"
 }
 
 prepare_default_proxy_direct_bypass() {
@@ -5258,7 +5526,10 @@ write_proxy_exit_files() {
     resolved_guard="$LIB_DIR/clear-resolved-link"
     server_esc=$(json_escape "$server")
     outbound_json=$(proxy_outbound_json "$protocol" "$server" "$port" "$method" "$password" "$username")
-    split_rules=$(proxy_split_rules)
+    split_rules=""
+    if [ "${ADDING_SPLIT_ONLY_EXIT:-false}" != "true" ] && ! is_split_only_exit "$name"; then
+        split_rules=$(proxy_split_rules)
+    fi
     sniff_rule=""
     if [ -n "$split_rules" ]; then
         sniff_rule='      { "inbound": ["tun-in"], "action": "sniff" },'
@@ -5412,6 +5683,11 @@ is_proxy_exit() {
 patch_proxy_exit_config() {
     local name="$1" new_level="${2:--}" new_stack="${3:--}" new_eim="${4:--}" kernel_bypass="${5:-${PROXY_KERNEL_DIRECT_BYPASS:-true}}"
     local conf="$EXIT_DIR/$name/config.json" backup enabled_rules all_rules service iface was_active="false"
+    # The host already selected this exit for a specific app. Applying the
+    # legacy built-in direct rules inside this tunnel could bypass that policy.
+    if is_split_only_exit "$name"; then
+        kernel_bypass="true"
+    fi
     [ -s "$conf" ] || die "出口 $name 不是脚本托管的 sing-box 出口。"
     [ "$new_level" = "-" ] || valid_proxy_log_level "$new_level" || die "sing-box 日志等级无效: $new_level"
     [ "$new_stack" = "-" ] || valid_proxy_tun_stack "$new_stack" || die "sing-box TUN 栈无效: $new_stack"
@@ -5432,6 +5708,7 @@ import tempfile
 path, level, stack, eim, kernel_bypass, enabled_path, all_path = sys.argv[1:8]
 with open(path, "r", encoding="utf-8") as fh:
     data = json.load(fh)
+original = json.dumps(data, sort_keys=True)
 
 if level != "-":
     data.setdefault("log", {})["level"] = level
@@ -5506,6 +5783,8 @@ if kernel_bypass != "true" and any(enabled.values()):
     for rule in reversed(generated):
         rules.insert(insert_at, rule)
 route["rules"] = rules
+if json.dumps(data, sort_keys=True) == original:
+    raise SystemExit(0)
 
 directory = os.path.dirname(path)
 fd, staged = tempfile.mkstemp(prefix=".config.", suffix=".json", dir=directory)
@@ -5529,20 +5808,20 @@ PY
         die "修改 sing-box 出口 $name 的运行参数失败，已保留原配置。"
     fi
     rm -f "$enabled_rules" "$all_rules"
+    if cmp -s "$backup" "$conf"; then
+        rm -f "$backup"
+        return 0
+    fi
     if ! "$SINGBOX_BIN" check -c "$conf" >/dev/null 2>&1; then
         install -m 0600 "$backup" "$conf"
         rm -f "$backup"
         die "修改后的 sing-box 配置校验失败，已恢复出口 $name。"
     fi
-    if cmp -s "$backup" "$conf"; then
-        rm -f "$backup"
-        return 0
-    fi
-
     service="${EXIT_SERVICE_PREFIX}-${name}"
     iface="$(proxy_exit_interface "$name" || true)"
     systemctl is-active --quiet "$service" 2>/dev/null && was_active="true"
     if [ "$was_active" = "true" ]; then
+        info "正在重载出口 $name ..." >&2
         if ! systemctl restart "$service" || { [ -n "$iface" ] && ! wait_for_iface "$iface"; }; then
             install -m 0600 "$backup" "$conf"
             systemctl restart "$service" >/dev/null 2>&1 || true
@@ -5551,6 +5830,15 @@ PY
         fi
     fi
     rm -f "$backup"
+}
+
+refresh_split_only_proxy_configs() {
+    local name
+    [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" != "true" ] || return 0
+    while IFS= read -r name; do
+        is_proxy_exit "$name" || continue
+        patch_proxy_exit_config "$name" "-" "-" "-" true
+    done < <(split_only_exit_names)
 }
 
 apply_proxy_profile_all() {
@@ -5675,7 +5963,7 @@ start_proxy_exit() {
         rollback_proxy_exit_add "$name"
         die "$kind 出口 '$display' 已启动，但宿主机路由应用失败，已回滚本次添加。"
     fi
-    info "$kind 出口 '$display' 已添加并启动。需要接管或刷新容器时，请在主菜单选择 7 或 8。"
+    info "$kind 出口 '$display' 已添加并启动。需要接管或刷新容器时，请在主菜单选择 [9] 出口切换接管或 [10] 仅宿主机分流。"
 }
 
 add_ss_exit_values() {
@@ -6063,7 +6351,7 @@ add_wireguard_exit() {
         printf '  本地UDP端口: 随机（如需防火墙白名单，请重新添加时指定固定端口）\n'
     fi
     printf '\n下一步：回到 WG 出口机，选择“添加入口机”，复制上面的公钥和隧道地址。\n'
-        printf '出口机添加完成后，再通过入口机主菜单 8 同步实例。\n'
+        printf '出口机添加完成后，再通过入口机主菜单 [9] 同步实例并授权切换出口。\n'
 }
 
 wireguard_exit_conf() {
@@ -6426,6 +6714,18 @@ def parse_probe_ip(output, family):
     return ""
 
 
+def proxy_tun_is_down(iface):
+    if not iface:
+        return False
+    try:
+        with open(os.path.join("/sys/class/net", iface, "flags"), encoding="ascii") as fh:
+            return not (int(fh.read().strip(), 0) & 1)
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def live_probe(iface, family):
     if family == 6:
         targets = [("-6", "https://api64.ipify.org")]
@@ -6736,17 +7036,24 @@ with open(lock_path, "a+", encoding="utf-8") as lock_fh:
                 if probe_error:
                     attempted = bool(entry.get("probe_repair_attempted", False))
                     already_restarted = bool(entry.get("action"))
-                    if repair and not attempted and not already_restarted:
+                    # Public probe sites can fail while existing sessions still work.
+                    # Only repair a confirmed local interface fault here.
+                    tun_down = proxy_tun_is_down(probe_iface)
+                    if repair and tun_down and not attempted and not already_restarted:
                         restarted = run(["systemctl", "restart", unit], timeout=20)
                         if restarted.returncode == 0:
                             entry["status"] = "恢复中"
                             entry["probe_repair_attempted"] = True
                             entry["last_repair"] = now
-                            entry["action"] = "真实探测失败，已重启对应 sing-box 出口服务"
+                            entry["action"] = "本地 TUN 不可用，已重启对应 sing-box 出口服务"
                             append_message(entry, "已自动重启对应出口一次")
-                            notices.append("%s: 真实出口探测失败，已重启对应 sing-box 服务一次" % display)
+                            notices.append("%s: 本地 TUN 不可用，已重启对应 sing-box 服务一次" % display)
                         else:
                             hard_failures.append("%s: %s；服务重启失败" % (display, probe_error))
+                    elif not tun_down:
+                        message = "%s；本地 TUN 未确认故障，保留现有服务与连接" % probe_error
+                        append_message(entry, "本地 TUN 未确认故障，保留现有服务与连接")
+                        hard_failures.append("%s: %s" % (display, message))
                     else:
                         hard_failures.append("%s: %s" % (display, probe_error))
             current_exits[name] = entry
@@ -7575,7 +7882,7 @@ repair_exit_references() {
     need_root
     load_config
     write_default_config
-    local dry_run="false" no_runtime="false" arg report rc
+    local dry_run="false" no_runtime="false" refresh_autosync="false" arg report rc
     for arg in "$@"; do
         case "$arg" in
             --dry-run) dry_run="true" ;;
@@ -7584,6 +7891,10 @@ repair_exit_references() {
         esac
     done
     need_cmd python3
+    if [ "$no_runtime" != "true" ] && [ "$dry_run" != "true" ] && [ "${AUTO_SYNC:-true}" = "true" ] &&
+        unit_is_active "$APP_NAME-autosync.service"; then
+        refresh_autosync="true"
+    fi
 
     state_lock_acquire
     if report="$(python3 - "$CONFIG_DIR" "$dry_run" <<'PY'
@@ -7981,17 +8292,16 @@ PY
         if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || warn "systemd daemon-reload 失败。"
             systemctl enable "$APP_NAME" >/dev/null 2>&1 || true
-            if ! systemctl restart "$APP_NAME"; then
+            if ! restart_managed_service "$APP_NAME"; then
                 warn "API 服务重启失败: $APP_NAME"
             fi
-            if [ "${AUTO_SYNC:-true}" = "true" ]; then
-                systemctl enable "$APP_NAME-autosync" >/dev/null 2>&1 || true
-                if ! systemctl restart --no-block "$APP_NAME-autosync"; then
+            if [ "$refresh_autosync" = "true" ]; then
+                if ! restart_managed_service "$APP_NAME-autosync" --no-block; then
                     warn "自动同步服务重启失败: $APP_NAME-autosync"
                 fi
             fi
         fi
-        if command -v incus >/dev/null 2>&1; then
+        if [ "$refresh_autosync" = "true" ] && command -v incus >/dev/null 2>&1; then
             if ! sync_now; then
                 warn "出口引用修复后自动同步未通过，请查看服务日志。"
                 return 1
@@ -8968,7 +9278,7 @@ split_download_app() {
 }
 
 split_parse_app_rules() {
-    local app="$1" raw v4 v6 domains unsupported stats
+    local app="$1" mode="${2:-refresh}" answers="${3:-}" raw v4 v6 domains unsupported stats
     raw="$(split_raw_file "$app")"
     v4="$(split_resolved_v4_file "$app")"
     v6="$(split_resolved_v6_file "$app")"
@@ -8976,15 +9286,19 @@ split_parse_app_rules() {
     unsupported="$SPLIT_RESOLVED_DIR/$app.unsupported"
     stats="$SPLIT_RESOLVED_DIR/$app.stats"
     mkdir -p "$SPLIT_RESOLVED_DIR"
-    python3 - "$raw" "$v4" "$v6" "$domains" "$unsupported" "$stats" "${SPLIT_DOMAIN_RESOLVE_LIMIT:-300}" "${SPLIT_DNS_TIMEOUT:-2}" "${SPLIT_DNS_WORKERS:-4}" <<'PY'
+    python3 - "$raw" "$v4" "$v6" "$domains" "$unsupported" "$stats" "${SPLIT_DOMAIN_RESOLVE_LIMIT:-300}" "${SPLIT_DNS_TIMEOUT:-2}" "${SPLIT_DNS_WORKERS:-4}" \
+        "$mode" "$answers" "${SPLIT_DNS_REFRESH_INTERVAL:-21600}" <<'PY'
 import concurrent.futures
 import datetime
 import ipaddress
+import json
 import os
 import socket
 import sys
+import time
 
 raw_path, v4_path, v6_path, domains_path, unsupported_path, stats_path, limit_s, timeout_s, workers_s = sys.argv[1:10]
+mode, answers_path, refresh_s = sys.argv[10:13]
 limit = max(int(limit_s or "300"), 0)
 timeout = max(float(timeout_s or "2"), 0.2)
 dns_workers = max(1, min(int(workers_s or "4"), 16))
@@ -9089,15 +9403,41 @@ with open(raw_path, "r", encoding="utf-8", errors="ignore") as fh:
 
 
 unique_domains = list(dict.fromkeys(domains))
-if unique_domains:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(dns_workers, len(unique_domains))) as executor:
-        for domain, addresses in executor.map(resolve_domain, unique_domains):
-            if addresses:
-                resolved_domains += 1
-                for address in addresses:
-                    add_ip_or_cidr(address)
-            else:
-                unsupported.append("UNRESOLVED,%s" % domain)
+answers = {}
+now = int(time.time())
+if answers_path:
+    max_age = max(300, int(refresh_s))
+    try:
+        with open(answers_path, encoding="utf-8") as fh:
+            previous = json.load(fh)
+        answers = {
+            domain: entry for domain, entry in previous.items()
+            if isinstance(entry, list) and len(entry) == 2
+            and isinstance(entry[0], int) and 0 <= now - entry[0] < max_age
+            and isinstance(entry[1], list) and all(isinstance(address, str) for address in entry[1])
+        }
+    except (OSError, ValueError, AttributeError):
+        pass
+
+pending = [domain for domain in unique_domains if mode == "refresh" or domain not in answers]
+if pending and mode != "cached":
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(dns_workers, len(pending))) as executor:
+        for domain, addresses in executor.map(resolve_domain, pending):
+            answers[domain] = [now, sorted(addresses)]
+    if answers_path:
+        with open(answers_path + ".tmp", "w", encoding="utf-8") as out:
+            json.dump(answers, out)
+        os.chmod(answers_path + ".tmp", 0o600)
+        os.replace(answers_path + ".tmp", answers_path)
+
+for domain in unique_domains:
+    addresses = answers.get(domain, (0, []))[1]
+    if addresses:
+        resolved_domains += 1
+        for address in addresses:
+            add_ip_or_cidr(address)
+    elif domain in answers:
+        unsupported.append("UNRESOLVED,%s" % domain)
 
 
 def write_lines(path, values):
@@ -9930,7 +10270,8 @@ split_refresh_cached_dns() {
     done < <(read_enabled_split_app_ids)
     split_cache_lock_release
     if [ "$parsed" -gt 0 ]; then
-        do_apply_nftables
+        # 周期刷新会淘汰旧动态地址。修改出口目标时则应保留已学习地址。
+        PRESERVE_LEARNED_SPLIT_DNS=false do_apply_nftables
     fi
     info "已用本地缓存刷新分流域名：成功 $parsed 个，失败/无缓存 $failed 个；未访问 GitHub。"
 }
@@ -10262,6 +10603,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -10318,14 +10660,26 @@ API_SOCKET_TIMEOUT = max(2, int(os.environ.get("API_SOCKET_TIMEOUT", CFG.get("AP
 CONNTRACK_BIN = shutil.which("conntrack")
 RATE_LOCK = threading.Lock()
 RATE_BUCKETS = {}
+HELD_STATE_LOCK = threading.local()
 
 
 @contextmanager
 def file_lock(path, exclusive=True):
+    if path == STATE_LOCK_FILE and hasattr(HELD_STATE_LOCK, "exclusive"):
+        if exclusive and not HELD_STATE_LOCK.exclusive:
+            raise RuntimeError("cannot upgrade a held shared state lock")
+        yield
+        return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a+", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-        yield
+        if path == STATE_LOCK_FILE:
+            HELD_STATE_LOCK.exclusive = exclusive
+        try:
+            yield
+        finally:
+            if path == STATE_LOCK_FILE:
+                del HELD_STATE_LOCK.exclusive
 
 
 def rate_allowed(source):
@@ -10679,12 +11033,32 @@ def clear_pending_generation(generation):
                 pass
 
 
-def update_container_current(container_ip, new_exit):
+class StaleContainerRequest(Exception):
+    pass
+
+
+def recheck_container(expected):
+    current = find_container_by_ip(expected["ip"])
+    if current is None or current["name"] != expected["name"] or current["token"] != expected["token"]:
+        raise StaleContainerRequest("实例身份已变化，请重新请求")
+    return current
+
+
+def update_container_current(container, new_exit, rollback_from=None):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with file_lock(STATE_LOCK_FILE):
+        current = recheck_container(container)
+        if rollback_from is None:
+            if (not is_allowed_target(current, new_exit) or
+                    (new_exit != DIRECT_EXIT and
+                     (new_exit not in load_exits() or new_exit in load_split_only_exits()))):
+                raise StaleContainerRequest("实例出口授权已变化，请重新请求")
+        elif current["current"] != rollback_from:
+            raise StaleContainerRequest("实例出口已被其他操作更新")
+        previous = current["current"]
+        if previous == new_exit:
+            return previous, None
         fd, tmp_path = tempfile.mkstemp(prefix="containers.", dir=CONFIG_DIR)
-        found = False
-        previous = None
         with os.fdopen(fd, "w", encoding="utf-8") as out:
             with open(CONTAINERS_FILE, "r", encoding="utf-8") as src:
                 for raw in src:
@@ -10696,22 +11070,29 @@ def update_container_current(container_ip, new_exit):
                     if len(parts) < 5:
                         out.write(raw)
                         continue
-                    if normalize_ip(parts[1]) == normalize_ip(container_ip):
-                        previous = parts[4]
+                    if parts[0] == current["name"] and normalize_ip(parts[1]) == normalize_ip(current["ip"]):
                         parts[4] = new_exit
-                        found = True
                     out.write("\t".join(parts) + "\n")
-        if not found:
-            os.unlink(tmp_path)
-            raise RuntimeError("container row disappeared")
         os.chmod(tmp_path, 0o600)
+        generation = write_pending_generation()
         os.replace(tmp_path, CONTAINERS_FILE)
-        return previous, write_pending_generation()
+        return previous, generation
 
 
-def update_container_split(container_name, app, target):
+def update_container_split(container, app, target, rollback=False):
     os.makedirs(SPLIT_DIR, exist_ok=True)
     with file_lock(STATE_LOCK_FILE):
+        current = recheck_container(container)
+        container_name = current["name"]
+        if not rollback:
+            policy = load_split_policies().get(app, "")
+            apps = load_split_apps()
+            if (not policy or app_is_forced(app, apps) or conditional_force_target(app, apps, current)
+                    or (target != DEFAULT_SPLIT_TARGET and
+                        (target != DIRECT_EXIT and target not in load_exits()
+                         or not split_target_allowed(policy, target)
+                         or not (is_allowed_target(current, target) or target in load_split_only_exits())))):
+                raise StaleContainerRequest("实例分流策略已变化，请重新请求")
         fd, tmp_path = tempfile.mkstemp(prefix="container-policies.", dir=SPLIT_DIR)
         found = False
         if not os.path.exists(SPLIT_CONTAINER_POLICIES_FILE):
@@ -10742,8 +11123,9 @@ def update_container_split(container_name, app, target):
             if not found and target != DEFAULT_SPLIT_TARGET:
                 out.write("%s\t%s\t%s\n" % (container_name, app, target))
         os.chmod(tmp_path, 0o600)
+        generation = write_pending_generation()
         os.replace(tmp_path, SPLIT_CONTAINER_POLICIES_FILE)
-        return write_pending_generation()
+        return generation
 
 
 def ensure_split_rules(app):
@@ -10864,25 +11246,41 @@ def clear_conntrack(container_ip):
         pass
 
 
+HOST_PROBE_TCP_PORT = 443
+
+
 def host_ping(target_ip, count=3, timeout=2):
     try:
         ip = ipaddress.ip_address(target_ip.strip())
     except ValueError:
-        return None, "invalid IP address"
+        return [], "", "invalid IP address"
     cmd = ["ping", "-c", str(count), "-W", str(timeout), "-n", str(ip)]
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=count * timeout + 3)
         out = res.stdout or ""
-    except Exception as exc:
-        return None, str(exc)
-    samples = []
-    for line in out.splitlines():
-        m = re.search(r"time=([0-9.]+)\s*ms", line)
-        if m:
-            samples.append(m.group(1))
-    if not samples:
-        return None, "timeout or unreachable"
-    return samples, ""
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout or ""
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+    except OSError:
+        out = ""
+    samples = re.findall(r"time=([0-9]+(?:\.[0-9]+)?)\s*ms", out)
+    if samples:
+        return samples, "icmp", ""
+
+    # Keep the fallback on the same public destination with a fixed port.
+    if not ip.is_global or ip.is_multicast:
+        return [], "", "ICMP 无响应，TCP 回退仅用于公网单播地址"
+    for _ in range(count):
+        started = time.monotonic()
+        try:
+            with socket.create_connection((str(ip), HOST_PROBE_TCP_PORT), timeout=timeout):
+                samples.append("%.3f" % ((time.monotonic() - started) * 1000))
+        except OSError:
+            continue
+    if samples:
+        return samples, "tcp", ""
+    return [], "", "ICMP 无响应且 TCP 443 无法建立连接"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -11008,8 +11406,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     response(self, 400, {"ok": False, "error": "缺少 ip 参数"})
                 return
-            samples, err = host_ping(target_ip)
-            if samples is None:
+            samples, method, err = host_ping(target_ip)
+            if not samples:
                 if path.endswith(".txt"):
                     text_response(self, 200, "ERROR: %s\n" % err)
                 else:
@@ -11017,6 +11415,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path.endswith(".txt"):
                 text_lines = "\n".join(samples) + "\n"
+                if params.get("detail") == ["1"]:
+                    protocol = "ICMP" if method == "icmp" else "TCP %s" % HOST_PROBE_TCP_PORT
+                    text_lines = "METHOD: %s\n" % protocol + text_lines
                 text_response(self, 200, text_lines)
             else:
                 avg_val = sum(float(x) for x in samples) / len(samples)
@@ -11024,6 +11425,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "ip": target_ip,
                     "samples": samples,
+                    "method": method,
                     "avg": "%.3f" % avg_val
                 })
         else:
@@ -11060,28 +11462,29 @@ class Handler(BaseHTTPRequestHandler):
                 previous = None
                 generation = None
                 try:
-                    previous, generation = update_container_current(container["ip"], target)
-                    if target == DIRECT_EXIT:
-                        nft_clear(container["ip"], previous)
-                    else:
-                        nft_update(container["ip"], exits[target]["mark"], previous)
-                    # 按当前出口强制（force-on-exit / force-category-on-exit）的分流规则
-                    # 覆盖 current == 来源出口的容器，容器按来源出口分组在 force{4,6}_src_*
-                    # 集合里；切换后增量增删集合元素即可，失败时内部回退全量重建。
-                    nft_force_source_transition(container["ip"], previous, target)
-                    clear_pending_generation(generation)
-                    clear_conntrack(container["ip"])
+                    previous, generation = update_container_current(container, target)
+                    if generation is not None:
+                        if target == DIRECT_EXIT:
+                            nft_clear(container["ip"], previous)
+                        else:
+                            nft_update(container["ip"], exits[target]["mark"], previous)
+                        nft_force_source_transition(container["ip"], previous, target)
+                        clear_pending_generation(generation)
+                        clear_conntrack(container["ip"])
                 except Exception as operation_error:
-                    if previous is None:
+                    if generation is None:
                         raise
                     try:
-                        _changed_from, rollback_generation = update_container_current(container["ip"], previous)
+                        _changed_from, rollback_generation = update_container_current(container, previous, rollback_from=target)
                         apply_nft_fallback()
                         clear_pending_generation(rollback_generation)
                         clear_conntrack(container["ip"])
                     except Exception as rollback_error:
                         raise RuntimeError("%s；回滚旧出口时发生错误：%s（已保留待应用标记）" % (operation_error, rollback_error)) from operation_error
                     raise RuntimeError("%s；容器出口和数据面已恢复到切换前状态" % operation_error) from operation_error
+        except StaleContainerRequest as exc:
+            response(self, 409, {"ok": False, "error": str(exc)})
+            return
         except Exception as exc:
             response(self, 500, {"ok": False, "error": str(exc)})
             return
@@ -11134,7 +11537,7 @@ class Handler(BaseHTTPRequestHandler):
                 generation = None
                 try:
                     ensure_split_rules(app)
-                    generation = update_container_split(container["name"], app, target)
+                    generation = update_container_split(container, app, target)
                     apply_nft_fallback()
                     clear_pending_generation(generation)
                     clear_conntrack(container["ip"])
@@ -11142,13 +11545,16 @@ class Handler(BaseHTTPRequestHandler):
                     if generation is None:
                         raise
                     try:
-                        rollback_generation = update_container_split(container["name"], app, previous_override)
+                        rollback_generation = update_container_split(container, app, previous_override, rollback=True)
                         apply_nft_fallback()
                         clear_pending_generation(rollback_generation)
                         clear_conntrack(container["ip"])
                     except Exception as rollback_error:
                         raise RuntimeError("%s；回滚旧分流选择时发生错误：%s（已保留待应用标记）" % (operation_error, rollback_error)) from operation_error
                     raise RuntimeError("%s；容器分流选择和数据面已恢复到切换前状态" % operation_error) from operation_error
+        except StaleContainerRequest as exc:
+            response(self, 409, {"ok": False, "error": str(exc)})
+            return
         except Exception as exc:
             response(self, 500, {"ok": False, "error": str(exc)})
             return
@@ -11314,6 +11720,9 @@ BRIDGE_HEALTH_STATE_FILE = os.path.join(CONFIG_DIR, "bridge-health-state.json")
 UPSTREAM_HEALTH_STATE_FILE = os.path.join(CONFIG_DIR, "upstream-health-state.json")
 SPLIT_CONTAINER_POLICIES_FILE = os.path.join(CONFIG_DIR, "split", "container-policies.tsv")
 RECONCILE_EVENT = threading.Event()
+CLIENT_START_LOCK = threading.Lock()
+CLIENT_START_EVENTS = {}
+INSTANCE_EVENT_SEQUENCE = 0
 
 
 @contextmanager
@@ -11585,7 +11994,7 @@ def list_instances(project):
     return candidates
 
 
-def discover_instances(existing, refresh_ips=False):
+def discover_instances(existing, refresh_ips=False, starts=()):
     raw_instances = []
     failed_projects = []
     for project in AUTO_PROJECTS:
@@ -11640,7 +12049,8 @@ def discover_instances(existing, refresh_ips=False):
             inst.get("configured_ips"),
         )
         if inst.get("status", "").lower() == "running":
-            if not ip and not skip_reason and known and not refresh_ips:
+            identity = (inst["project"], inst["name"])
+            if not ip and not skip_reason and known and not refresh_ips and identity not in starts:
                 ip = known
             if not ip and not skip_reason:
                 needs_query.append(inst)
@@ -11743,9 +12153,9 @@ def parse_live_mark(value):
     return int(str(value).split("/", 1)[0], 0)
 
 
-def nft_live_elements(kind, name):
+def nft_live_snapshot():
     result = run(
-        ["nft", "-j", "list", kind, "inet", NFT_TABLE, name],
+        ["nft", "-j", "list", "table", "inet", NFT_TABLE],
         check=False,
         capture=True,
         timeout=max(AUTO_COMMAND_TIMEOUT, 10),
@@ -11756,12 +12166,17 @@ def nft_live_elements(kind, name):
         payload = json.loads(result.stdout or "{}")
     except json.JSONDecodeError as exc:
         return None, "invalid nft json: %s" % exc
-    obj = None
+    objects = {}
     for item in payload.get("nftables") or []:
-        candidate = item.get(kind) if isinstance(item, dict) else None
-        if isinstance(candidate, dict) and candidate.get("name") == name:
-            obj = candidate
-            break
+        for kind in ("map", "set"):
+            candidate = item.get(kind)
+            if isinstance(candidate, dict):
+                objects[kind, candidate["name"]] = candidate
+    return objects, ""
+
+
+def nft_live_elements(snapshot, kind, name):
+    obj = snapshot.get((kind, name))
     if obj is None:
         return None, "nft %s %s not found" % (kind, name)
     elements = obj.get("elem") or []
@@ -11837,6 +12252,9 @@ def policy_rule_problem(exits):
 
 
 def nft_mapping_problem(rows, exits):
+    snapshot, error = nft_live_snapshot()
+    if snapshot is None:
+        return error
     expected = {
         4: {"managed": set(), "split": set(), "egress": set(), "map": {}},
         6: {"managed": set(), "split": set(), "egress": set(), "map": {}},
@@ -11867,7 +12285,7 @@ def nft_mapping_problem(rows, exits):
         for label in ("managed", "split", "egress", "map"):
             kind = "map" if label == "map" else "set"
             nft_name = names[label] % family
-            live, error = nft_live_elements(kind, nft_name)
+            live, error = nft_live_elements(snapshot, kind, nft_name)
             if live is None:
                 return "%s: %s" % (nft_name, error)
             if label == "map":
@@ -12040,59 +12458,162 @@ def remote_client_ok(inst, row):
     script = r'''
 client_path="$1"
 token_path="$2"
-expected="$3"
-[ -x "$client_path" ] || exit 1
-[ -f "$token_path" ] || exit 1
-actual="$(tr -d '\r\n' < "$token_path" 2>/dev/null || true)"
-[ "$actual" = "$expected" ] || exit 1
+IFS= read -r expected || exit 2
+[ -x "$client_path" ] || exit 42
+[ -f "$token_path" ] || exit 42
+actual="$(tr -d '\r\n' < "$token_path" 2>/dev/null)" || exit 2
+[ "$actual" = "$expected" ] || exit 42
 '''
     result = run(
-        incus_cmd(inst["project"], "exec", inst["name"], "--", "sh", "-c", script, "sh", AUTO_CLIENT_PATH, AUTO_TOKEN_PATH, row["token"]),
+        incus_cmd(inst["project"], "exec", inst["name"], "--mode=non-interactive", "--",
+                  "sh", "-c", script, "sh", AUTO_CLIENT_PATH, AUTO_TOKEN_PATH),
         check=False,
+        input_data=row["token"] + "\n",
+        timeout=min(AUTO_COMMAND_TIMEOUT, 5),
     )
+    if result.returncode not in (0, 42):
+        raise RuntimeError("Incus 客户端文件检查未完成")
     return result.returncode == 0
 
 
-def inject_client(inst, row, state, client_digest, verify=False):
+def client_signature(row, client_digest):
+    return "%s:%s:%s:%s" % (row["token"], AUTO_CLIENT_PATH, AUTO_TOKEN_PATH, client_digest)
+
+
+def inject_client(inst, row, state, signature, verify=False, recently_started=False):
     if not AUTO_INSTALL_CLIENT:
         return
     if inst.get("status", "").lower() != "running":
         return
     injected = state.setdefault("injected", {})
-    signature = "%s:%s:%s:%s" % (row["token"], AUTO_CLIENT_PATH, AUTO_TOKEN_PATH, client_digest)
-    if injected.get(row["name"]) == signature:
-        if not verify:
-            return
-        if remote_client_ok(inst, row):
-            return
-        log("检测到容器 out/token 缺失或不匹配，重新注入: %s" % row["name"])
     try:
+        if verify:
+            try:
+                client_ok = remote_client_ok(inst, row)
+            except subprocess.TimeoutExpired:
+                if not recently_started:
+                    raise
+                log("启动后 out/token 校验超时，快速重试一次: %s" % row["name"])
+                time.sleep(1)
+                client_ok = remote_client_ok(inst, row)
+            if client_ok:
+                return True
+            log("检测到容器 out/token 缺失或不匹配，重新注入: %s" % row["name"])
+        elif injected.get(row["name"]) == signature:
+            return True
         push_file(inst["project"], inst["name"], OUT_CLIENT_FILE, AUTO_CLIENT_PATH, "0755")
         push_text(inst["project"], inst["name"], row["token"] + "\n", AUTO_TOKEN_PATH, "0600")
         injected[row["name"]] = signature
         log("已注入 out/token: %s" % row["name"])
+        return True
     except Exception as exc:
-        log("注入失败 %s: %s" % (row["name"], exc))
+        log("out/token %s未完成 %s: %s" % (
+            "校验" if verify else "注入", row["name"], type(exc).__name__,
+        ))
+        return False
 
 
-def inject_clients(inst_rows, state, verify=False):
+def client_start_snapshot():
+    # Retain events while an instance boots or a failed check waits for retry.
+    cutoff = time.monotonic() - max(300, AUTO_INTERVAL * 4)
+    with CLIENT_START_LOCK:
+        for identity, started in list(CLIENT_START_EVENTS.items()):
+            if started < cutoff:
+                del CLIENT_START_EVENTS[identity]
+        return CLIENT_START_EVENTS.copy(), INSTANCE_EVENT_SEQUENCE
+
+
+def inject_clients(inst_rows, state, verify=False, defer_verification=False, start_snapshot=None):
     if not AUTO_INSTALL_CLIENT or not inst_rows:
         return
     if not os.path.exists(OUT_CLIENT_FILE):
         run([MANAGER_BIN, "write-client"], check=True)
     client_digest = file_sha256(OUT_CLIENT_FILE)
-    workers = min(AUTO_INJECT_WORKERS, len(inst_rows))
-    if workers <= 1:
-        for inst, row in inst_rows:
-            inject_client(inst, row, state, client_digest, verify=verify)
+    now = time.time()
+    starts, event_sequence = client_start_snapshot() if start_snapshot is None else start_snapshot
+    retry = state.setdefault("client_retry_after", {})
+    priority, pending, stable = [], [], []
+    for inst, row in inst_rows:
+        if not verify and retry.get(row["name"], 0) > now:
+            continue
+        signature = client_signature(row, client_digest)
+        job = (inst, row, signature)
+        check = state["injected"].get(row["name"]) == signature
+        if (inst["project"], inst["name"]) in starts:
+            priority.append((job, check))
+        elif check:
+            stable.append(job)
+        else:
+            pending.append(job)
+    batch_size = AUTO_INJECT_WORKERS * 2
+    if verify:
+        jobs = priority + [(job, False) for job in pending] + [(job, True) for job in stable]
+        state.pop("client_verify_cursor", None)
+        state["last_client_verify"] = time.time()
+        worker_limit = AUTO_INJECT_WORKERS
+    elif priority:
+        # Drain ready starts from the same inventory while Incus is responding
+        # quickly. Each wave retains the usual command concurrency and size.
+        jobs = priority[:batch_size * 3]
+        jobs += [(job, False) for job in pending[:max(0, batch_size - len(jobs))]]
+        worker_limit = AUTO_INJECT_WORKERS
+    elif pending:
+        jobs = [(job, False) for job in pending[:batch_size]]
+        worker_limit = AUTO_INJECT_WORKERS
+    elif stable and not defer_verification:
+        # Spread a sweep across regular reconciliation cycles and keep its
+        # cursor on disk so service restarts do not always revisit the first rows.
+        interval = max(AUTO_CLIENT_VERIFY_INTERVAL, 5)
+        cadence = max(AUTO_INTERVAL, 5)
+        batch = max(1, (len(stable) * cadence + interval - 1) // interval)
+        batch = min(batch, AUTO_INJECT_WORKERS * 4)
+        cursor = state.get("client_verify_cursor", "")
+        remaining = [job for job in stable if job[1]["name"] > cursor]
+        if not remaining:
+            remaining = stable
+        selected = remaining[:batch]
+        jobs = [(job, True) for job in selected]
+        if len(selected) == len(remaining):
+            state.pop("client_verify_cursor", None)
+            state["last_client_verify"] = time.time()
+        else:
+            state["client_verify_cursor"] = selected[-1][1]["name"]
+        worker_limit = min(AUTO_INJECT_WORKERS, 2)
+    else:
         return
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(inject_client, inst, row, state, client_digest, verify) for inst, row in inst_rows]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as exc:
-                log("注入任务异常: %s" % exc)
+    wave_size = batch_size if priority and not verify else len(jobs)
+    continuation_deadline = time.monotonic() + min(AUTO_RECONCILE_MIN_INTERVAL, 5)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(worker_limit, len(jobs))) as executor:
+        for offset in range(0, len(jobs), wave_size):
+            wave = jobs[offset:offset + wave_size]
+            failed = False
+            futures = {
+                executor.submit(inject_client, inst, row, state, signature, check,
+                                (inst["project"], inst["name"]) in starts):
+                    (row["name"], (inst["project"], inst["name"]))
+                for (inst, row, signature), check in wave
+            }
+            for future in concurrent.futures.as_completed(futures):
+                name, identity = futures[future]
+                if not future.result():
+                    failed = True
+                    retry[name] = time.time() + max(AUTO_INTERVAL * 2, 30)
+                    continue
+                retry.pop(name, None)
+                if identity in starts:
+                    log("实例启动后 out/token 就绪: %s elapsed_ms=%d" % (
+                        name, (time.monotonic() - starts[identity]) * 1000,
+                    ))
+                    with CLIENT_START_LOCK:
+                        if CLIENT_START_EVENTS.get(identity) == starts[identity]:
+                            del CLIENT_START_EVENTS[identity]
+            processed = offset + len(wave)
+            with CLIENT_START_LOCK:
+                inventory_changed = event_sequence != INSTANCE_EVENT_SEQUENCE
+            if failed or inventory_changed or time.monotonic() >= continuation_deadline:
+                break
+    if len(priority) > processed:
+        RECONCILE_EVENT.set()
 
 
 def reconcile(force_client_check=False, force_ip_refresh=False):
@@ -12112,7 +12633,8 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
     missing_counts = state.setdefault("missing_counts", {})
     previous_skipped = state.setdefault("skipped_instances", {})
     now = time.time()
-    last_verify = float(state.get("last_client_verify", 0) or 0)
+    start_snapshot = client_start_snapshot()
+    starts, _ = start_snapshot
     last_ip_refresh = float(state.get("last_ip_refresh", 0) or 0)
     last_dataplane_attempt = float(
         state.get("last_dataplane_verify_attempt", state.get("last_dataplane_verify", 0)) or 0
@@ -12126,7 +12648,6 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
         if dataplane_failures
         else AUTO_DATAPLANE_VERIFY_INTERVAL
     )
-    verify_clients = force_client_check or (now - last_verify >= max(AUTO_CLIENT_VERIFY_INTERVAL, 5))
     refresh_ips = force_ip_refresh or (now - last_ip_refresh >= max(AUTO_STATE_REFRESH_INTERVAL, 30))
     verify_dataplane = force_client_check or (
         now - last_dataplane_attempt >= dataplane_interval
@@ -12136,7 +12657,9 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
         default_exit = first_exit()
         _, snapshot_rows = read_container_rows()
     snapshot = {row["name"]: row for row in snapshot_rows}
-    found, scan_complete = discover_instances(snapshot, refresh_ips=refresh_ips)
+    scan_started = time.monotonic()
+    found, scan_complete = discover_instances(snapshot, refresh_ips=refresh_ips, starts=starts)
+    scan_ms = (time.monotonic() - scan_started) * 1000
     if refresh_ips and scan_complete:
         state["last_ip_refresh"] = now
 
@@ -12168,6 +12691,15 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
         removed_containers = set()
 
         for key, inst in sorted(found.items()):
+            old = existing.get(key)
+            if old and (inst.get("skip_reason") or not inst.get("ip")):
+                owner = ip_owners.get(old["ip"])
+                if owner and owner != key:
+                    injected.pop(key, None)
+                    missing_counts.pop(key, None)
+                    removed_containers.add(key)
+                    log("容器 %s 的旧 IP 已由 %s 使用，回收旧授权" % (key, owner))
+                    continue
             if inst.get("skip_reason"):
                 if key in existing:
                     new_rows.append(existing[key])
@@ -12211,15 +12743,12 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
             row["fingerprint"] = inst.get("fingerprint", "")
             new_rows.append(row)
             missing_counts.pop(key, None)
-            if running:
+            if running and (inst.get("ip") or (inst["project"], inst["name"]) not in starts):
                 inject_targets.append((inst, row))
 
         absent = sorted(set(existing) - set(found))
         for key in absent:
             row = existing[key]
-            if not scan_complete:
-                new_rows.append(row)
-                continue
             # Incus may reuse an address immediately after an instance is removed.
             # Keeping the missing instance through the normal grace scans would
             # create two authorization rows for the same IP and make apply-nft
@@ -12234,6 +12763,9 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
                     key, row.get("ip", ""), current_owner,
                 ))
                 continue
+            if not scan_complete:
+                new_rows.append(row)
+                continue
             misses = int(missing_counts.get(key, 0) or 0) + 1
             missing_counts[key] = misses
             if misses < AUTO_DELETE_GRACE_SCANS:
@@ -12246,20 +12778,29 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
             log("连续 %s 轮确认容器已删除，回收配置: %s" % (AUTO_DELETE_GRACE_SCANS, key))
 
         cleanup_names = recreated | removed_containers
+        removed_overrides = 0
         if cleanup_names:
+            for key in cleanup_names:
+                state.get("client_retry_after", {}).pop(key, None)
             removed_overrides = remove_container_split_policies(cleanup_names)
             if removed_overrides:
                 log("已清理已删除/重新创建容器的旧应用分流覆盖: %s 条" % removed_overrides)
 
         changed = rows != new_rows
-        if changed:
-            write_container_rows(comments, new_rows)
+        rule_fields = ("name", "ip", "allowed", "current")
+        old_rules = {tuple(row[k] for k in rule_fields) for row in rows}
+        new_rules = {tuple(row[k] for k in rule_fields) for row in new_rows}
+        rules_changed = old_rules != new_rules or bool(removed_overrides)
+        if rules_changed:
             state["apply_pending"] = True
             fd, tmp_path = tempfile.mkstemp(prefix="nft-pending.", dir=CONFIG_DIR)
             with os.fdopen(fd, "w", encoding="utf-8") as out:
                 out.write("autosync-%s-%s\n" % (os.getpid(), time.time_ns()))
             os.chmod(tmp_path, 0o600)
             os.replace(tmp_path, PENDING_NFT_FILE)
+        if changed:
+            write_container_rows(comments, new_rows)
+        if rules_changed:
             # 先持久化待应用标记；即使此刻进程退出，下一轮也会补做 nft 提交。
             save_state(state)
 
@@ -12269,7 +12810,9 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
     state["skipped_instances"] = current_skipped
 
     apply_error = None
-    if changed or state.get("apply_pending") or os.path.exists(PENDING_NFT_FILE):
+    apply_started = None
+    if rules_changed or state.get("apply_pending") or os.path.exists(PENDING_NFT_FILE):
+        apply_started = time.monotonic()
         try:
             result = run([MANAGER_BIN, "apply-nft"], check=True, capture=True, timeout=max(AUTO_COMMAND_TIMEOUT, 60))
             output = (result.stdout or "").strip()
@@ -12281,9 +12824,15 @@ def reconcile_locked(force_client_check=False, force_ip_refresh=False):
             apply_error = exc
             log("容器配置已保存，但数据面应用失败，将在下一轮重试: %s" % exc)
 
-    inject_clients(inject_targets, state, verify=verify_clients)
-    if verify_clients:
-        state["last_client_verify"] = now
+    if starts:
+        ready = sum((inst["project"], inst["name"]) in starts for inst, _ in inject_targets)
+        log("实例启动同步: queued=%d ip_ready=%d scan_ms=%d rules_ms=%d rules=%s" % (
+            len(starts), ready, scan_ms, (time.monotonic() - apply_started) * 1000 if apply_started else 0,
+            "failed" if apply_error else "applied" if apply_started else "unchanged",
+        ))
+    if not apply_error:
+        inject_clients(inject_targets, state, verify=force_client_check,
+                       defer_verification=refresh_ips, start_snapshot=start_snapshot)
     if not apply_error and verify_dataplane:
         state["last_dataplane_verify_attempt"] = now
         try:
@@ -12520,8 +13069,30 @@ def maybe_check_upstream_health(force=False):
         ))
 
 
+def note_instance_event(action, source, project):
+    global INSTANCE_EVENT_SEQUENCE
+    identity = None
+    if AUTO_INSTALL_CLIENT and action in ("instance-started", "instance-restarted", "instance-restored"):
+        path = source.path.split("/")
+        if len(path) == 4 and path[1:3] == ["1.0", "instances"] and path[3]:
+            identity = (project, urllib.parse.unquote(path[3]))
+    with CLIENT_START_LOCK:
+        INSTANCE_EVENT_SEQUENCE += 1
+        if identity is not None:
+            CLIENT_START_EVENTS[identity] = time.monotonic()
+    if identity is not None:
+        RECONCILE_EVENT.set()
+
+
 def watch_events():
-    cmd = ["incus", "monitor", "--type=lifecycle"]
+    cmd = ["incus", "monitor", "--type=lifecycle", "--format=json"]
+    if AUTO_PROJECTS != ["default"]:
+        cmd.append("--all-projects")
+    actions = {
+        "instance-created", "instance-deleted", "instance-started", "instance-stopped",
+        "instance-restarted", "instance-renamed", "instance-updated", "instance-restored",
+        "instance-paused", "instance-resumed",
+    }
     last_sync = 0.0
     while True:
         try:
@@ -12534,17 +13105,49 @@ def watch_events():
             )
             assert proc.stdout is not None
             for line in proc.stdout:
-                if any(word in line.lower() for word in ("instance", "container", "created", "deleted", "started", "stopped", "renamed")):
-                    now = time.time()
-                    if now - last_sync < AUTO_EVENT_DEBOUNCE:
-                        continue
-                    last_sync = now
-                    log("收到 Incus 事件，已合并到下一轮同步")
-                    RECONCILE_EVENT.set()
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict) or event.get("type") != "lifecycle":
+                    continue
+                metadata = event.get("metadata") or {}
+                action = metadata.get("action")
+                if action not in actions:
+                    continue
+                source = urllib.parse.urlsplit(metadata.get("source", ""))
+                project = (urllib.parse.parse_qs(source.query)
+                           .get("project", [event.get("project") or "default"])[0])
+                if project not in AUTO_PROJECTS:
+                    continue
+                note_instance_event(action, source, project)
+                now = time.monotonic()
+                if now - last_sync < AUTO_EVENT_DEBOUNCE:
+                    continue
+                last_sync = now
+                log("收到 Incus 实例状态事件，已合并到下一轮同步")
+                RECONCILE_EVENT.set()
             proc.wait(timeout=1)
         except Exception as exc:
             log("incus monitor 异常，稍后重连: %s" % exc)
         time.sleep(3)
+
+
+def periodic_maintenance():
+    checks = (
+        maybe_check_bridge_health,
+        maybe_sync_split_rules,
+        maybe_refresh_split_dns,
+        maybe_check_split_dns_health,
+        maybe_check_upstream_health,
+    )
+    while True:
+        for check in checks:
+            try:
+                check()
+            except Exception as exc:
+                log("定期巡检失败 %s: %s" % (check.__name__, exc))
+        time.sleep(max(AUTO_INTERVAL, 5))
 
 
 def main():
@@ -12561,6 +13164,7 @@ def main():
         reconcile(force_client_check=True, force_ip_refresh=True)
         return
     threading.Thread(target=watch_events, daemon=True).start()
+    threading.Thread(target=periodic_maintenance, daemon=True).start()
     next_run = 0.0
     last_run = 0.0
     while True:
@@ -12572,11 +13176,6 @@ def main():
             if delay > 0:
                 time.sleep(delay)
         try:
-            maybe_check_bridge_health(force=False)
-            maybe_sync_split_rules(force=False)
-            maybe_refresh_split_dns(force=False)
-            maybe_check_split_dns_health(force=False)
-            maybe_check_upstream_health(force=False)
             reconcile()
         except Exception as exc:
             log("定时同步失败: %s" % exc)
@@ -12645,6 +13244,7 @@ Environment=EGRESS_CONFIG_DIR=$CONFIG_DIR
 Environment=EGRESS_MANAGER_BIN=$INSTALL_BIN
 Environment=EGRESS_OUT_CLIENT=$OUT_CLIENT_FILE
 EnvironmentFile=-$CONFIG_FILE
+ExecStartPre=-$INSTALL_BIN apply-wg-bridge-routes
 ExecStart=/usr/bin/python3 $AUTOSYNC_FILE
 Restart=always
 RestartSec=3
@@ -12731,14 +13331,15 @@ install_host() {
     write_client_file
     write_service
     refresh_existing_exit_service_hooks
+    refresh_split_only_proxy_configs
     systemctl daemon-reload
     systemctl enable "$APP_NAME" >/dev/null
-    systemctl restart "$APP_NAME"
+    restart_managed_service "$APP_NAME"
     if [ "$autosync_was_active" = "true" ]; then
-        systemctl restart "$APP_NAME-autosync" >/dev/null 2>&1 || true
+        restart_managed_service "$APP_NAME-autosync" >/dev/null 2>&1 || true
     fi
     info "宿主机基础组件和控制器文件已安装。"
-    info "安装步骤不会扫描或接管容器；需要接管时请在主菜单选择 7 或 8。"
+    info "安装步骤不会扫描或接管容器；需要接管时请在主菜单选择 [9] 出口切换接管或 [10] 仅宿主机分流。"
     info "API 服务已启动并设置开机自启: $APP_NAME"
 }
 
@@ -13248,16 +13849,20 @@ host_ping_probe() {
     ip="$1"
     [ -n "$ip" ] || { echo "宿主机直连延迟 (宿主机 -> 出口IP): unavailable"; return 1; }
     echo "宿主机直连延迟 (宿主机 -> 出口IP):"
-    raw="$(api_raw "$API_URL/host-ping.txt?ip=$ip" 2>/dev/null || true)"
+    raw="$(api_raw "$API_URL/host-ping.txt?ip=$ip&detail=1" 2>/dev/null || true)"
     if [ -z "$raw" ]; then
         echo "  unavailable"
         return 1
     fi
     if printf '%s\n' "$raw" | grep -qiE "^(error|error:)"; then
-        echo "  unavailable (节点禁Ping/超时)"
+        printf '%s\n' "$raw" | awk 'NR == 1 {sub(/^[^:]*:[[:space:]]*/, ""); printf "  unavailable (%s)\n", $0}'
         return 1
     fi
     printf '%s\n' "$raw" | awk '
+        /^METHOD: (ICMP|TCP [0-9]+)[[:space:]]*$/ {
+            sub(/^METHOD: /, "")
+            printf "  探测方式 %s\n", $0
+        }
         /^[0-9.]+[[:space:]]*$/ {
             n++
             v = $1
@@ -13266,7 +13871,7 @@ host_ping_probe() {
         }
         END {
             if (n > 0) printf "  平均 %.3fms\n", sum / n
-            else print "  unavailable (节点禁Ping/超时)"
+            else print "  unavailable"
         }'
 }
 
@@ -13531,7 +14136,7 @@ enable_autosync() {
     systemctl daemon-reload
     systemctl enable "$APP_NAME-autosync"
     # 大规模宿主机上旧进程可能正在扫描/注入数百台容器；异步重启避免菜单等待 TimeoutStopSec。
-    systemctl restart --no-block "$APP_NAME-autosync"
+    restart_managed_service "$APP_NAME-autosync" --no-block
     info "自动同步服务重启任务已提交: $APP_NAME-autosync（后台完成，不阻塞当前操作）"
 }
 
@@ -13948,7 +14553,7 @@ interactive_add_ss_exit() {
 
 interactive_add_split_only_exit() {
     # 复用 [3] 添加出口的完整流程，添加成功后自动标记为“分流专用出口”。
-    local added
+    local added ADDING_SPLIT_ONLY_EXIT=true
     LAST_ADDED_EXIT_NAME=""
     interactive_add_proxy_exit
     added="$LAST_ADDED_EXIT_NAME"
@@ -14109,39 +14714,75 @@ entry_direct_value_label() {
 entry_direct_summary() {
     printf '软件源=%s  BT/PT=%s  测速=%s\n' \
         "$(entry_direct_value_label "${ENTRY_DIRECT_SOFTWARE:-true}")" \
-        "$(entry_direct_value_label "${ENTRY_DIRECT_BT_PT:-true}")" \
+        "$(entry_direct_bt_pt_label)" \
         "$(entry_direct_value_label "${ENTRY_DIRECT_SPEEDTEST:-true}")"
 }
 
+entry_direct_bt_pt_label() {
+    if [ "${BLOCK_BT_PT_DOMAINS:-false}" = "true" ]; then
+        printf '屏蔽域名'
+    elif entry_direct_bt_pt_enabled; then
+        printf '入口机直连'
+    else
+        printf '跟随容器出口'
+    fi
+}
+
 set_entry_direct_group() {
-    need_root
-    load_config
-    write_default_config
-    local group="${1:-}" desired="${2:-}" key label result changed failed
+    local group="${1:-}" desired="${2:-}" key label
     case "$group" in
         software) key="ENTRY_DIRECT_SOFTWARE"; label="软件源与开发平台" ;;
         btpt) key="ENTRY_DIRECT_BT_PT"; label="BT/PT 站点与公共 Tracker" ;;
         speedtest) key="ENTRY_DIRECT_SPEEDTEST"; label="测速网站" ;;
         *) die "未知入口机直连分组: $group" ;;
     esac
+    set_entry_direct_values "$desired" "$label" "$key"
+}
+
+set_all_entry_direct_groups() {
+    set_entry_direct_values "${1:-}" "三组默认入口机直连" \
+        ENTRY_DIRECT_SOFTWARE ENTRY_DIRECT_BT_PT ENTRY_DIRECT_SPEEDTEST
+}
+
+set_entry_direct_values() {
+    need_root
+    load_config
+    write_default_config
+    local desired="$1" label="$2" setting key value mode=reuse result changed failed
+    shift 2
     valid_bool_value "$desired" || die "入口机直连开关必须是 true 或 false。"
-    # 依赖必须在写配置之前准备完成，避免安装失败后出现“状态已切换、规则未应用”。
     ensure_entry_direct_dependencies || die "入口机直连依赖准备失败，原开关状态保持不变。"
-
-    set_config_value "$key" "$desired"
-    case "$key" in
-        ENTRY_DIRECT_SOFTWARE) ENTRY_DIRECT_SOFTWARE="$desired" ;;
-        ENTRY_DIRECT_BT_PT) ENTRY_DIRECT_BT_PT="$desired" ;;
-        ENTRY_DIRECT_SPEEDTEST) ENTRY_DIRECT_SPEEDTEST="$desired" ;;
-    esac
-
+    info "正在准备应用入口机直连规则..."
+    if ! split_cache_lock_acquire 3; then
+        warn "分流规则正在更新，开关未修改。请稍后重试。"
+        return 0
+    fi
+    load_config
+    for setting in "$@"; do
+        key="${setting%%=*}"
+        value="$desired"
+        [[ "$setting" != *=* ]] || value="${setting#*=}"
+        set_config_value "$key" "$value"
+        printf -v "$key" '%s' "$value"
+    done
     mark_nft_pending
-    prepare_proxy_direct_rule_cache || die "入口机直连域名缓存生成失败，配置已保存；请稍后重新进入菜单应用。"
+    if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ]; then
+        if proxy_direct_native_dns_ready; then
+            mode=cached
+        elif proxy_direct_any_enabled; then
+            info "当前使用静态缓存补充直连地址，正在解析缺失的域名..."
+        fi
+        prepare_proxy_direct_rule_cache "$mode" || die "入口机直连域名缓存生成失败，配置已保存；请稍后重新进入菜单应用。"
+    fi
     result="$(apply_proxy_profile_all "-" "-" "-" "${PROXY_KERNEL_DIRECT_BYPASS:-true}")"
     IFS=$'\t' read -r changed failed <<< "$result"
+    info "正在提交入口机直连规则..."
     do_apply_nftables
-
-    if [ "$desired" = "true" ]; then
+    split_cache_lock_release
+    bt_pt_dns_block_health || die "BT/PT 域名屏蔽未通过网桥 DNS 检查。"
+    if [ -z "$label" ]; then
+        info "BT/PT 站点与公共 Tracker：$(entry_direct_bt_pt_label)"
+    elif [ "$desired" = "true" ]; then
         info "$label 已开启，匹配流量默认从入口机直出。"
     else
         info "$label 已关闭，匹配流量将跟随容器当前出口。"
@@ -14149,30 +14790,27 @@ set_entry_direct_group() {
     [ "${failed:-0}" -eq 0 ] || warn "有 ${failed:-0} 个 sing-box 出口配置未能同步更新，请在并发健康页检查。"
 }
 
-set_all_entry_direct_groups() {
-    need_root
-    load_config
-    write_default_config
-    local desired="${1:-}" result changed failed
-    valid_bool_value "$desired" || die "入口机直连开关必须是 true 或 false。"
-    ensure_entry_direct_dependencies || die "入口机直连依赖准备失败，原开关状态保持不变。"
-    set_config_value ENTRY_DIRECT_SOFTWARE "$desired"
-    set_config_value ENTRY_DIRECT_BT_PT "$desired"
-    set_config_value ENTRY_DIRECT_SPEEDTEST "$desired"
-    ENTRY_DIRECT_SOFTWARE="$desired"
-    ENTRY_DIRECT_BT_PT="$desired"
-    ENTRY_DIRECT_SPEEDTEST="$desired"
-    mark_nft_pending
-    prepare_proxy_direct_rule_cache || die "入口机直连域名缓存生成失败，配置已保存；请稍后重新进入菜单应用。"
-    result="$(apply_proxy_profile_all "-" "-" "-" "${PROXY_KERNEL_DIRECT_BYPASS:-true}")"
-    IFS=$'\t' read -r changed failed <<< "$result"
-    do_apply_nftables
-    if [ "$desired" = "true" ]; then
-        info "三组默认入口机直连均已开启。"
-    else
-        info "三组默认入口机直连均已关闭，相关流量将跟随容器当前出口。"
-    fi
-    [ "${failed:-0}" -eq 0 ] || warn "有 ${failed:-0} 个 sing-box 出口配置未能同步更新，请在并发健康页检查。"
+interactive_bt_pt_settings() {
+    local choice bridges
+    printf '\nBT/PT 站点与公共 Tracker（当前：%s）\n' "$(entry_direct_bt_pt_label)"
+    printf '  1. 屏蔽域名（由网桥拒绝 DNS 解析）\n'
+    printf '  2. 入口机直连\n'
+    printf '  3. 跟随容器当前出口\n'
+    printf '  0. 返回\n'
+    read -r -p "请输入选项 [0-3]: " choice
+    case "$choice" in
+        1)
+            if ! bridges="$(split_managed_dns_bridges --strict)" || [ -z "$bridges" ]; then
+                warn "没有可管理的 Incus DNS 网桥，未开启域名屏蔽。"
+                return 0
+            fi
+            set_entry_direct_values true "" BLOCK_BT_PT_DOMAINS ENTRY_DIRECT_BT_PT=false
+            ;;
+        2) set_entry_direct_values true "" BLOCK_BT_PT_DOMAINS=false ENTRY_DIRECT_BT_PT ;;
+        3) set_entry_direct_values false "" BLOCK_BT_PT_DOMAINS ENTRY_DIRECT_BT_PT ;;
+        0|"") return 0 ;;
+        *) warn "无效选项。" ;;
+    esac
 }
 
 interactive_entry_direct_menu() {
@@ -14190,14 +14828,14 @@ interactive_entry_direct_menu() {
 管理员在“分流管理”中明确设置的入口机策略不受这里影响。
 
   1. 软件源与开发平台       [$(entry_direct_value_label "$ENTRY_DIRECT_SOFTWARE")]
-  2. BT/PT 站点与 Tracker   [$(entry_direct_value_label "$ENTRY_DIRECT_BT_PT")]
+  2. BT/PT 站点与 Tracker   [$(entry_direct_bt_pt_label)]
   3. 测速网站               [$(entry_direct_value_label "$ENTRY_DIRECT_SPEEDTEST")]
-  4. 全部开启
-  5. 全部关闭
+  4. 全部开启默认直连
+  5. 全部关闭默认直连
   0. 返回主菜单
 ============================================================
-提示：BT/PT 网址和 Tracker 可以识别；DHT、磁力 Peer 的直接
-IP/随机端口流量无法仅靠域名规则完整识别，仍可能跟随当前出口。
+BT/PT 域名屏蔽单独设置。已知 IP 直连、加密 DNS、DHT 和磁力 Peer 的
+直接 IP/随机端口流量无法仅靠网桥 DNS 完整识别。
 EOF
         read -r -p "请输入选项 [0-5]: " choice
         case "$choice" in
@@ -14208,9 +14846,7 @@ EOF
                 pause_screen
                 ;;
             2)
-                current=true
-                [ "$ENTRY_DIRECT_BT_PT" = "true" ] && current=false
-                set_entry_direct_group btpt "$current"
+                interactive_bt_pt_settings
                 pause_screen
                 ;;
             3)
@@ -15720,7 +16356,7 @@ interactive_container_out_autofill() {
     fi
     printf '\n容器 out/token 自动补齐当前状态: %s\n' "$state"
     printf '开启后，后台轮询会把缺失的 /usr/local/bin/out 和 /etc/incus-egress-token 自动补回。\n'
-    printf '关闭后，宿主机分流仍然生效，但容器不能再用 out use 自助切换出口。\n\n'
+    printf '关闭后停止自动补齐。已安装的 out/token 仍可使用，宿主机分流继续生效。\n\n'
     printf '  1. 启用自动补齐\n'
     printf '  2. 关闭自动补齐\n'
     printf '  0. 取消\n'
@@ -15746,7 +16382,6 @@ interactive_clear_container_out() {
         return 0
     fi
     clear_container_out_access
-    info "如需重新接管实例，请返回主菜单选择 7；可直接选择 1 一次授权全部已添加出口。"
     pause_screen
 }
 
@@ -15853,7 +16488,7 @@ disable_container_out_access() {
     set_config_value AUTO_INSTALL_CLIENT false
     load_config
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart "$APP_NAME-autosync" 2>/dev/null || true
+        restart_managed_service "$APP_NAME-autosync" 2>/dev/null || true
     fi
     info "已关闭容器 out/token 自动补齐。后台仍会同步容器记录和宿主机应用分流。"
 }
@@ -15876,7 +16511,7 @@ clear_container_out_access() {
     cat > "$tmp" <<'EOF'
 # 容器授权配置，每行一台：
 # 名称    容器IP       token               允许出口      当前出口
-# 请通过主菜单 8 重新同步运行中容器并选择授权出口。
+# 请通过主菜单 [9] 重新同步运行中容器并选择授权出口。
 EOF
     install -m 0600 "$tmp" "$CONTAINERS_FILE"
     cat > "$tmp" <<'EOF'
@@ -15888,7 +16523,7 @@ EOF
     do_apply_nftables
     state_lock_release
     info "已清空全部实例出口信息；自动同步和 out/token 自动补齐保持关闭。"
-    info "下一步：执行主菜单 8 重新同步；选择 1 可授权全部已添加出口。"
+    info "下一步：执行主菜单 [9] 重新同步；在授权列表选择 1 可授权全部可切换出口。"
 }
 
 enable_container_out_access() {
@@ -15898,7 +16533,7 @@ enable_container_out_access() {
     set_config_value AUTO_INSTALL_CLIENT true
     load_config
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart "$APP_NAME-autosync" 2>/dev/null || true
+        restart_managed_service "$APP_NAME-autosync" 2>/dev/null || true
     fi
     sync_now
     info "已开启 AUTO_INSTALL_CLIENT，并已尝试重新注入容器 out/token。"
@@ -15923,7 +16558,8 @@ restore_initial_state() {
     fi
     rm -rf "$EXIT_DIR" "$LEGACY_EXIT_DIR"
     rm -f "$LEGACY_SINGBOX_BIN" 2>/dev/null || true
-    rm -f "$EXITS_FILE" "$LIMITS_FILE" "$CONTAINERS_FILE" "$CONFIG_DIR/autosync-state.json" \
+    rm -f "$EXITS_FILE" "$LIMITS_FILE" "$CONTAINERS_FILE" "$SPLIT_ONLY_EXITS_FILE" \
+        "$UPSTREAM_HEALTH_STATE_FILE" "$CONFIG_DIR/autosync-state.json" \
         "$CONFIG_DIR/.autosync.lock" "$CONFIG_DIR/.lock" "$CONFIG_DIR/.state.lock" "$CONFIG_DIR/.reconcile.lock"
     rm -rf "$SPLIT_DIR"
     rm -rf "$RUN_DIR"
@@ -15931,7 +16567,8 @@ restore_initial_state() {
     set_config_value AUTO_INSTALL_CLIENT false
     load_config
     if command -v systemctl >/dev/null 2>&1 && [ -f "$SERVICE_FILE" ]; then
-        systemctl enable --now "$APP_NAME" >/dev/null 2>&1 || true
+        systemctl enable "$APP_NAME" >/dev/null 2>&1 || true
+        restart_managed_service "$APP_NAME" >/dev/null 2>&1 || true
     fi
     info "已还原到初始状态：出口、容器授权、分流、策略路由、nft 规则和容器 out/token 已清空；脚本和基础配置已保留。"
 }
@@ -16067,7 +16704,7 @@ interactive_menu() {
           printf '    %s[18]%s 彻底卸载                    %s[19]%s 重建当前版本组件（不联网）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
           printf '    %s[20]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
           printf '    %s[21]%s 出口引用全面修复（自动映射或安全清理）\n' "$UI_GREEN" "$UI_RESET"
-          printf '    固定更新命令：%ssbout update-github && sbout upgrade%s（跨版本请使用命令，不要记忆菜单编号）\n' "$UI_YELLOW" "$UI_RESET"
+          printf '    GitHub 更新命令：%ssbout update-github%s（跨版本请使用命令，不要记忆菜单编号）\n' "$UI_YELLOW" "$UI_RESET"
         printf '\n'
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$UI_GREEN" "$UI_RESET"
@@ -16089,7 +16726,7 @@ interactive_menu() {
             13) interactive_switch_all_running_containers ;;
             14) interactive_split_menu ;;
             15) interactive_entry_direct_menu ;;
-            16) update_from_github; "$INSTALL_BIN" upgrade; exec "$INSTALL_BIN" menu ;;
+            16) update_from_github; exec "$INSTALL_BIN" menu ;;
             17) interactive_restore ;;
             18) interactive_uninstall ;;
               19) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
@@ -16119,7 +16756,7 @@ show_status_overview() {
     if [ "$component_state" != "已匹配" ]; then
         printf '[WARN] 主脚本与 controller/autosync/out 版本不一致，请执行: sbout upgrade\n'
     fi
-    printf '固定更新命令: sbout update-github && sbout upgrade\n'
+    printf 'GitHub 安全更新命令: sbout update-github\n'
     printf 'API 监听: %s:%s  容器访问地址: %s\n' "$API_BIND" "$API_PORT" "$API_PUBLIC_URL"
     printf '容器网桥: %s\n' "$BRIDGE_IFACES"
     printf '自动同步: %s  间隔: %ss  Project: %s\n' "$AUTO_SYNC" "$AUTO_INTERVAL" "$AUTO_PROJECTS"
@@ -16742,7 +17379,7 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       从 GitHub 下载最新版，然后复用 upgrade-config 的预检、备份、健康检查和自动回滚流程。
       下载 SHA256 必须与最终安装 SHA256 一致，否则自动回滚；该命令不受不同版本菜单编号变化影响。
       默认地址: $DEFAULT_UPDATE_SCRIPT_URL
-      跨旧版本固定更新命令: sbout update-github && sbout upgrade
+      GitHub 安全更新命令: sbout update-github
 
   sbout
       安装后可直接输入 sbout 进入主菜单。
@@ -16954,6 +17591,12 @@ case "$command_name" in
         need_root
         load_config
         unmark_split_only_exit "$1"
+        if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" != "true" ] && is_proxy_exit "$1"; then
+            if ! (patch_proxy_exit_config "$1" "-" "-" "-" false); then
+                mark_split_only_exit "$1"
+                die "恢复普通出口直连规则失败，已保留分流专用标记。"
+            fi
+        fi
         info "出口 '$(display_exit_name "$1")' 已取消分流专用标记。"
         ;;
     add-container)
@@ -17000,6 +17643,9 @@ case "$command_name" in
         ;;
     apply-exit-route)
         do_apply_exit_route "$@"
+        ;;
+    apply-wg-bridge-routes)
+        do_apply_wireguard_bridge_routes
         ;;
     status)
         show_status "$@"
