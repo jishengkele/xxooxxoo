@@ -17,6 +17,9 @@ SPLIT_FORCE_POLICIES_FILE="$SPLIT_DIR/force-policies.tsv"
 SPLIT_FORCE_CATEGORY_POLICIES_FILE="$SPLIT_DIR/force-category-policies.tsv"
 SPLIT_FORCE_ON_EXIT_POLICIES_FILE="$SPLIT_DIR/force-on-exit-policies.tsv"
 SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE="$SPLIT_DIR/force-category-on-exit-policies.tsv"
+SPLIT_POLICY_LAYERS_FILE="$SPLIT_DIR/policy-layers.json"
+SPLIT_ORDINARY_POLICIES_FILE="$SPLIT_DIR/ordinary-policies.tsv"
+SPLIT_POLICY_TRANSACTION_DIR="$CONFIG_DIR/.split-policy-transaction"
 SPLIT_ONLY_EXITS_FILE="$CONFIG_DIR/split-only-exits.tsv"
 SPLIT_CACHE_DIR="$SPLIT_DIR/cache"
 SPLIT_RAW_DIR="$SPLIT_CACHE_DIR/raw"
@@ -44,6 +47,7 @@ SHORTCUT_BIN="/usr/local/sbin/sbout"
 LIB_DIR="/usr/local/lib/$APP_NAME"
 CONTROLLER_FILE="$LIB_DIR/controller.py"
 AUTOSYNC_FILE="$LIB_DIR/autosync.py"
+SPLIT_ENGINE_FILE="$LIB_DIR/split_engine.py"
 OUT_CLIENT_FILE="$LIB_DIR/out"
 SINGBOX_BIN="$LIB_DIR/cloudshlii-sing-box"
 # 固定核心版本，避免新部署随 GitHub latest 漂移；升级前必须先完成兼容性验证。
@@ -58,6 +62,7 @@ LEGACY_EXIT_DIR="$CONFIG_DIR/exits.d"
 SYSTEMD_DIR="${EGRESS_SYSTEMD_DIR:-/etc/systemd/system}"
 SERVICE_FILE="$SYSTEMD_DIR/$APP_NAME.service"
 AUTOSYNC_SERVICE="$SYSTEMD_DIR/$APP_NAME-autosync.service"
+SPLIT_ENGINE_SERVICE="$SYSTEMD_DIR/$APP_NAME-split-dns.service"
 EXIT_SERVICE_PREFIX="incus-egress-switch-exit"
 SPLIT_DNS_SIDECAR_SERVICE_PREFIX="$APP_NAME-dns-sidecar"
 UPDATE_BACKUP_ROOT="${EGRESS_UPDATE_BACKUP_ROOT:-/var/backups/$APP_NAME}"
@@ -114,6 +119,12 @@ state_lock_acquire() {
     exec {STATE_LOCK_FD}>"$STATE_LOCK_FILE"
     flock -x "$STATE_LOCK_FD"
     STATE_LOCK_DEPTH=1
+    if [ -d "$SPLIT_POLICY_TRANSACTION_DIR" ] && [ "${SPLIT_POLICY_TRANSACTION_ACTIVE:-false}" != "true" ]; then
+        restore_split_policy_transaction "$SPLIT_POLICY_TRANSACTION_DIR" || die "无法恢复中断的分流策略提交，请保留事务备份。"
+        mark_nft_pending
+        finish_split_policy_transaction "$SPLIT_POLICY_TRANSACTION_DIR" || die "无法结束已恢复的分流策略提交。"
+        warn "已恢复中断的分流策略配置，待重新应用 nftables。"
+    fi
 }
 
 state_lock_release() {
@@ -341,6 +352,7 @@ build_bundled_dnsmasq_nftset() {
 }
 
 install_split_dns_sidecar_dependency() {
+    split_v2_enabled && return 0
     need_root
     if split_dnsmasq_supported || system_dnsmasq_supports_nftset ||
         bundled_dnsmasq_supports_nftset; then
@@ -579,6 +591,7 @@ preflight_update_source() {
         # shellcheck disable=SC1090
         . "$source_path"
         LIB_DIR="$stage/lib"
+        SPLIT_ENGINE_FILE="$LIB_DIR/split_engine.py"
         CONTROLLER_FILE="$LIB_DIR/controller.py"
         AUTOSYNC_FILE="$LIB_DIR/autosync.py"
         OUT_CLIENT_FILE="$LIB_DIR/out"
@@ -591,6 +604,7 @@ preflight_update_source() {
         write_autosync
         write_client_file
         write_service
+        if declare -F write_split_engine >/dev/null; then EGRESS_SPLIT_PREFLIGHT=true write_split_engine; fi
         python3 -m py_compile "$CONTROLLER_FILE" "$AUTOSYNC_FILE"
         sh -n "$OUT_CLIENT_FILE"
         grep -q "^ExecStart=" "$SERVICE_FILE"
@@ -651,7 +665,7 @@ create_update_backup() {
     UPDATE_BACKUP_ARCHIVE="$UPDATE_BACKUP_PATH/state.tar.gz"
 
     for path in "$CONFIG_DIR" "$INSTALL_BIN" "$SHORTCUT_BIN" "$CONTROLLER_FILE" "$AUTOSYNC_FILE" "$OUT_CLIENT_FILE" "$SINGBOX_BIN" \
-        "$SERVICE_FILE" "$AUTOSYNC_SERVICE" "$SYSCTL_FILE"; do
+        "$SERVICE_FILE" "$AUTOSYNC_SERVICE" "$SPLIT_ENGINE_FILE" "$SPLIT_ENGINE_SERVICE" "$SYSCTL_FILE"; do
         if [ -e "$path" ] || [ -L "$path" ]; then
             if [[ "$path" != /* ]]; then
                 warn "拒绝备份非绝对路径: $path"
@@ -782,6 +796,7 @@ restore_update_backup() {
         return 1
     fi
     command -v systemctl >/dev/null 2>&1 && systemctl stop "$APP_NAME-autosync" "$APP_NAME" 2>/dev/null || true
+    split_v2_stop_dns
     remove_split_dns_sidecars
     load_config
     current_nft="$NFT_TABLE"
@@ -790,12 +805,13 @@ restore_update_backup() {
     if command -v nft >/dev/null 2>&1; then
         nft delete table inet "$current_nft" 2>/dev/null || true
         nft delete table inet "${current_nft}_apply_guard" 2>/dev/null || true
+        nft delete table inet "${current_nft}_split" 2>/dev/null || true
     fi
 
     service_dir="$(dirname "$SERVICE_FILE")"
     rm -rf -- "$CONFIG_DIR"
     rm -f -- "$INSTALL_BIN" "$SHORTCUT_BIN" "$CONTROLLER_FILE" "$AUTOSYNC_FILE" "$OUT_CLIENT_FILE" \
-        "$SERVICE_FILE" "$AUTOSYNC_SERVICE" "$SYSCTL_FILE"
+        "$SERVICE_FILE" "$AUTOSYNC_SERVICE" "$SPLIT_ENGINE_FILE" "$SPLIT_ENGINE_SERVICE" "$SYSCTL_FILE"
     rm -f -- "$service_dir"/${EXIT_SERVICE_PREFIX}-*.service 2>/dev/null || true
     rm -f -- "$service_dir"/${SPLIT_DNS_SIDECAR_SERVICE_PREFIX}-*.service 2>/dev/null || true
     # Running processes may still hold the current executable open. Restore
@@ -913,6 +929,7 @@ load_config() {
     PROXY_DIRECT_DEFAULT_MIGRATED="${PROXY_DIRECT_DEFAULT_MIGRATED:-false}"
     CONCURRENCY_WARN_PERCENT="${CONCURRENCY_WARN_PERCENT:-80}"
     ENABLE_SPLIT_RULES="${ENABLE_SPLIT_RULES:-true}"
+    SPLIT_ENGINE="${SPLIT_ENGINE:-v2}"
     SPLIT_RULE_BUNDLE_URL="${SPLIT_RULE_BUNDLE_URL:-$DEFAULT_SPLIT_RULE_BUNDLE_URL}"
     # 旧安装的 config.env 会覆盖新脚本默认值。即使尚未执行配置升级，
     # 也要在本次进程中立即改用新的应用规则表，避免继续下载旧版表。
@@ -1283,7 +1300,7 @@ PROXY_TUN_STACK="mixed"
 PROXY_ENDPOINT_INDEPENDENT_NAT="true"
 
 # 默认入口机直连规则优先在 nftables 内核层执行，减少 sing-box 用户态负载。
-# PROXY_KERNEL_DIRECT_BYPASS 只控制内核提前直连的实现方式；日常开关请使用主菜单“入口机直连”。
+# PROXY_KERNEL_DIRECT_BYPASS 只控制内核提前直连的实现方式；日常开关在“分流管理 -> 入口机直连与 BT/PT 屏蔽”。
 PROXY_KERNEL_DIRECT_BYPASS="true"
 
 # 三组内置入口机直连规则。关闭某组后，该组流量会继续匹配容器当前出口。
@@ -1301,6 +1318,7 @@ CONCURRENCY_WARN_PERCENT="80"
 
 # 是否启用宿主机统一应用分流规则。
 ENABLE_SPLIT_RULES="true"
+SPLIT_ENGINE="v2"
 
 # 单文件应用分流规则源。一次下载后按文件中的“应用分类/应用”注释拆分分类和应用。
 SPLIT_RULE_BUNDLE_URL="$DEFAULT_SPLIT_RULE_BUNDLE_URL"
@@ -1784,7 +1802,7 @@ migrate_proxy_direct_default() {
         set_config_value PROXY_DIRECT_DEFAULT_MIGRATED true
         PROXY_KERNEL_DIRECT_BYPASS=true
         PROXY_DIRECT_DEFAULT_MIGRATED=true
-        info "默认入口机直连已迁移为 nftables 内核提前处理；各分组可在主菜单独立开关。"
+        info "默认入口机直连已迁移为 nftables 内核提前处理；各分组可在分流管理中独立开关。"
     fi
 }
 
@@ -1815,6 +1833,7 @@ ensure_runtime_config_defaults() {
     ensure_config_default PROXY_DIRECT_DEFAULT_MIGRATED true
     ensure_config_default CONCURRENCY_WARN_PERCENT 80
     ensure_config_default ENABLE_SPLIT_RULES true
+    ensure_config_default SPLIT_ENGINE v2
     ensure_config_default SPLIT_RULE_BUNDLE_URL "$DEFAULT_SPLIT_RULE_BUNDLE_URL"
     migrate_default_split_rule_url
     ensure_config_default SPLIT_UPDATE_INTERVAL 259200
@@ -1939,6 +1958,7 @@ upgrade_config_and_components() {
         install_runtime_sysctls
         load_config
         install_split_dns_sidecar_dependency
+        write_split_engine
         prepare_default_proxy_direct_bypass
         prepare_default_split_collision_bypass
         preflight_update_runtime
@@ -2265,6 +2285,15 @@ split_policy_targets() {
     awk -F '\t' -v n="$target" 'NF && $1 !~ /^#/ && $1 == n {print ($2 ? $2 : "-"); exit}' "$SPLIT_POLICIES_FILE"
 }
 
+split_ordinary_policy_targets() {
+    local app="$1"
+    if [ -f "$SPLIT_ORDINARY_POLICIES_FILE" ]; then
+        awk -F '\t' -v n="$app" 'NF >= 2 && $1 !~ /^#/ && $1 == n {print $2; exit}' "$SPLIT_ORDINARY_POLICIES_FILE"
+    else
+        split_policy_targets "$app"
+    fi
+}
+
 split_category_policy_target() {
     local target="$1"
     split_target_list_default "$(split_category_policy_targets "$target")"
@@ -2353,6 +2382,11 @@ split_target_label() {
 
 split_app_policy_is_category_default() {
     local app="$1" target="$2" category category_target
+    if [ -f "$SPLIT_ORDINARY_POLICIES_FILE" ]; then
+        awk -F '\t' -v a="$app" -v t="$target" \
+            '$1 == a && $2 == t && $3 == "category" {found=1} END {exit !found}' "$SPLIT_ORDINARY_POLICIES_FILE"
+        return $?
+    fi
     category="$(split_app_category "$app")"
     [ -n "$category" ] || return 1
     category_target="$(split_category_policy_targets "$category")"
@@ -2445,6 +2479,7 @@ validate_runtime_config() {
     valid_bool_value "$ENTRY_DIRECT_SPEEDTEST" || die "ENTRY_DIRECT_SPEEDTEST 必须是 true 或 false"
     valid_bool_value "$PROXY_DIRECT_DEFAULT_MIGRATED" || die "PROXY_DIRECT_DEFAULT_MIGRATED 必须是 true 或 false"
     valid_bool_value "$SPLIT_DNSMASQ_NFTSET" || die "SPLIT_DNSMASQ_NFTSET 必须是 true 或 false"
+    case "$SPLIT_ENGINE" in v1|v2) ;; *) die "SPLIT_ENGINE 必须为 v1 或 v2" ;; esac
     valid_bool_value "$SPLIT_FORCE_CONTAINER_DNS" || die "SPLIT_FORCE_CONTAINER_DNS 必须是 true 或 false"
     valid_bool_value "$SPLIT_DNS_SIDECAR_FALLBACK" || die "SPLIT_DNS_SIDECAR_FALLBACK 必须是 true 或 false"
     valid_bool_value "$SPLIT_DNS_FORCE_SIDECAR" || die "SPLIT_DNS_FORCE_SIDECAR 必须是 true 或 false"
@@ -2515,7 +2550,7 @@ validate_split_policies() {
         container_exists "$container" || die "容器级分流引用了未知容器: $container"
         split_app_exists "$app" || die "容器级分流 $container 引用了未知应用: $app"
         [ "$target" = "-" ] || exit_exists "$target" || die "容器级分流 $container/$app 引用了未知出口: $target"
-        targets="$(split_policy_targets "$app")"
+        targets="$(split_ordinary_policy_targets "$app")"
         [ -z "$targets" ] || split_target_list_contains "$targets" "$target" || die "容器级分流 $container/$app 引用了不在候选列表内的出口: $target"
         container_allows_split_target "$container" "$app" "$target" || die "容器级分流 $container/$app 引用了该容器不可用的出口: $target"
     done < <(read_container_split_policies)
@@ -2641,8 +2676,8 @@ apply_routes_and_rules() {
     local name mark table route4 route6 display fallback_priority ipv6_available="false"
     # 先准备全部路由，再替换规则；准备失败时旧规则仍然受不可达路由保护。
     while IFS=$'\t' read -r name mark table route4 route6 display; do
-        apply_default_route 4 "$table" "$route4"
-        apply_default_route 6 "$table" "$route6"
+        apply_default_route 4 "$table" "$route4" || return 1
+        apply_default_route 6 "$table" "$route6" || return 1
     done < <(read_exit_rows)
     reset_managed_ip_rules
     fallback_priority=$((RULE_PRIORITY + 1))
@@ -2730,6 +2765,10 @@ nft_elements_from_file() {
 
 build_split_dnsmasq_file() {
     local out="$1" app raw safe kind domain
+    if split_v2_enabled; then
+        split_v2_call forwarders > "$out"
+        return $?
+    fi
     while IFS=$'\t' read -r app _target; do
         [ -n "$app" ] || continue
         raw="$(split_raw_file "$app")"
@@ -2797,6 +2836,14 @@ split_dnsmasq_supported() {
 }
 
 split_dnsmasq_status_label() {
+    if split_v2_enabled; then
+        if systemctl is-active --quiet "$APP_NAME-split-dns.service"; then
+            printf '域名虚拟地址（v2）'
+        else
+            printf 'CIDR 分流（v2）'
+        fi
+        return 0
+    fi
     local iface total=0 native=0 sidecar=0
     if [ "${SPLIT_DNSMASQ_NFTSET:-true}" != "true" ]; then
         printf '已关闭'
@@ -3419,12 +3466,16 @@ apply_split_dnsmasq_nftsets() {
     local generated generated_hash iface network_dir config_file old_config current base desired
     local file_changed raw_changed changed=0 sidecar_applied=0 static_count=0 sidecar_failed="false" sidecar_ready required
     if [ "${SPLIT_DNSMASQ_NFTSET:-true}" != "true" ] && [ "${BLOCK_BT_PT_DOMAINS:-false}" != "true" ]; then
-        remove_split_dnsmasq_integration
-        return $?
+        remove_split_dnsmasq_integration || return 1
+        if split_v2_enabled; then split_v2_stop_dns; fi
+        return 0
     fi
     generated="$(mktemp)"
     if [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ]; then
-        build_split_dnsmasq_file "$generated"
+        build_split_dnsmasq_file "$generated" || { rm -f "$generated"; return 1; }
+    fi
+    if split_v2_enabled && [ -s "$generated" ]; then
+        split_v2_start_dns || { rm -f "$generated"; return 1; }
     fi
     generated_hash="$(sha256sum "$generated" | awk '{print $1}')"
     mkdir -p "$SPLIT_DNSMASQ_DIR"
@@ -3458,7 +3509,7 @@ apply_split_dnsmasq_nftsets() {
             fi
         fi
         strip_split_dnsmasq_block "$current" "$base"
-        if [ "${SPLIT_DNSMASQ_NFTSET:-true}" != "true" ] || ! incus_bridge_dnsmasq_supports_nftset "$iface"; then
+        if ! split_v2_enabled && { [ "${SPLIT_DNSMASQ_NFTSET:-true}" != "true" ] || ! incus_bridge_dnsmasq_supports_nftset "$iface"; }; then
             sidecar_ready="false"
             if [ -s "$generated" ] && split_dns_sidecar_available; then
                 if apply_split_dns_sidecar_one "$iface" "$generated"; then
@@ -3523,6 +3574,7 @@ apply_split_dnsmasq_nftsets() {
         remove_split_dns_sidecar_one "$iface"
         rm -f "$old_config" "$current" "$base" "$desired"
     done < <(split_managed_dns_bridges)
+    if split_v2_enabled && [ ! -s "$generated" ]; then split_v2_stop_dns; fi
     rm -f "$generated"
     if [ "$sidecar_failed" = "true" ]; then
         if [ "${BLOCK_BT_PT_DOMAINS:-false}" = "true" ]; then
@@ -3617,6 +3669,10 @@ split_dns_health_check() {
     local v4 v6 server family port chain total=0 reason=""
     bridge_dhcp_health_check || return 1
     bt_pt_dns_block_health || return 1
+    if split_v2_enabled; then
+        split_v2_health
+        return $?
+    fi
     [ "${ENABLE_SPLIT_RULES:-true}" = "true" ] || return 0
     [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ] || return 0
     generated="$(mktemp)"
@@ -3723,6 +3779,13 @@ for item in payload.get("nftables") or []:
 }
 
 split_dns_health() {
+    load_config
+    if split_v2_enabled; then
+        if split_dns_health_check; then info "分流 DNS 健康检查通过。"; return 0; fi
+        [ "${1:-}" = "--repair" ] || return 1
+        do_apply_split_changes && split_dns_health_check
+        return $?
+    fi
     need_root
     load_config
     write_default_config
@@ -3759,6 +3822,7 @@ split_dns_health() {
 }
 
 build_split_dns_sidecar_redirect_rules() {
+    split_v2_enabled && return 0
     local mode="${1:-}" generated iface port dynamic=false
     if [ "$mode" != native-only ] && [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ]; then
         generated="$(mktemp)"
@@ -3951,9 +4015,9 @@ $v6elements_line
   }
 "
         fi
-    done < <(read_enabled_split_app_ids)
+    done < <(if ! split_v2_enabled; then read_enabled_split_app_ids; fi)
 
-    if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
+    if ! split_v2_enabled && [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
         split_nft_name_into safe "$SPLIT_COLLISION_BYPASS_APP_ID"
         v4file="$(split_resolved_v4_file "$SPLIT_COLLISION_BYPASS_APP_ID")"
         v6file="$(split_resolved_v6_file "$SPLIT_COLLISION_BYPASS_APP_ID")"
@@ -3984,7 +4048,7 @@ $v6elements_line
             *" $source "*) ;;
             *) force_sources="$force_sources $source" ;;
         esac
-    done < <(read_force_on_exit_policies; read_force_category_on_exit_policies)
+    done < <(if ! split_v2_enabled; then read_force_on_exit_policies; read_force_category_on_exit_policies; fi)
     for source in $force_sources; do
         split_nft_name_into src_safe "$source"
         [ -n "$src_safe" ] || continue
@@ -4005,7 +4069,7 @@ $line6
 "
     done
 
-    if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
+    if ! split_v2_enabled && [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
         while IFS=$'\t' read -r app target; do
             split_app_is_forced "$app" || continue
             target="$(split_target_list_default "$target")"
@@ -4191,7 +4255,7 @@ $line6
             fi
         done < <(read_split_policies)
     fi
-    if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ] &&
+    if ! split_v2_enabled && [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ] &&
         proxy_direct_any_enabled; then
         split_nft_name_into safe "$PROXY_DIRECT_APP_ID"
         v4file="$(split_resolved_v4_file "$PROXY_DIRECT_APP_ID")"
@@ -4287,19 +4351,26 @@ apply_wireguard_bridge_routes_for_exits() {
 apply_nftables() {
     local preserve_pending="${1:-false}" tmp batch dns_config live
     apply_wireguard_bridge_routes_for_exits || return 1
+    if split_v2_enabled; then split_v2_call apply || return 1; fi
     tmp="$(mktemp)"
     batch="$(mktemp)"
     dns_config="$(mktemp)"
     live="$(mktemp)"
-    build_nft_file "$tmp"
+    if ! build_nft_file "$tmp"; then
+        rm -f "$tmp" "$batch" "$dns_config" "$live"
+        return 1
+    fi
     if [ "${SPLIT_DNSMASQ_NFTSET:-true}" = "true" ]; then
-        build_split_dnsmasq_file "$dns_config"
+        if ! build_split_dnsmasq_file "$dns_config"; then
+            rm -f "$tmp" "$batch" "$dns_config" "$live"
+            return 1
+        fi
     fi
     if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
         printf 'delete table inet %s\n' "$NFT_TABLE" > "$batch"
     fi
     cat "$tmp" >> "$batch"
-    if [ "${PRESERVE_LEARNED_SPLIT_DNS:-true}" = "true" ] &&
+    if ! split_v2_enabled && [ "${PRESERVE_LEARNED_SPLIT_DNS:-true}" = "true" ] &&
         [ -s "$dns_config" ] && [ -s "$SPLIT_DNS_STATE_FILE" ] && [ -s "$NFT_STATE_FILE" ] &&
         nft -j list table inet "$NFT_TABLE" > "$live" 2>/dev/null; then
         if ! preserve_split_dns_elements "$live" "$tmp" "$dns_config" >> "$batch"; then
@@ -4321,8 +4392,16 @@ apply_nftables() {
         rm -f "$tmp" "$batch" "$dns_config" "$live"
         return 1
     fi
-    cp "$tmp" "$NFT_STATE_FILE"
-    cp "$dns_config" "$SPLIT_DNS_STATE_FILE"
+    if ! split_v2_enabled; then
+        if nft list table inet "${NFT_TABLE}_split" >/dev/null 2>&1; then
+            nft delete table inet "${NFT_TABLE}_split" || return 1
+        fi
+        split_v2_stop_dns
+    fi
+    if ! cp "$tmp" "$NFT_STATE_FILE" || ! cp "$dns_config" "$SPLIT_DNS_STATE_FILE"; then
+        rm -f "$tmp" "$batch" "$dns_config" "$live"
+        return 1
+    fi
     [ "$preserve_pending" = "true" ] || rm -f "$PENDING_NFT_FILE"
     rm -f "$tmp" "$batch" "$dns_config" "$live"
 }
@@ -4430,6 +4509,11 @@ do_apply() {
     install_split_dns_sidecar_dependency
     state_lock_acquire
     apply_lock_acquire
+    # Older installed updaters replace the sourced apply functions, but
+    # continue executing their original upgrade function body.
+    if [ -f "$SPLIT_APPS_FILE" ] && [ ! -f "$SPLIT_POLICY_LAYERS_FILE" ]; then
+        split_policy_layers migrate || die "分流策略迁移失败，已中止应用。"
+    fi
     validate_runtime_config
     validate_exits
     validate_exit_limits
@@ -4444,7 +4528,7 @@ do_apply() {
     fi
     enable_apply_guard || die "无法启用全量应用期间的流量保护表，已中止更新。"
     if ! (
-        apply_routes_and_rules
+        apply_routes_and_rules &&
         apply_nftables true
     ); then
         warn "全量应用失败；临时流量保护仍保持启用，修复错误后重新执行 apply 即可恢复。"
@@ -4482,7 +4566,11 @@ do_apply_nftables() {
     validate_exits
     validate_containers
     validate_split_policies
-    apply_nftables
+    if ! apply_nftables; then
+        apply_lock_release
+        state_lock_release
+        return 1
+    fi
     apply_lock_release
     state_lock_release
 }
@@ -4804,18 +4892,24 @@ print("\t".join([name, parts.hostname, str(parts.port), username, password]))
 PY
 }
 
-parse_vless_tcp_link() {
+parse_vless_link() {
     local link="$1"
     python3 - "$link" <<'PY'
+import ipaddress
+import json
+import re
 import sys
 import uuid
 from urllib.parse import parse_qs, unquote, urlsplit
 
-link = sys.argv[1].strip()
-parts = urlsplit(link)
+try:
+    parts = urlsplit(sys.argv[1].strip())
+    port = parts.port
+except ValueError:
+    raise SystemExit("VLESS 链接的地址或端口无效")
 if parts.scheme.lower() != "vless":
     raise SystemExit("不是有效的 vless:// 链接")
-if not parts.hostname or not parts.port:
+if not parts.hostname or not port:
     raise SystemExit("VLESS 链接缺少地址或端口")
 user_id = unquote(parts.username or "")
 try:
@@ -4823,17 +4917,68 @@ try:
 except (ValueError, AttributeError):
     raise SystemExit("VLESS 用户 ID 不是有效 UUID")
 query = parse_qs(parts.query, keep_blank_values=True)
-transport = (query.get("type") or ["tcp"])[0].lower()
-encryption = (query.get("encryption") or ["none"])[0].lower()
-security = (query.get("security") or ["none"])[0].lower()
-if transport not in ("", "tcp"):
-    raise SystemExit("目前只支持 VLESS+TCP，不支持 type=%s" % transport)
-if encryption not in ("", "none"):
-    raise SystemExit("VLESS+TCP 仅支持 encryption=none")
-if security not in ("", "none"):
-    raise SystemExit("目前只支持不带 TLS/Reality 的 VLESS+TCP")
+
+def setting(key, default=""):
+    return query.get(key, [default])[0] or default
+
+def valid_host(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return bool(re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.?", value))
+
+transport = setting("type", "tcp").lower()
+security = setting("security", "none").lower()
+if setting("encryption", "none").lower() != "none":
+    raise SystemExit("VLESS 仅支持 encryption=none")
 name = unquote(parts.fragment) if parts.fragment else parts.hostname.replace(".", "-")
-print("\t".join([name, parts.hostname, str(parts.port), user_id]))
+fields = [re.sub(r"[\t\r\n]", " ", name).strip() or "unnamed", parts.hostname, str(port), user_id]
+if (transport, security) == ("tcp", "none"):
+    print("\t".join(fields))
+    raise SystemExit(0)
+if (transport, security) != ("ws", "tls"):
+    raise SystemExit("VLESS 仅支持无 TLS 的 TCP 或带 TLS 的 WebSocket（不支持 Reality）")
+if setting("flow"):
+    raise SystemExit("VLESS+WebSocket 不支持 flow")
+if setting("allowInsecure", "false").lower() not in ("false", "0"):
+    raise SystemExit("VLESS+WebSocket+TLS 需要验证服务端证书")
+sni = setting("sni", parts.hostname)
+host = setting("host")
+if not valid_host(sni):
+    raise SystemExit("VLESS TLS SNI 无效")
+if host:
+    try:
+        authority = urlsplit("//" + host)
+        if not re.fullmatch(r"(?:[a-zA-Z0-9.-]+|\[[a-fA-F0-9:.]+\])(?::[0-9]+)?", host) or not valid_host(authority.hostname or "") or authority.port == 0:
+            raise ValueError
+    except ValueError:
+        raise SystemExit("VLESS WebSocket Host 无效")
+if setting("alpn") and "http/1.1" not in setting("alpn").split(","):
+    raise SystemExit("VLESS WebSocket 的 ALPN 需要支持 HTTP/1.1")
+
+path = setting("path", "/")
+if not path.startswith("/") or path.startswith("//") or re.search(r"[\x00-\x20\x7f#]", path):
+    raise SystemExit("VLESS WebSocket 路径无效")
+route, _, raw_query = path.partition("?")
+early_data = setting("ed")
+other_params = []
+for param in raw_query.split("&") if raw_query else []:
+    key, _, value = param.partition("=")
+    if unquote(key) == "ed":
+        early_data = unquote(value) or "0"
+    else:
+        other_params.append(param)
+ws = {"type": "ws", "path": route + ("?" + "&".join(other_params) if other_params else "")}
+if host:
+    ws["headers"] = {"Host": host}
+if early_data:
+    if not re.fullmatch(r"[0-9]{1,10}", early_data) or int(early_data) > 4294967295:
+        raise SystemExit("VLESS WebSocket early data (ed) 无效")
+    if int(early_data):
+        ws.update(max_early_data=int(early_data), early_data_header_name="Sec-WebSocket-Protocol")
+tls = {"enabled": True, "server_name": sni, "alpn": ["http/1.1"]}
+print("\t".join(fields + [json.dumps({"tls": tls, "transport": ws}, separators=(",", ":"))]))
 PY
 }
 
@@ -5340,6 +5485,7 @@ prepare_split_collision_bypass_cache() {
 }
 
 prepare_default_split_collision_bypass() {
+    split_v2_enabled && return 0
     [ "${ENABLE_SPLIT_RULES:-true}" = "true" ] || return 0
     if ! prepare_split_collision_bypass_cache; then
         warn "共享 IP 防误分流缓存暂未准备完成；后续规则刷新会再次尝试。"
@@ -5414,6 +5560,7 @@ proxy_direct_native_dns_ready() {
 }
 
 prepare_default_proxy_direct_bypass() {
+    if split_v2_enabled; then ensure_proxy_direct_rule_source; return $?; fi
     [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ] || return 0
     if ! prepare_proxy_direct_rule_cache; then
         warn "入口机直连缓存暂未准备完成；已保留配置，后续规则刷新会再次尝试。"
@@ -5421,6 +5568,7 @@ prepare_default_proxy_direct_bypass() {
 }
 
 proxy_split_rules() {
+    split_v2_enabled && return 0
     [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" != "true" ] || return 0
     proxy_direct_any_enabled || return 0
     proxy_direct_enabled_rule_lines | python3 -c '
@@ -5456,6 +5604,7 @@ for field in ("domain_suffix", "domain", "ip_cidr"):
 
 proxy_outbound_json() {
     local protocol="$1" server="$2" port="$3" method="$4" password="$5" username="$6"
+    local vless_options="${7:-}"
     local server_esc method_esc pass_esc user_esc auth_json
     server_esc=$(json_escape "$server")
     pass_esc=$(json_escape "$password")
@@ -5497,17 +5646,19 @@ EOF
 EOF
             ;;
         vless)
-            method_esc=$(json_escape "$method")
-            cat <<EOF
-    {
-      "type": "vless",
-      "tag": "proxy",
-      "server": "$server_esc",
-      "server_port": $port,
-      "uuid": "$method_esc",
-      "routing_mark": 666
-    }
-EOF
+            python3 - "$server" "$port" "$method" "$vless_options" <<'PY'
+import json
+import sys
+
+server, port, user_id, options = sys.argv[1:]
+outbound = {
+    "type": "vless", "tag": "proxy", "server": server,
+    "server_port": int(port), "uuid": user_id, "routing_mark": 666,
+}
+if options:
+    outbound.update(json.loads(options))
+print(json.dumps(outbound))
+PY
             ;;
         *) die "不支持的 sing-box 出口协议: $protocol" ;;
     esac
@@ -5515,6 +5666,7 @@ EOF
 
 write_proxy_exit_files() {
     local protocol="$1" name="$2" server="$3" port="$4" table="$5" tun="$6" method="${7:-}" password="${8:-}" username="${9:-}"
+    local vless_options="${10:-}"
     local conf_dir conf service resolved_guard server_esc outbound_json split_rules sniff_rule domain_route proxy_direct_rule v4_octet v6_suffix
     local proxy_log_level="${PROXY_LOG_LEVEL:-warn}" proxy_tun_stack="${PROXY_TUN_STACK:-mixed}" proxy_eim="${PROXY_ENDPOINT_INDEPENDENT_NAT:-true}"
     valid_proxy_log_level "$proxy_log_level" || proxy_log_level="warn"
@@ -5525,7 +5677,7 @@ write_proxy_exit_files() {
     service="$SYSTEMD_DIR/${EXIT_SERVICE_PREFIX}-${name}.service"
     resolved_guard="$LIB_DIR/clear-resolved-link"
     server_esc=$(json_escape "$server")
-    outbound_json=$(proxy_outbound_json "$protocol" "$server" "$port" "$method" "$password" "$username")
+    outbound_json=$(proxy_outbound_json "$protocol" "$server" "$port" "$method" "$password" "$username" "$vless_options") || return 1
     split_rules=""
     if [ "${ADDING_SPLIT_ONLY_EXIT:-false}" != "true" ] && ! is_split_only_exit "$name"; then
         split_rules=$(proxy_split_rules)
@@ -5909,7 +6061,7 @@ write_sk5_exit_files() {
 
 write_vless_exit_files() {
     local name="$1" server="$2" port="$3" uuid="$4" table="$5" tun="$6"
-    write_proxy_exit_files "vless" "$name" "$server" "$port" "$table" "$tun" "$uuid" "" ""
+    write_proxy_exit_files "vless" "$name" "$server" "$port" "$table" "$tun" "$uuid" "" "" "${7:-}"
 }
 
 wait_for_iface() {
@@ -6097,7 +6249,9 @@ add_vless_exit_values() {
     need_cmd python3
     need_cmd systemctl
     need_cmd ip
-    local display="$1" server="$2" port="$3" uuid="$4" name="${5:-}" idx mark table tun normalized_uuid existing
+    local display="$1" server="$2" port="$3" uuid="$4" name="${5:-}" vless_options="${6:-}"
+    local idx mark table tun normalized_uuid existing label="VLESS+TCP"
+    [ -z "$vless_options" ] || label="VLESS+WebSocket+TLS"
     display="$(normalize_display_name "$display")"
     server="$(normalize_proxy_host "$server")"
     valid_proxy_host "$server" || die "VLESS 地址无效，请填写纯 IP 或域名/DDNS，不要带协议、端口或路径: $server"
@@ -6115,7 +6269,7 @@ PY
         if replace_exit_duplicate_action "$existing" "$display"; then
             case "$REPLACE_EXIT_DUPLICATE_ACTION" in
                 reuse)
-                    replace_proxy_exit_in_place "$REPLACE_EXIT_CONTEXT_OLD" "vless" "$display" "$server" "$port" "$normalized_uuid" "" ""
+                    replace_proxy_exit_in_place "$REPLACE_EXIT_CONTEXT_OLD" "vless" "$display" "$server" "$port" "$normalized_uuid" "" "" "$vless_options"
                     REPLACE_EXIT_COMPLETED="true"
                     return 0
                     ;;
@@ -6138,22 +6292,22 @@ PY
     table=$(table_for_index "$idx")
     tun=$(tun_for_exit "$name")
     install_singbox_core
-    write_vless_exit_files "$name" "$server" "$port" "$normalized_uuid" "$table" "$tun"
-    start_proxy_exit "VLESS+TCP" "$name" "$display" "$mark" "$table" "$tun"
+    write_vless_exit_files "$name" "$server" "$port" "$normalized_uuid" "$table" "$tun" "$vless_options"
+    start_proxy_exit "$label" "$name" "$display" "$mark" "$table" "$tun"
 }
 
 add_vless_exit_link() {
-    local link="$1" parsed display server port uuid name
-    [ -n "$link" ] || die "请提供 VLESS+TCP 节点链接。"
-    parsed=$(parse_vless_tcp_link "$link") || die "VLESS+TCP 链接解析失败。"
-    IFS=$'\t' read -r display server port uuid <<< "$parsed"
+    local link="$1" parsed display server port uuid name vless_options
+    [ -n "$link" ] || die "请提供 VLESS 节点链接。"
+    parsed=$(parse_vless_link "$link") || die "VLESS 链接解析失败。"
+    IFS=$'\t' read -r display server port uuid vless_options <<< "$parsed"
     name="$(safe_exit_id "vless" "$display" "$server" "$port")"
-    add_vless_exit_values "$display" "$server" "$port" "$uuid" "$name"
+    add_vless_exit_values "$display" "$server" "$port" "$uuid" "$name" "$vless_options"
 }
 
 add_vless_exit() {
     local first="${1:-}" display server port uuid
-    [ -n "$first" ] || die "用法: $0 add-vless vless://UUID@地址:端口?encryption=none&type=tcp#名称 或 $0 add-vless 出口名 地址 端口 UUID"
+    [ -n "$first" ] || die "用法: $0 add-vless 'vless://...' 或 $0 add-vless 出口名 地址 端口 UUID"
     if [[ "$first" == vless://* ]]; then
         add_vless_exit_link "$first"
         return 0
@@ -6293,7 +6447,7 @@ add_wireguard_exit() {
         || die "用法: $0 add-wg 出口名 服务端地址:端口 服务端公钥 IPv4隧道地址 [IPv6隧道地址|-] [PSK|-] [MTU] [本地UDP端口|-]"
     display="$(normalize_display_name "$display")"
     valid_wireguard_endpoint "$endpoint" || die "WireGuard Endpoint 无效，请使用 域名:端口、IPv4:端口 或 [IPv6]:端口。"
-    valid_wireguard_key "$peer_public_key" || die "WireGuard 服务端公钥无效。"
+    [ "$peer_public_key" != "-" ] && valid_wireguard_key "$peer_public_key" || die "WireGuard 服务端公钥无效。"
     valid_wireguard_key "$preshared_key" || die "WireGuard PSK 无效；没有 PSK 请填 -。"
     valid_wireguard_address 4 "$address4" || die "WireGuard IPv4 隧道地址无效，请包含前缀，例如 10.66.0.2/32；不启用请填 -。"
     valid_wireguard_address 6 "$address6" || die "WireGuard IPv6 隧道地址无效，请包含前缀；不启用请填 -。"
@@ -7159,6 +7313,9 @@ reset_auto_allowed_for_removed_exit() {
 
 reset_split_policies_for_removed_exit() {
     local removed="$1" tmp changed=0 app target new_target was_changed
+    if [ -f "$SPLIT_POLICY_LAYERS_FILE" ]; then
+        split_policy_layers replace-exit "$removed" ""
+    fi
     [ -f "$SPLIT_POLICIES_FILE" ] || return 0
     tmp="$(mktemp)"
     while IFS= read -r line || [ -n "$line" ]; do
@@ -7363,30 +7520,6 @@ list_exit_limits() {
     [ "$count" -gt 0 ] || printf '  暂无出口，请先添加出口。\n'
 }
 
-cleanup_container_split_policies_for_app_targets() {
-    local target_app="$1" allowed_targets="$2" tmp changed=0 container app target
-    [ -f "$SPLIT_CONTAINER_POLICIES_FILE" ] || return 0
-    state_lock_acquire
-    tmp="$(mktemp)"
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-        esac
-        IFS=$'\t' read -r container app target <<< "$line"
-        if [ "$app" = "$target_app" ] && ! split_target_list_contains "$allowed_targets" "$target"; then
-            changed=$((changed + 1))
-            continue
-        fi
-        printf '%s\n' "$line" >> "$tmp"
-    done < "$SPLIT_CONTAINER_POLICIES_FILE"
-    install -m 0600 "$tmp" "$SPLIT_CONTAINER_POLICIES_FILE"
-    rm -f "$tmp"
-    if [ "$changed" -gt 0 ]; then
-        info "已清理 $changed 条不在候选出口内的容器级覆盖。"
-    fi
-    state_lock_release
-}
-
 cleanup_container_split_policies_for_container_allowed() {
     local tmp changed=0 container app target
     [ -f "$SPLIT_CONTAINER_POLICIES_FILE" ] || return 0
@@ -7464,7 +7597,7 @@ replace_exit_backup() {
     for f in \
         "$EXITS_FILE" "$CONTAINERS_FILE" "$LIMITS_FILE" \
         "$SPLIT_POLICIES_FILE" "$SPLIT_CATEGORY_POLICIES_FILE" \
-        "$SPLIT_CONTAINER_POLICIES_FILE" \
+        "$SPLIT_CONTAINER_POLICIES_FILE" "$SPLIT_POLICY_LAYERS_FILE" "$SPLIT_ORDINARY_POLICIES_FILE" \
         "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" \
         "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" \
         "$SPLIT_ONLY_EXITS_FILE" \
@@ -7482,7 +7615,7 @@ replace_exit_restore() {
     for f in \
         "$EXITS_FILE" "$CONTAINERS_FILE" "$LIMITS_FILE" \
         "$SPLIT_POLICIES_FILE" "$SPLIT_CATEGORY_POLICIES_FILE" \
-        "$SPLIT_CONTAINER_POLICIES_FILE" \
+        "$SPLIT_CONTAINER_POLICIES_FILE" "$SPLIT_POLICY_LAYERS_FILE" "$SPLIT_ORDINARY_POLICIES_FILE" \
         "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" \
         "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" \
         "$CONFIG_FILE"; do
@@ -7574,6 +7707,7 @@ replace_proxy_exit_in_place_rollback() {
 
 replace_proxy_exit_in_place() {
     local name="$1" protocol="$2" display="$3" server="$4" port="$5" method="${6:-}" password="${7:-}" username="${8:-}"
+    local vless_options="${9:-}"
     local row mark table route4 route6 tun service
     need_root
     if [ "$protocol" = "shadowsocks" ]; then
@@ -7601,7 +7735,7 @@ replace_proxy_exit_in_place() {
             write_sk5_exit_files "$name" "$server" "$port" "$username" "$password" "$table" "$tun" || { replace_proxy_exit_in_place_rollback "$name"; die "SK5 节点配置写入失败，已回滚。"; }
             ;;
         vless)
-            write_vless_exit_files "$name" "$server" "$port" "$method" "$table" "$tun" || { replace_proxy_exit_in_place_rollback "$name"; die "VLESS 节点配置写入失败，已回滚。"; }
+            write_vless_exit_files "$name" "$server" "$port" "$method" "$table" "$tun" "$vless_options" || { replace_proxy_exit_in_place_rollback "$name"; die "VLESS 节点配置写入失败，已回滚。"; }
             ;;
         *)
             replace_proxy_exit_in_place_rollback "$name"
@@ -7655,6 +7789,9 @@ migrate_containers_for_replaced_exit() {
 
 migrate_split_policies_for_replaced_exit() {
     local old="$1" new="$2" file tmp line key source target new_target was_changed total=0
+    if [ -f "$SPLIT_POLICY_LAYERS_FILE" ]; then
+        split_policy_layers replace-exit "$old" "$new"
+    fi
     for file in "$SPLIT_POLICIES_FILE" "$SPLIT_CATEGORY_POLICIES_FILE"; do
         [ -f "$file" ] || continue
         tmp="$(mktemp)"
@@ -8343,7 +8480,7 @@ container_allows_split_target() {
     local container="$1" app="$2" target="$3" policy_targets
     [ "$target" = "-" ] && return 0
     if is_split_only_exit "$target"; then
-        policy_targets="$(split_policy_targets "$app")"
+        policy_targets="$(split_ordinary_policy_targets "$app")"
         [ -n "$policy_targets" ] && split_target_list_contains "$policy_targets" "$target"
         return $?
     fi
@@ -9238,7 +9375,7 @@ split_fetch_all_rules() {
         return 1
     fi
     rm -f "$tmp"
-    if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
+    if ! split_v2_enabled && [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
         ensure_split_collision_bypass_rule_source
         split_parse_app_rules "$SPLIT_COLLISION_BYPASS_APP_ID" \
             || warn "共享 IP 防误分流缓存刷新失败，已保留应用目录。"
@@ -9279,6 +9416,7 @@ split_download_app() {
 
 split_parse_app_rules() {
     local app="$1" mode="${2:-refresh}" answers="${3:-}" raw v4 v6 domains unsupported stats
+    if split_v2_enabled; then mode=cached; answers=""; fi
     raw="$(split_raw_file "$app")"
     v4="$(split_resolved_v4_file "$app")"
     v6="$(split_resolved_v6_file "$app")"
@@ -9555,174 +9693,291 @@ split_sync() {
     info "已更新已启用的分流规则：解析下发 $parsed 个应用，失败 $fail 个。"
 }
 
-split_write_policy_value() {
-    local app="$1" resolved="$2" tmp found="false" line row_app row_target
-    tmp="$(mktemp)"
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-        esac
-        IFS=$'\t' read -r row_app row_target <<< "$line"
-        if [ "$row_app" = "$app" ]; then
-            printf '%s\t%s\n' "$app" "$resolved" >> "$tmp"
-            found="true"
+# The legacy TSVs are the effective views consumed by nft, dnsmasq and the
+# controller. Preserve their existing row order because overlapping IP rules
+# at the same priority match in that order.
+split_policy_layers() {
+    python3 - "$SPLIT_DIR" "$@" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+root = Path(sys.argv[1])
+op, *args = sys.argv[2:]
+layers_path = root / "policy-layers.json"
+
+
+def rows(name, fields=1):
+    path = root / name
+    if not path.is_file():
+        return []
+    return [
+        row for line in path.read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+        for row in [line.split("\t")]
+        if len(row) >= fields and row[0]
+    ]
+
+
+def save(name, content):
+    path = root / name
+    if path.is_file() and path.read_text(encoding="utf-8") == content:
+        return
+    fd, tmp = tempfile.mkstemp(prefix="." + path.name + ".", dir=root)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(content)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def write_view(name, values):
+    save(name, "# Split policy view\n" + "".join(
+        "\t".join((key, value) if value is not None else (key,)) + "\n"
+        for key, value in values.items()
+    ))
+
+
+def targets(name):
+    return {r[0]: r[1] or "-" for r in rows(name, 2)}
+
+
+catalog = {r[0]: r[2] or "未分类" for r in rows("apps.tsv", 3)}
+previous = targets("policies.tsv")
+existing_layers = layers_path.is_file()
+if existing_layers:
+    model = json.loads(layers_path.read_text(encoding="utf-8"))
+    if model.get("version") != 1:
+        raise SystemExit("不支持的分流策略存储版本")
+else:
+    categories = targets("category-policies.tsv")
+    forced_categories = {r[0]: categories.get(r[0]) for r in rows("force-category-policies.tsv")}
+    model = {
+        "version": 1,
+        # Legacy rows contain effective policies without provenance. Pin them
+        # as explicit policies, including absences under a legacy category.
+        "apps": dict(previous),
+        "categories": categories,
+        "forced_apps": {r[0]: previous.get(r[0]) for r in rows("force-policies.tsv")},
+        "forced_categories": forced_categories,
+        "legacy_category_targets": {
+            app: previous.get(app) for app, category in catalog.items()
+            if category in forced_categories
+        },
+    }
+    for app, category in catalog.items():
+        if category in categories and app not in previous:
+            model["apps"][app] = None
+
+apps = model["apps"]
+categories = model["categories"]
+forced_apps = model["forced_apps"]
+forced_categories = model["forced_categories"]
+legacy = model["legacy_category_targets"]
+old_ordinary = targets("ordinary-policies.tsv") if existing_layers else previous
+
+if op == "migrate" and existing_layers:
+    sys.exit(0)
+if op in ("set-app", "set-category", "force-app", "force-category"):
+    names, target = args
+    dest = {"set-app": apps, "set-category": categories,
+            "force-app": forced_apps, "force-category": forced_categories}[op]
+    for name in (name.strip() for name in names.split(",")) if op == "force-category" else [names]:
+        dest[name] = target
+        if op == "force-category":
+            for app in list(legacy):
+                if catalog.get(app) == name:
+                    del legacy[app]
+elif op == "clear-app":
+    apps.pop(args[0], None)
+elif op == "clear-category":
+    categories.pop(args[0], None)
+elif op == "clear-forced-app":
+    forced_apps.pop(args[0], None)
+elif op == "clear-forced-category":
+    name, = args
+    forced_categories.pop(name, None)
+    for app in list(legacy):
+        if catalog.get(app) == name:
+            del legacy[app]
+elif op == "replace-exit":
+    old, new = args
+    for mapping in (apps, categories, forced_apps, forced_categories, legacy):
+        for key, value in mapping.items():
+            if value:
+                items = [new if item == old else item for item in value.split(",")]
+                mapping[key] = ",".join(dict.fromkeys(item for item in items if item)) or "-"
+elif op == "prune":
+    for mapping, allowed in ((apps, catalog), (forced_apps, catalog), (legacy, catalog),
+                             (categories, set(catalog.values())), (forced_categories, set(catalog.values()))):
+        for key in list(mapping):
+            if key not in allowed:
+                del mapping[key]
+elif op == "reset":
+    for mapping in (apps, categories, forced_apps, forced_categories, legacy):
+        mapping.clear()
+elif op != "migrate":
+    raise SystemExit("未知分流策略操作")
+
+ordinary, effective = {}, {}
+order = dict.fromkeys([*previous, *apps, *forced_apps, *catalog])
+for app in order:
+    category = catalog.get(app)
+    normal = apps.get(app, categories.get(category))
+    if normal:
+        ordinary[app] = normal
+    if app in forced_apps:
+        selected = forced_apps[app]
+    elif category in forced_categories:
+        selected = legacy.get(app, forced_categories[category])
+    else:
+        selected = normal
+    if selected:
+        effective[app] = selected
+
+if op == "migrate" and list(effective.items()) != list(previous.items()):
+    raise SystemExit("旧分流策略无法等价迁移，已保留原配置")
+
+save(layers_path.name, json.dumps(model, ensure_ascii=False, indent=2) + "\n")
+save("ordinary-policies.tsv", "# app_id\tcandidates\torigin\n" + "".join(
+    f"{app}\t{target}\t{'app' if app in apps else 'category'}\n" for app, target in ordinary.items()
+))
+if op != "migrate":
+    write_view("policies.tsv", effective)
+    write_view("category-policies.tsv", categories)
+    write_view("force-policies.tsv", dict.fromkeys(forced_apps))
+    write_view("force-category-policies.tsv", dict.fromkeys(forced_categories))
+    # Forced rules mask ordinary selections. Only changes to ordinary
+    # candidates can invalidate a saved container selection.
+    overrides = root / "container-policies.tsv"
+    if op not in ("replace-exit", "reset") and overrides.is_file():
+        original = overrides.read_text(encoding="utf-8")
+        keep = []
+        for line in original.splitlines(keepends=True):
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 3 and not line.startswith("#"):
+                _, app, target = parts[:3]
+                if ordinary.get(app) != old_ordinary.get(app) and target not in ordinary.get(app, "").split(","):
+                    continue
+            keep.append(line)
+        save(overrides.name, "".join(keep))
+PY
+}
+
+restore_split_policy_transaction() {
+    local snapshot="$1" relative target temp
+    while IFS= read -r relative; do
+        case "$relative" in ""|/*|../*|*/../*|*/..) return 1 ;; esac
+        target="$CONFIG_DIR/$relative"
+        if [ -e "$snapshot/files/$relative" ]; then
+            temp="$(mktemp -d "${target%/*}/.policy-restore.XXXXXX")" || return 1
+            cp -a -- "$snapshot/files/$relative" "$temp/value" || return 1
+            if [ -d "$temp/value" ]; then
+                rm -rf -- "$target" || return 1
+            fi
+            mv -Tf -- "$temp/value" "$target" || return 1
+            rmdir -- "$temp" || return 1
         else
-            printf '%s\n' "$line" >> "$tmp"
+            rm -rf -- "$target" || return 1
         fi
-    done < "$SPLIT_POLICIES_FILE"
-    if [ "$found" != "true" ]; then
-        printf '%s\t%s\n' "$app" "$resolved" >> "$tmp"
-    fi
-    install -m 0600 "$tmp" "$SPLIT_POLICIES_FILE"
-    rm -f "$tmp"
+    done < "$snapshot/paths"
 }
 
-split_write_category_policy_value() {
-    local category="$1" resolved="$2" tmp found="false" line row_category row_target
-    tmp="$(mktemp)"
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-        esac
-        IFS=$'\t' read -r row_category row_target <<< "$line"
-        if [ "$row_category" = "$category" ]; then
-            printf '%s\t%s\n' "$category" "$resolved" >> "$tmp"
-            found="true"
+finish_split_policy_transaction() {
+    local snapshot="$1" finished="$1.finished.$$"
+    mv -T -- "$snapshot" "$finished" || return 1
+    rm -rf -- "$finished"
+}
+
+snapshot_split_policy_files() {
+    local stage="$1" path relative
+    shift
+    for path in "$@"; do
+        relative="${path#"$CONFIG_DIR/"}"
+        [ "$relative" != "$path" ] || return 1
+        printf '%s\n' "$relative" >> "$stage/paths" || return 1
+        if [ -e "$path" ]; then
+            mkdir -p "$(dirname "$stage/files/$relative")" || return 1
+            cp -a -- "$path" "$stage/files/$relative" || return 1
+        fi
+    done
+}
+
+split_policy_transaction() {
+    local scope="$1" snapshot stage result=0 apply_pid input_fd
+    shift
+    split_cache_lock_acquire || return 1
+    state_lock_acquire
+    local SPLIT_POLICY_TRANSACTION_ACTIVE=true
+    snapshot="$SPLIT_POLICY_TRANSACTION_DIR"
+    stage="$(mktemp -d "$CONFIG_DIR/.split-policy-stage.XXXXXX")" || die "无法创建分流事务备份。"
+    local -a files=(
+        "$SPLIT_POLICIES_FILE" "$SPLIT_CATEGORY_POLICIES_FILE"
+        "$SPLIT_FORCE_POLICIES_FILE" "$SPLIT_FORCE_CATEGORY_POLICIES_FILE"
+        "$SPLIT_CONTAINER_POLICIES_FILE" "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE"
+        "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" "$SPLIT_POLICY_LAYERS_FILE"
+        "$SPLIT_ORDINARY_POLICIES_FILE" "$PENDING_NFT_FILE"
+    )
+    if [ "$scope" = "catalog" ]; then
+        files+=("$SPLIT_APPS_FILE" "$SPLIT_CACHE_DIR" "$SPLIT_LAST_SYNC_FILE" "$SPLIT_CATALOG_FILE")
+    fi
+    if ! snapshot_split_policy_files "$stage" "${files[@]}" || ! mv -T -- "$stage" "$snapshot"; then
+        rm -rf -- "$stage"
+        state_lock_release
+        split_cache_lock_release
+        warn "分流事务备份失败，配置未修改。"
+        return 1
+    fi
+    exec {input_fd}<&0 || die "无法保留分流命令输入。"
+    (
+        mark_nft_pending || exit $?
+        "$@" <&"$input_fd" || exit $?
+        touch "$snapshot/apply-attempted" || exit $?
+        do_apply_split_changes
+    ) &
+    apply_pid=$!
+    exec {input_fd}<&-
+    wait "$apply_pid" || result=$?
+    if [ "$result" -ne 0 ]; then
+        if ! restore_split_policy_transaction "$snapshot"; then
+            die "分流策略提交及配置恢复失败，事务备份已保留: $snapshot"
+        fi
+        if [ -e "$snapshot/apply-attempted" ]; then
+            ( do_apply_split_changes ) &
+            apply_pid=$!
+            if ! wait "$apply_pid"; then
+                mark_nft_pending
+                warn "已恢复旧分流配置，重建旧数据面失败，保留待应用标记。"
+            elif [ -f "$snapshot/files/${PENDING_NFT_FILE#"$CONFIG_DIR/"}" ]; then
+                cp -a "$snapshot/files/${PENDING_NFT_FILE#"$CONFIG_DIR/"}" "$PENDING_NFT_FILE"
+            fi
+        fi
+        warn "本次分流策略提交失败，已恢复修改前的配置。"
+    fi
+        if [ "$result" -eq 0 ] && split_v2_enabled; then
+        if [ -f "$snapshot/files/${PENDING_NFT_FILE#"$CONFIG_DIR/"}" ]; then
+            cp -a "$snapshot/files/${PENDING_NFT_FILE#"$CONFIG_DIR/"}" "$PENDING_NFT_FILE"
         else
-            printf '%s\n' "$line" >> "$tmp"
+            rm -f "$PENDING_NFT_FILE"
         fi
-    done < "$SPLIT_CATEGORY_POLICIES_FILE"
-    if [ "$found" != "true" ]; then
-        printf '%s\t%s\n' "$category" "$resolved" >> "$tmp"
     fi
-    install -m 0600 "$tmp" "$SPLIT_CATEGORY_POLICIES_FILE"
-    rm -f "$tmp"
-}
-
-force_write_app_value() {
-    local app="$1" tmp found="false" line row_app
-    tmp="$(mktemp)"
-    [ -f "$SPLIT_FORCE_POLICIES_FILE" ] || write_default_config
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-        esac
-        IFS=$'\t' read -r row_app <<< "$line"
-        if [ "$row_app" = "$app" ]; then
-            found="true"
-        fi
-        printf '%s\n' "$line" >> "$tmp"
-    done < "$SPLIT_FORCE_POLICIES_FILE"
-    if [ "$found" != "true" ]; then
-        printf '%s\n' "$app" >> "$tmp"
-    fi
-    install -m 0600 "$tmp" "$SPLIT_FORCE_POLICIES_FILE"
-    rm -f "$tmp"
-}
-
-force_write_category_value() {
-    local category="$1" tmp found="false" line row_category
-    tmp="$(mktemp)"
-    [ -f "$SPLIT_FORCE_CATEGORY_POLICIES_FILE" ] || write_default_config
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-        esac
-        IFS=$'\t' read -r row_category <<< "$line"
-        if [ "$row_category" = "$category" ]; then
-            found="true"
-        fi
-        printf '%s\n' "$line" >> "$tmp"
-    done < "$SPLIT_FORCE_CATEGORY_POLICIES_FILE"
-    if [ "$found" != "true" ]; then
-        printf '%s\n' "$category" >> "$tmp"
-    fi
-    install -m 0600 "$tmp" "$SPLIT_FORCE_CATEGORY_POLICIES_FILE"
-    rm -f "$tmp"
-}
-
-force_clear_app_value() {
-    local app="$1" tmp removed="false" line row_app
-    [ -f "$SPLIT_FORCE_POLICIES_FILE" ] || return 0
-    tmp="$(mktemp)"
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-        esac
-        IFS=$'\t' read -r row_app <<< "$line"
-        if [ "$row_app" = "$app" ]; then
-            removed="true"
-            continue
-        fi
-        printf '%s\n' "$line" >> "$tmp"
-    done < "$SPLIT_FORCE_POLICIES_FILE"
-    install -m 0600 "$tmp" "$SPLIT_FORCE_POLICIES_FILE"
-    rm -f "$tmp"
-    [ "$removed" = "true" ]
-}
-
-force_clear_category_value() {
-    local category="$1" tmp removed="false" line row_category
-    [ -f "$SPLIT_FORCE_CATEGORY_POLICIES_FILE" ] || return 0
-    tmp="$(mktemp)"
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-        esac
-        IFS=$'\t' read -r row_category <<< "$line"
-        if [ "$row_category" = "$category" ]; then
-            removed="true"
-            continue
-        fi
-        printf '%s\n' "$line" >> "$tmp"
-    done < "$SPLIT_FORCE_CATEGORY_POLICIES_FILE"
-    install -m 0600 "$tmp" "$SPLIT_FORCE_CATEGORY_POLICIES_FILE"
-    rm -f "$tmp"
-    [ "$removed" = "true" ]
-}
-
-force_on_exit_write_value() {
-    local file="$1" key="$2" source="$3" target="$4" tmp line row_key row_source row_target found="false"
-    tmp="$(mktemp)"
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-        esac
-        IFS=$'\t' read -r row_key row_source row_target <<< "$line"
-        if [ "$row_key" = "$key" ] && [ "$row_source" = "$source" ]; then
-            printf '%s\t%s\t%s\n' "$key" "$source" "$target" >> "$tmp"
-            found="true"
-        else
-            printf '%s\n' "$line" >> "$tmp"
-        fi
-    done < "$file"
-    [ "$found" = "true" ] || printf '%s\t%s\t%s\n' "$key" "$source" "$target" >> "$tmp"
-    install -m 0600 "$tmp" "$file"
-    rm -f "$tmp"
-}
-
-force_on_exit_clear_value() {
-    local file="$1" key="$2" source="$3" tmp line row_key row_source row_target removed="false"
-    [ -f "$file" ] || return 1
-    tmp="$(mktemp)"
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-        esac
-        IFS=$'\t' read -r row_key row_source row_target <<< "$line"
-        if [ "$row_key" = "$key" ] && [ "$row_source" = "$source" ]; then
-            removed="true"
-            continue
-        fi
-        printf '%s\n' "$line" >> "$tmp"
-    done < "$file"
-    install -m 0600 "$tmp" "$file"
-    rm -f "$tmp"
-    [ "$removed" = "true" ]
+    finish_split_policy_transaction "$snapshot" || die "无法结束分流事务，备份已保留。"
+    state_lock_release
+    split_cache_lock_release
+    return "$result"
 }
 
 split_reconcile_category_policies() {
     state_lock_acquire
+    if [ -f "$SPLIT_POLICY_LAYERS_FILE" ]; then
+        split_policy_layers prune
+        state_lock_release
+        return 0
+    fi
     python3 - "$SPLIT_APPS_FILE" "$SPLIT_CATEGORY_POLICIES_FILE" "$SPLIT_POLICIES_FILE" <<'PY'
 import os
 import tempfile
@@ -9764,84 +10019,6 @@ PY
     state_lock_release
 }
 
-split_bulk_set_category_apps() {
-    local category="$1" target="$2"
-    state_lock_acquire
-    python3 - "$SPLIT_APPS_FILE" "$SPLIT_POLICIES_FILE" "$category" "$target" <<'PY'
-import os
-import tempfile
-import sys
-
-apps_path, policies_path, category, target = sys.argv[1:5]
-apps = []
-with open(apps_path, "r", encoding="utf-8", errors="ignore") as fh:
-    for raw in fh:
-        parts = raw.rstrip("\n").split("\t")
-        if len(parts) >= 3 and parts[2] == category:
-            apps.append(parts[0])
-wanted = set(apps)
-rows = []
-seen = set()
-if os.path.exists(policies_path):
-    with open(policies_path, "r", encoding="utf-8", errors="ignore") as fh:
-        for raw in fh:
-            parts = raw.rstrip("\n").split("\t")
-            if len(parts) >= 2 and parts[0] in wanted:
-                rows.append("%s\t%s\n" % (parts[0], target))
-                seen.add(parts[0])
-            else:
-                rows.append(raw)
-for app in apps:
-    if app not in seen:
-        rows.append("%s\t%s\n" % (app, target))
-fd, tmp = tempfile.mkstemp(prefix="policies.", dir=os.path.dirname(policies_path))
-with os.fdopen(fd, "w", encoding="utf-8") as out:
-    out.writelines(rows)
-os.chmod(tmp, 0o600)
-os.replace(tmp, policies_path)
-print(len(apps))
-PY
-    state_lock_release
-}
-
-cleanup_container_split_policies_for_category_targets() {
-    local category="$1" allowed="$2" removed
-    [ -f "$SPLIT_CONTAINER_POLICIES_FILE" ] || return 0
-    state_lock_acquire
-    removed="$(python3 - "$SPLIT_APPS_FILE" "$SPLIT_CONTAINER_POLICIES_FILE" "$category" "$allowed" <<'PY'
-import os
-import tempfile
-import sys
-
-apps_path, policies_path, category, allowed_raw = sys.argv[1:5]
-allowed = {item for item in allowed_raw.split(",") if item}
-apps = set()
-with open(apps_path, "r", encoding="utf-8", errors="ignore") as fh:
-    for raw in fh:
-        parts = raw.rstrip("\n").split("\t")
-        if len(parts) >= 3 and parts[2] == category:
-            apps.add(parts[0])
-rows = []
-removed = 0
-with open(policies_path, "r", encoding="utf-8", errors="ignore") as fh:
-    for raw in fh:
-        parts = raw.rstrip("\n").split("\t")
-        if len(parts) >= 3 and parts[1] in apps and parts[2] not in allowed:
-            removed += 1
-            continue
-        rows.append(raw)
-fd, tmp = tempfile.mkstemp(prefix="container-policies.", dir=os.path.dirname(policies_path))
-with os.fdopen(fd, "w", encoding="utf-8") as out:
-    out.writelines(rows)
-os.chmod(tmp, 0o600)
-os.replace(tmp, policies_path)
-print(removed)
-PY
-)"
-    state_lock_release
-    [ "${removed:-0}" -eq 0 ] || info "已清理 $removed 条不在候选出口内的容器级覆盖。"
-}
-
 split_set_policy() {
     need_root
     load_config
@@ -9855,21 +10032,15 @@ split_set_policy() {
     resolved="$(resolve_split_target_list "$@")" || die "存在未知出口: $*"
     require_split_only_targets "$resolved"
     split_prepare_app_rules "$app"
-    state_lock_acquire
-    mark_nft_pending
-    split_write_policy_value "$app" "$resolved"
-    cleanup_container_split_policies_for_app_targets "$app" "$resolved"
-    cleanup_container_split_policies_for_container_allowed
-    do_apply_nftables
-    state_lock_release
-    info "已设置应用分流：$(split_app_display "$app") -> $(split_target_list_label "$resolved")"
+    split_policy_transaction policy split_policy_layers set-app "$app" "$resolved" || return $?
+    info "已设置应用分流：$(split_app_display "$app") -> $(split_target_list_label "$resolved")" 
 }
 
 split_set_category_policy() {
     need_root
     load_config
     write_default_config
-    local target_category="${1:-}" resolved app display app_category remote enabled count=0
+    local target_category="${1:-}" resolved app display app_category remote enabled
     split_require_catalog
     [ -n "$target_category" ] || die "用法: $0 split-set-category 分类 目标出口[,候选出口...]"
     shift || true
@@ -9881,15 +10052,59 @@ split_set_category_policy() {
         [ "$app_category" = "$target_category" ] || continue
         split_prepare_app_rules "$app"
     done < <(read_split_apps)
-    state_lock_acquire
-    mark_nft_pending
-    split_write_category_policy_value "$target_category" "$resolved"
-    count="$(split_bulk_set_category_apps "$target_category" "$resolved")"
-    cleanup_container_split_policies_for_category_targets "$target_category" "$resolved"
-    cleanup_container_split_policies_for_container_allowed
-    do_apply_nftables
-    state_lock_release
-    info "已设置分类分流：$target_category -> $(split_target_list_label "$resolved")，共 $count 个应用。"
+    split_policy_transaction policy split_policy_layers set-category "$target_category" "$resolved" || return $?
+    info "已设置分类默认分流：$target_category -> $(split_target_list_label "$resolved")" 
+}
+
+split_resolve_force_sources() {
+    local input="$1" item source joined=""
+    local -a items
+    IFS=',' read -r -a items <<< "$input"
+    for item in "${items[@]}"; do
+        source="$(resolve_exit_target "$(trim_space "$item")")" || return 1
+        is_split_only_exit "$source" && return 1
+        joined="${joined:+$joined,}$source"
+    done
+    [ -n "$joined" ] || return 1
+    printf '%s\n' "$joined"
+}
+
+split_update_force_bindings() {
+    local file="$1" action="$2" keys="$3" sources="$4" target="${5:-}"
+    python3 - "$file" "$action" "$keys" "$sources" "$target" <<'PY'
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+path, action, keys, sources, target = sys.argv[1:]
+path = Path(path)
+wanted = [(key.strip(), source) for key in keys.split(",") for source in sources.split(",")]
+wanted_set = set(wanted)
+original = path.read_text(encoding="utf-8") if path.is_file() else ""
+rows, replaced = [], set()
+for line in original.splitlines(keepends=True):
+    fields = line.rstrip("\n").split("\t")
+    identity = tuple(fields[:2])
+    if len(fields) < 3 or line.startswith("#") or identity not in wanted_set:
+        rows.append(line)
+    elif action == "set" and identity not in replaced:
+        rows.append("\t".join((*identity, target)) + "\n")
+        replaced.add(identity)
+if action == "set":
+    for identity in wanted:
+        if identity not in replaced:
+            rows.append("\t".join((*identity, target)) + "\n")
+            replaced.add(identity)
+fd, tmp = tempfile.mkstemp(prefix="." + path.name + ".", dir=path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.writelines(rows)
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
 }
 
 split_force_on_exit_policy() {
@@ -9905,13 +10120,8 @@ split_force_on_exit_policy() {
     for item in "${sources[@]}"; do item="$(trim_space "$item")"; source="$(resolve_exit_target "$item")" || die "未知来源出口: $item"; is_split_only_exit "$source" && die "来源出口 '$(display_exit_name "$source")' 是分流专用出口，只能作为强制分流目标，不能作为实例出口来源。"; comma=""; [ -n "$resolved_sources" ] && comma=","; case ",$resolved_sources," in *,"$source",*) ;; *) resolved_sources="$resolved_sources$comma$source" ;; esac; done
     for item in "${targets[@]}"; do item="$(trim_space "$item")"; target="$(resolve_exit_target "$item")" || die "未知目标出口: $item"; require_split_only_targets "$target"; comma=""; [ -n "$resolved_targets" ] && comma=","; case ",$resolved_targets," in *,"$target",*) ;; *) resolved_targets="$resolved_targets$comma$target" ;; esac; done
     case "$resolved_targets" in *,*) die "按出口强制分流只能设置一个实际目标出口。" ;; esac
-    state_lock_acquire
-    mark_nft_pending
-    IFS=',' read -r -a sources <<< "$resolved_sources"
-    for app in "${apps[@]}"; do app="$(trim_space "$app")"; for source in "${sources[@]}"; do force_on_exit_write_value "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" "$app" "$source" "$resolved_targets"; done; done
-    do_apply_nftables
-    state_lock_release
-    info "已批量设置按出口强制应用分流：应用 ${#apps[@]} 个，来源 $(split_target_list_label "$resolved_sources") -> 目标 $(split_target_list_label "$resolved_targets")"
+    split_policy_transaction policy split_update_force_bindings "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" set "$apps_input" "$resolved_sources" "$resolved_targets" || return $?
+    info "已批量设置按出口强制应用分流：应用 ${#apps[@]} 个，来源 $(split_target_list_label "$resolved_sources") -> 目标 $(split_target_list_label "$resolved_targets")" 
 }
 
 split_force_category_on_exit_policy() {
@@ -9932,49 +10142,40 @@ split_force_category_on_exit_policy() {
         split_prepare_app_rules "$app"
         count=$((count + 1))
     done < <(read_split_apps)
-    state_lock_acquire
-    mark_nft_pending
-    IFS=',' read -r -a sources <<< "$resolved_sources"
-    for category in "${categories[@]}"; do category="$(trim_space "$category")"; for source in "${sources[@]}"; do force_on_exit_write_value "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" "$category" "$source" "$resolved_targets"; done; done
-    do_apply_nftables
-    state_lock_release
-    info "已批量设置按出口强制分类分流：分类 ${#categories[@]} 个，来源 $(split_target_list_label "$resolved_sources") -> 目标 $(split_target_list_label "$resolved_targets")，共 $count 个应用。"
+    split_policy_transaction policy split_update_force_bindings "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" set "$categories_input" "$resolved_sources" "$resolved_targets" || return $?
+    info "已批量设置按出口强制分类分流：分类 ${#categories[@]} 个，来源 $(split_target_list_label "$resolved_sources") -> 目标 $(split_target_list_label "$resolved_targets")" 
 }
 
 split_force_on_exit_clear_policy() {
     need_root
     load_config
     write_default_config
-    local apps_input="${1:-}" sources_input="${2:-}" app source item removed="false"
+    local apps_input="${1:-}" sources_input="${2:-}" app
     local apps=() sources=()
     split_require_catalog
     [ -n "$apps_input" ] && [ -n "$sources_input" ] || die "用法: $0 split-force-on-exit-clear 应用ID列表 来源出口列表"
     IFS=',' read -r -a apps <<< "$apps_input"; IFS=',' read -r -a sources <<< "$sources_input"
     for app in "${apps[@]}"; do app="$(trim_space "$app")"; split_app_exists "$app" || die "未知应用: $app"; done
-    state_lock_acquire
-    mark_nft_pending
-    for app in "${apps[@]}"; do app="$(trim_space "$app")"; for item in "${sources[@]}"; do item="$(trim_space "$item")"; source="$(resolve_exit_target "$item")" || die "未知来源出口: $item"; is_split_only_exit "$source" && die "来源出口 '$(display_exit_name "$source")' 是分流专用出口，不能作为实例出口来源。"; force_on_exit_clear_value "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" "$app" "$source" && removed="true" || true; done; done
-    do_apply_nftables
-    state_lock_release
-    [ "$removed" = "true" ] && info "已批量取消对应的按出口强制应用分流。" || info "未找到对应的按出口强制应用分流。"
+    local resolved_sources
+    resolved_sources="$(split_resolve_force_sources "$sources_input")" || die "存在无效的来源出口，原规则未修改。"
+    split_policy_transaction policy split_update_force_bindings "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" clear "$apps_input" "$resolved_sources" || return $?
+    info "已批量取消对应的按出口强制应用分流。" 
 }
 
 split_force_category_on_exit_clear_policy() {
     need_root
     load_config
     write_default_config
-    local categories_input="${1:-}" sources_input="${2:-}" category source item removed="false"
+    local categories_input="${1:-}" sources_input="${2:-}" category
     local categories=() sources=()
     split_require_catalog
     [ -n "$categories_input" ] && [ -n "$sources_input" ] || die "用法: $0 split-force-category-on-exit-clear 分类列表 来源出口列表"
     IFS=',' read -r -a categories <<< "$categories_input"; IFS=',' read -r -a sources <<< "$sources_input"
     for category in "${categories[@]}"; do category="$(trim_space "$category")"; split_category_exists "$category" || die "未找到分类: $category"; done
-    state_lock_acquire
-    mark_nft_pending
-    for category in "${categories[@]}"; do category="$(trim_space "$category")"; for item in "${sources[@]}"; do item="$(trim_space "$item")"; source="$(resolve_exit_target "$item")" || die "未知来源出口: $item"; is_split_only_exit "$source" && die "来源出口 '$(display_exit_name "$source")' 是分流专用出口，不能作为实例出口来源。"; force_on_exit_clear_value "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" "$category" "$source" && removed="true" || true; done; done
-    do_apply_nftables
-    state_lock_release
-    [ "$removed" = "true" ] && info "已批量取消对应的按出口强制分类分流。" || info "未找到对应的按出口强制分类分流。"
+    local resolved_sources
+    resolved_sources="$(split_resolve_force_sources "$sources_input")" || die "存在无效的来源出口，原规则未修改。"
+    split_policy_transaction policy split_update_force_bindings "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" clear "$categories_input" "$resolved_sources" || return $?
+    info "已批量取消对应的按出口强制分类分流。" 
 }
 
 split_force_policy() {
@@ -9988,22 +10189,15 @@ split_force_policy() {
     resolved="$(resolve_exit_target "$target")" || die "未知出口: $target"
     require_split_only_targets "$resolved"
     split_prepare_app_rules "$app"
-    state_lock_acquire
-    mark_nft_pending
-    split_write_policy_value "$app" "$resolved"
-    force_write_app_value "$app"
-    cleanup_container_split_policies_for_app_targets "$app" "$resolved"
-    cleanup_container_split_policies_for_container_allowed
-    do_apply_nftables
-    state_lock_release
-    info "已设置强制应用分流：$(split_app_display "$app") -> $(display_exit_name "$resolved")"
+    split_policy_transaction policy split_policy_layers force-app "$app" "$resolved" || return $?
+    info "已设置强制应用分流：$(split_app_display "$app") -> $(display_exit_name "$resolved")" 
 }
 
 split_force_category_policy() {
     need_root
     load_config
     write_default_config
-    local categories_input="${1:-}" target="${2:-}" resolved item category app display app_category remote enabled count=0 total_count=0 label="" comma=""
+    local categories_input="${1:-}" target="${2:-}" resolved item category app display app_category remote enabled
     local categories=()
     split_require_catalog
     [ -n "$categories_input" ] && [ -n "$target" ] || die "用法: $0 split-force-category 分类[,分类...] 目标出口"
@@ -10021,121 +10215,43 @@ split_force_category_policy() {
             split_prepare_app_rules "$app"
         done < <(read_split_apps)
     done
-    state_lock_acquire
-    mark_nft_pending
-    for category in "${categories[@]}"; do
-        category="$(trim_space "$category")"
-        split_write_category_policy_value "$category" "$resolved"
-        force_write_category_value "$category"
-        count="$(split_bulk_set_category_apps "$category" "$resolved")"
-        total_count=$((total_count + count))
-        cleanup_container_split_policies_for_category_targets "$category" "$resolved"
-        label="$label$comma$category"
-        comma=","
-    done
-    cleanup_container_split_policies_for_container_allowed
-    do_apply_nftables
-    state_lock_release
-    info "已设置强制分类分流：$label -> $(split_target_list_label "$resolved")，共 $total_count 个应用。"
+    split_policy_transaction policy split_policy_layers force-category "$categories_input" "$resolved" || return $?
+    info "已设置强制分类分流：$categories_input -> $(display_exit_name "$resolved")" 
 }
 
 split_clear_category_policy() {
     need_root
     load_config
     write_default_config
-    local target_category="${1:-}" tmp removed="false" line row_category row_target app display app_category remote enabled target
+    local target_category="${1:-}"
     split_require_catalog
     [ -n "$target_category" ] || die "用法: $0 split-clear-category 分类"
     split_category_exists "$target_category" || die "未找到分类: $target_category"
-    state_lock_acquire
-    mark_nft_pending
-    target="$(split_category_policy_targets "$target_category")"
-    tmp="$(mktemp)"
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-        esac
-        IFS=$'\t' read -r row_category row_target <<< "$line"
-        if [ "$row_category" = "$target_category" ]; then
-            removed="true"
-            continue
-        fi
-        printf '%s\n' "$line" >> "$tmp"
-    done < "$SPLIT_CATEGORY_POLICIES_FILE"
-    install -m 0600 "$tmp" "$SPLIT_CATEGORY_POLICIES_FILE"
-    rm -f "$tmp"
-
-    if [ -n "$target" ]; then
-        tmp="$(mktemp)"
-        while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in
-                ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-            esac
-            IFS=$'\t' read -r app row_target <<< "$line"
-            app_category="$(split_app_category "$app")"
-            if [ "$app_category" = "$target_category" ] && [ "$row_target" = "$target" ]; then
-                continue
-            fi
-            printf '%s\n' "$line" >> "$tmp"
-        done < "$SPLIT_POLICIES_FILE"
-        install -m 0600 "$tmp" "$SPLIT_POLICIES_FILE"
-        rm -f "$tmp"
-    fi
-    force_clear_category_value "$target_category" >/dev/null 2>&1 || true
-    while IFS=$'\t' read -r app display app_category remote enabled; do
-        [ "$app_category" = "$target_category" ] || continue
-        force_clear_app_value "$app" >/dev/null 2>&1 || true
-    done < <(read_split_apps)
-    do_apply_nftables
-    if [ "$removed" = "true" ]; then
-        info "已取消分类分流：$target_category"
-    else
-        info "该分类没有设置分流策略：$target_category"
-    fi
-    state_lock_release
+    split_policy_transaction policy split_policy_layers clear-category "$target_category" || return $?
+    info "已取消分类默认分流：$target_category" 
 }
 
 split_clear_policy() {
     need_root
     load_config
     write_default_config
-    local app="${1:-}" tmp removed="false"
+    local app="${1:-}"
     split_require_catalog
     [ -n "$app" ] || die "用法: $0 split-clear 应用ID"
     split_app_exists "$app" || die "未知应用: $app"
-    state_lock_acquire
-    mark_nft_pending
-    tmp="$(mktemp)"
-    while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in
-            ""|\#*) printf '%s\n' "$line" >> "$tmp"; continue ;;
-        esac
-        IFS=$'\t' read -r row_app row_target <<< "$line"
-        if [ "$row_app" = "$app" ]; then
-            removed="true"
-            continue
-        fi
-        printf '%s\n' "$line" >> "$tmp"
-    done < "$SPLIT_POLICIES_FILE"
-    install -m 0600 "$tmp" "$SPLIT_POLICIES_FILE"
-    rm -f "$tmp"
-    force_clear_app_value "$app" >/dev/null 2>&1 || true
-    do_apply_nftables
-    if [ "$removed" = "true" ]; then
-        info "已取消应用分流：$(split_app_display "$app")"
-    else
-        info "该应用没有设置分流策略：$(split_app_display "$app")"
-    fi
-    state_lock_release
+    split_policy_transaction policy split_policy_layers clear-app "$app" || return $?
+    info "已取消应用显式分流：$(split_app_display "$app")" 
 }
 
 split_clear_all_rules() {
     need_root
     load_config
     write_default_config
-    split_cache_lock_acquire
-    state_lock_acquire
-    mark_nft_pending
+    split_policy_transaction catalog split_clear_all_rule_state || return $?
+    info "已清空分流策略，应用目录仍可使用。"
+}
+
+split_clear_all_rule_state() {
     local app_policies category_policies container_policies force_apps force_categories custom_apps tmp
     app_policies="$(read_split_policies | awk 'END {print NR + 0}')"
     category_policies="$(read_split_category_policies | awk 'END {print NR + 0}')"
@@ -10144,31 +10260,11 @@ split_clear_all_rules() {
     force_categories="$(read_force_split_category_policies | awk 'END {print NR + 0}')"
     custom_apps="$(read_split_apps | awk -F '\t' '$4 ~ /^custom:/ {n++} END {print n + 0}')"
 
-    cat > "$SPLIT_POLICIES_FILE" <<'EOF'
-# 应用分流策略，每行一条：
-# app_id  目标出口候选列表
-EOF
-    cat > "$SPLIT_CATEGORY_POLICIES_FILE" <<'EOF'
-# 分类分流策略，每行一条：
-# 分类  目标出口候选列表
-EOF
-    cat > "$SPLIT_CONTAINER_POLICIES_FILE" <<'EOF'
-# 容器级分流覆盖，每行一条：
-# 容器名  app_id  目标出口
-EOF
-    cat > "$SPLIT_FORCE_POLICIES_FILE" <<'EOF'
-# 强制应用分流，每行一个 app_id。
-EOF
-    cat > "$SPLIT_FORCE_CATEGORY_POLICIES_FILE" <<'EOF'
-# 强制分类分流，每行一个分类名。
-EOF
-    cat > "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" <<'EOF'
-# 按当前出口强制应用分流：app_id  来源出口  目标出口
-EOF
-    cat > "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE" <<'EOF'
-# 按当前出口强制分类分流：分类  来源出口  目标出口
-EOF
-    chmod 600 "$SPLIT_POLICIES_FILE" "$SPLIT_CATEGORY_POLICIES_FILE" "$SPLIT_CONTAINER_POLICIES_FILE" "$SPLIT_FORCE_POLICIES_FILE" "$SPLIT_FORCE_CATEGORY_POLICIES_FILE" "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE"
+    split_policy_layers reset || return 1
+    printf '# container app_id target_exit\n' > "$SPLIT_CONTAINER_POLICIES_FILE"
+    printf '# app_id source_exit target_exit\n' > "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE"
+    printf '# category source_exit target_exit\n' > "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE"
+    chmod 600 "$SPLIT_CONTAINER_POLICIES_FILE" "$SPLIT_FORCE_ON_EXIT_POLICIES_FILE" "$SPLIT_FORCE_CATEGORY_ON_EXIT_POLICIES_FILE"
 
     if [ -f "$SPLIT_APPS_FILE" ]; then
         tmp="$(mktemp)"
@@ -10180,7 +10276,9 @@ EOF
     mkdir -p "$SPLIT_RAW_DIR" "$SPLIT_RESOLVED_DIR"
     find "$SPLIT_RAW_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
     find "$SPLIT_RESOLVED_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
-    if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ]; then
+    if split_v2_enabled; then
+        ensure_proxy_direct_rule_source
+    elif [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ]; then
         ensure_proxy_direct_rule_source
         if proxy_direct_any_enabled; then
             split_parse_proxy_direct_rules || warn "入口机直连缓存重建失败，相关流量将暂时继续通过当前出口。"
@@ -10188,17 +10286,14 @@ EOF
             clear_proxy_direct_resolved_cache
         fi
     fi
-    if [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
+    if ! split_v2_enabled && [ "${ENABLE_SPLIT_RULES:-true}" = "true" ]; then
         ensure_split_collision_bypass_rule_source
         split_parse_app_rules "$SPLIT_COLLISION_BYPASS_APP_ID" \
             || warn "共享 IP 防误分流缓存重建失败。"
     fi
     rm -f "$SPLIT_LAST_SYNC_FILE"
-    do_apply_nftables
-    state_lock_release
-    split_cache_lock_release
-    info "已清空全部分流规则：应用策略 $app_policies 条，分类策略 $category_policies 条，容器覆盖 $container_policies 条，强制应用 $force_apps 条，强制分类 $force_categories 条，自定义规则 $custom_apps 条。"
-    info "应用目录仍保留，可继续按需重新添加应用/分类分流。"
+    info "准备清空分流规则：应用策略 $app_policies 条，分类策略 $category_policies 条，容器覆盖 $container_policies 条，强制应用 $force_apps 条，强制分类 $force_categories 条，自定义规则 $custom_apps 条。"
+    info "将保留应用目录。"
 }
 
 split_prepare_one() {
@@ -10239,6 +10334,7 @@ split_ensure_one() {
 split_refresh_cached_dns() {
     need_root
     load_config
+    if split_v2_enabled; then do_apply_split_changes; return $?; fi
     write_default_config
     local app parsed=0 failed=0
     split_cache_lock_acquire
@@ -10339,6 +10435,11 @@ split_add_custom_rule() {
     write_default_config
     need_cmd python3
     split_require_catalog
+    split_policy_transaction catalog split_add_custom_rule_state "$@" || return $?
+    info "自定义分流规则已提交。"
+}
+
+split_add_custom_rule_state() {
     local display="${1:-}" category="${2:-自定义}" input_file="${3:-}" app raw tmp normalized_count
     [ -n "$display" ] || die "用法: $0 split-add-custom 应用名 [分类] < rules.txt"
     display="$(printf '%s' "$display" | tr '\t\r\n' '   ')"
@@ -10468,10 +10569,10 @@ PY
     mark_nft_pending
     split_write_app_catalog_row "$app" "$display" "$category" "custom:$app" true
     split_parse_app_rules "$app"
-    do_apply_nftables
+    split_policy_layers prune || return 1
     state_lock_release
     split_cache_lock_release
-    info "已添加自定义分流规则：$display（分类: $category，应用ID: $app，规则 $normalized_count 条）"
+    info "已校验自定义分流规则：$display（分类: $category，应用ID: $app，规则 $normalized_count 条）"
 }
 
 split_force_clear_policy() {
@@ -10482,15 +10583,8 @@ split_force_clear_policy() {
     split_require_catalog
     [ -n "$app" ] || die "用法: $0 split-force-clear 应用ID"
     split_app_exists "$app" || die "未知应用: $app"
-    state_lock_acquire
-    mark_nft_pending
-    if force_clear_app_value "$app"; then
-        info "已取消强制应用分流：$(split_app_display "$app")"
-    else
-        info "该应用没有强制分流：$(split_app_display "$app")"
-    fi
-    do_apply_nftables
-    state_lock_release
+    split_policy_transaction policy split_policy_layers clear-forced-app "$app" || return $?
+    info "已取消强制应用分流：$(split_app_display "$app")" 
 }
 
 split_force_clear_category_policy() {
@@ -10501,15 +10595,8 @@ split_force_clear_category_policy() {
     split_require_catalog
     [ -n "$category" ] || die "用法: $0 split-force-clear-category 分类"
     split_category_exists "$category" || die "未找到分类: $category"
-    state_lock_acquire
-    mark_nft_pending
-    if force_clear_category_value "$category"; then
-        info "已取消强制分类分流：$category"
-    else
-        info "该分类没有强制分流：$category"
-    fi
-    do_apply_nftables
-    state_lock_release
+    split_policy_transaction policy split_policy_layers clear-forced-category "$category" || return $?
+    info "已取消强制分类分流：$category" 
 }
 
 split_list() {
@@ -10522,6 +10609,7 @@ split_list() {
     force_on_exit="$(read_force_on_exit_policies | awk 'END {print NR + 0}')"
     force_category_on_exit="$(read_force_category_on_exit_policies | awk 'END {print NR + 0}')"
     printf '应用分流状态: %s  单文件规则源: %s  更新间隔: %ss\n' "$ENABLE_SPLIT_RULES" "$SPLIT_RULE_BUNDLE_URL" "$SPLIT_UPDATE_INTERVAL"
+    printf '默认直连: %s\n' "$(entry_direct_summary)"
     printf '域名动态命中: %s  健康巡检: %ss  失败退避上限: %ss\n' "$(split_dnsmasq_status_label)" "$SPLIT_DNS_HEALTH_INTERVAL" "$AUTO_REPAIR_BACKOFF_MAX"
     if split_catalog_ready; then
         printf '应用目录: 已同步\n'
@@ -11215,6 +11303,9 @@ def load_force_exit_sources():
 
 
 def nft_force_source_transition(container_ip, previous, target):
+    if v2_enabled():
+        refresh_split_runtime()
+        return
     # 按当前出口强制的容器按来源出口分组在 force{4,6}_src_* 集合里。
     # 切换出口只做增量 add/delete 集合元素，避免全量重建 nft 表；
     # 任何失败回退 apply_nft_fallback() 全量重建保证规则与状态一致。
@@ -11234,6 +11325,26 @@ def nft_force_source_transition(container_ip, previous, target):
         return
     if not run_nft_transition(lines):
         apply_nft_fallback()
+
+
+def v2_enabled():
+    return read_env_file(CONFIG_FILE).get("SPLIT_ENGINE", "v2") == "v2"
+
+
+def v2_active_apps():
+    path = os.path.join(os.path.dirname(APPLY_LOCK_FILE), "split-v2.json")
+    try:
+        with open(path, encoding="utf-8") as snapshot:
+            return set(json.load(snapshot)["apps"])
+    except (OSError, ValueError, KeyError):
+        return set()
+
+
+def refresh_split_runtime():
+    result = subprocess.run([MANAGER_BIN, "split-apply-runtime"], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+    if result.returncode:
+        raise RuntimeError(result.stdout.strip() or "split apply failed")
 
 
 def clear_conntrack(container_ip):
@@ -11327,8 +11438,11 @@ class Handler(BaseHTTPRequestHandler):
         apps = load_split_apps()
         global_policies = load_split_policies()
         overrides = load_container_split_policies()
+        active = v2_active_apps() if v2_enabled() else apps
         lines = []
         for app in sorted(apps.keys(), key=lambda key: (apps[key].get("category", ""), apps[key].get("display", key))):
+            if app not in active:
+                continue
             conditional_target = conditional_force_target(app, apps, container)
             if app not in global_policies and not conditional_target:
                 continue
@@ -11394,7 +11508,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/current":
             response(self, 200, {"ok": True, "container": container["name"], "current": current_label(container["current"], exits)})
         elif path == "/split.txt":
-            text_response(self, 200, self.split_list_text(container, exits))
+            enabled = read_env_file(CONFIG_FILE).get("ENABLE_SPLIT_RULES", "true").lower() == "true"
+            text_response(self, 200, self.split_list_text(container, exits) if enabled else "")
         elif path == "/split-targets.txt":
             app_ref = (params.get("app") or [""])[0]
             text_response(self, 200, self.split_targets_text(container, exits, app_ref))
@@ -11498,6 +11613,9 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def do_split_post(self, container):
+        if read_env_file(CONFIG_FILE).get("ENABLE_SPLIT_RULES", "true").lower() != "true":
+            response(self, 403, {"ok": False, "error": "宿主机已关闭应用分流"})
+            return
         params = self.read_form()
         if params is None:
             return
@@ -11508,6 +11626,9 @@ class Handler(BaseHTTPRequestHandler):
         app = resolve_app(app_ref, apps)
         if not app:
             response(self, 400, {"ok": False, "error": "未知应用分流"})
+            return
+        if v2_enabled() and app not in v2_active_apps():
+            response(self, 403, {"ok": False, "error": "该应用分流未在数据面生效"})
             return
         global_policies = load_split_policies()
         conditional_target = conditional_force_target(app, apps, container)
@@ -11538,17 +11659,19 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     ensure_split_rules(app)
                     generation = update_container_split(container, app, target)
-                    apply_nft_fallback()
+                    refresh_split_runtime() if v2_enabled() else apply_nft_fallback()
                     clear_pending_generation(generation)
-                    clear_conntrack(container["ip"])
+                    if not v2_enabled():
+                        clear_conntrack(container["ip"])
                 except Exception as operation_error:
                     if generation is None:
                         raise
                     try:
                         rollback_generation = update_container_split(container, app, previous_override, rollback=True)
-                        apply_nft_fallback()
+                        refresh_split_runtime() if v2_enabled() else apply_nft_fallback()
                         clear_pending_generation(rollback_generation)
-                        clear_conntrack(container["ip"])
+                        if not v2_enabled():
+                            clear_conntrack(container["ip"])
                     except Exception as rollback_error:
                         raise RuntimeError("%s；回滚旧分流选择时发生错误：%s（已保留待应用标记）" % (operation_error, rollback_error)) from operation_error
                     raise RuntimeError("%s；容器分流选择和数据面已恢复到切换前状态" % operation_error) from operation_error
@@ -12890,6 +13013,8 @@ def maybe_sync_split_rules(force=False):
 
 
 def maybe_refresh_split_dns(force=False):
+    if read_env_file(CONFIG_FILE).get("SPLIT_ENGINE", "v2") == "v2":
+        return
     if not ENABLE_SPLIT_RULES or SPLIT_DNS_REFRESH_INTERVAL <= 0:
         return
     now = time.time()
@@ -13314,6 +13439,7 @@ install_host() {
     ensure_runtime_config_defaults
     load_config
     install_split_dns_sidecar_dependency
+    write_split_engine
     prepare_default_proxy_direct_bypass
     prepare_default_split_collision_bypass
     if command -v systemctl >/dev/null 2>&1; then
@@ -13350,7 +13476,7 @@ client_script() {
 #!/bin/sh
 # cloudshlii out client v2
 set -u
-API_URL="\${EGRESS_API_URL:-$API_PUBLIC_URL}"
+API_URL="${EGRESS_API_URL:-$API_PUBLIC_URL}"
 EOF
     cat <<'EOF'
 TOKEN_FILE="${EGRESS_TOKEN_FILE:-/etc/incus-egress-token}"
@@ -14405,8 +14531,6 @@ interactive_status() {
   2. 自动巡检与失败退避状态
   3. 出口状态
   4. 容器同步与异常跳过
-  5. 分流策略
-  6. 分流 DNS 即时健康检查（只读）
   7. 上游出口即时健康检查（不执行修复）
   8. 策略路由
   9. nftables 规则
@@ -14423,8 +14547,7 @@ EOF
             2) show_status_patrols; pause_screen ;;
             3) show_status_exits; pause_screen ;;
             4) show_status_containers; pause_screen ;;
-            5) show_status_split; pause_screen ;;
-            6) show_status_split_dns_live; pause_screen ;;
+            5|6) interactive_split_diagnostics ;;
             7) show_status_upstream_live; pause_screen ;;
             8) show_status_routes; pause_screen ;;
             9) show_status_nft; pause_screen ;;
@@ -14460,7 +14583,7 @@ interactive_add_proxy_exit() {
     printf '  2. SS / SS2022 手动输入\n'
     printf '  3. SK5 链接导入\n'
     printf '  4. SK5 手动输入\n'
-    printf '  5. VLESS+TCP 链接导入\n'
+    printf '  5. VLESS 链接导入（TCP / WebSocket+TLS）\n'
     printf '  6. VLESS+TCP 手动输入\n'
     printf '  7. WireGuard 原生隧道\n'
     printf '  0. 返回主菜单\n'
@@ -14513,9 +14636,9 @@ interactive_add_proxy_exit() {
             add_sk5_exit "$name" "$server" "$port" "$username" "$password"
             ;;
         5)
-            printf '\n请粘贴 VLESS+TCP 节点链接，格式类似 vless://UUID@地址:端口?encryption=none&type=tcp#名称。\n'
-            link="$(prompt_required "VLESS+TCP 节点链接")"
-            parsed=$(parse_vless_tcp_link "$link") || { warn "VLESS+TCP 链接解析失败。"; pause_screen; return 0; }
+            printf '\n请粘贴 vless:// 节点链接，支持无 TLS 的 TCP 和带 TLS 的 WebSocket。\n'
+            link="$(prompt_required_secret "VLESS 节点链接")"
+            parsed=$(parse_vless_link "$link") || { warn "VLESS 链接解析失败。"; pause_screen; return 0; }
             default_name=$(printf '%s' "$parsed" | awk -F '\t' '{print $1}')
             info "将使用节点链接解析出的出口名称: $default_name"
             add_vless_exit_link "$link"
@@ -14674,8 +14797,6 @@ interactive_proxy_optimization_menu() {
                  sing-box 多实例并发优化
 ============================================================
 当前默认: log=$PROXY_LOG_LEVEL  stack=$PROXY_TUN_STACK
-入口机直连: $(entry_direct_summary)
-
   1. 设置单个 sing-box 出口运行模式
   2. 全部应用推荐低负载模式
   3. 全部恢复兼容模式
@@ -14751,6 +14872,10 @@ set_entry_direct_values() {
     local desired="$1" label="$2" setting key value mode=reuse result changed failed
     shift 2
     valid_bool_value "$desired" || die "入口机直连开关必须是 true 或 false。"
+    if split_v2_enabled; then
+        split_v2_set_flags "$desired" "$@"
+        return $?
+    fi
     ensure_entry_direct_dependencies || die "入口机直连依赖准备失败，原开关状态保持不变。"
     info "正在准备应用入口机直连规则..."
     if ! split_cache_lock_acquire 3; then
@@ -14766,7 +14891,9 @@ set_entry_direct_values() {
         printf -v "$key" '%s' "$value"
     done
     mark_nft_pending
-    if [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ]; then
+    if split_v2_enabled; then
+        ensure_proxy_direct_rule_source
+    elif [ "${PROXY_KERNEL_DIRECT_BYPASS:-true}" = "true" ]; then
         if proxy_direct_native_dns_ready; then
             mode=cached
         elif proxy_direct_any_enabled; then
@@ -14777,7 +14904,7 @@ set_entry_direct_values() {
     result="$(apply_proxy_profile_all "-" "-" "-" "${PROXY_KERNEL_DIRECT_BYPASS:-true}")"
     IFS=$'\t' read -r changed failed <<< "$result"
     info "正在提交入口机直连规则..."
-    do_apply_nftables
+    do_apply_split_changes
     split_cache_lock_release
     bt_pt_dns_block_health || die "BT/PT 域名屏蔽未通过网桥 DNS 检查。"
     if [ -z "$label" ]; then
@@ -14814,7 +14941,7 @@ interactive_bt_pt_settings() {
 }
 
 interactive_entry_direct_menu() {
-    local choice current
+    local choice current back_label="${1:-返回分流管理}"
     while :; do
         if [ -t 1 ] && [ -n "${TERM:-}" ] && [ "${TERM:-}" != "dumb" ] && command -v clear >/dev/null 2>&1; then
             clear
@@ -14822,17 +14949,16 @@ interactive_entry_direct_menu() {
         load_config
         cat <<EOF
 ============================================================
-                     入口机直连
+              入口机直连与 BT/PT 屏蔽
 ============================================================
-关闭某组后，该组不再绕过出口，会跟随容器当前出口。
-管理员在“分流管理”中明确设置的入口机策略不受这里影响。
+关闭某组默认直连后，匹配流量按应用规则或容器当前出口处理。
 
   1. 软件源与开发平台       [$(entry_direct_value_label "$ENTRY_DIRECT_SOFTWARE")]
   2. BT/PT 站点与 Tracker   [$(entry_direct_bt_pt_label)]
   3. 测速网站               [$(entry_direct_value_label "$ENTRY_DIRECT_SPEEDTEST")]
   4. 全部开启默认直连
   5. 全部关闭默认直连
-  0. 返回主菜单
+  0. $back_label
 ============================================================
 BT/PT 域名屏蔽单独设置。已知 IP 直连、加密 DNS、DHT 和磁力 Peer 的
 直接 IP/随机端口流量无法仅靠网桥 DNS 完整识别。
@@ -15641,6 +15767,7 @@ print_split_menu_summary() {
  全局强制 : 分类 $force_categories / 应用 $force_apps
  按出口强制: 分类 $force_category_on_exit / 应用 $force_on_exit
  分流专用出口: $split_exits
+ 默认直连 : $(entry_direct_summary)
  目录同步 : $catalog_sync
  规则更新 : $rule_sync
 ------------------------------------------------------------
@@ -15780,8 +15907,12 @@ interactive_split_menu() {
   4. 全局强制分流
   5. 按实例当前出口强制分流
   6. 添加自定义分流规则
-  7. 添加分流专用出口（仅用于分流，不进实例 out）
-  8. 清空全部分流规则
+  7. 分流专用出口管理
+  8. 清空全部应用分流规则
+  9. 入口机直连与 BT/PT 屏蔽
+ 10. 同步容器并启用仅分流模式
+ 11. 应用分流启用开关
+ 12. 分流运行状态与匹配诊断
   0. 返回主菜单
 ============================================================
 EOF
@@ -15793,15 +15924,19 @@ EOF
             4) interactive_split_force_menu ;;
             5) interactive_split_force_on_exit_menu ;;
             6) interactive_split_add_custom; pause_screen ;;
-            7) interactive_add_split_only_exit ;;
+            7) interactive_split_exit_menu ;;
             8)
-                if confirm_yes "确认清空全部分流规则吗？这会删除应用/分类/强制分流、容器覆盖、规则缓存和自定义分流规则，但保留应用目录"; then
+                if confirm_yes "确认清空全部应用分流规则吗？这会删除应用/分类/强制分流、容器覆盖、自定义规则及相关缓存。应用目录和入口机直连与 BT/PT 开关保留。"; then
                     split_clear_all_rules
                 else
-                    info "已取消清空全部分流规则。"
+                    info "已取消清空全部应用分流规则。"
                 fi
                 pause_screen
                 ;;
+            9) interactive_entry_direct_menu ;;
+            10) interactive_sync_split_only ;;
+            11) interactive_split_toggle; pause_screen ;;
+            12) interactive_split_diagnostics ;;
             0) return 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
@@ -16550,6 +16685,8 @@ restore_initial_state() {
     cleanup_container_clients
     stop_and_remove_exit_services
     remove_split_dnsmasq_integration || true
+    split_v2_stop_dns
+    nft delete table inet "${NFT_TABLE}_split" 2>/dev/null || true
     reset_managed_ip_rules
     flush_exit_route_tables
     if command -v nft >/dev/null 2>&1; then
@@ -16690,14 +16827,12 @@ interactive_menu() {
         printf '\n'
         printf '  %s【容器同步】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[9]%s 同步运行中容器，并选择可切换出口\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[10]%s 同步运行中容器，但仅启用宿主机分流\n' "$UI_GREEN" "$UI_RESET"
         printf '    %s[11]%s 容器 out/token 自动补齐开关\n' "$UI_GREEN" "$UI_RESET"
         printf '    %s[12]%s 一键清空全部实例出口信息\n' "$UI_GREEN" "$UI_RESET"
         printf '    %s[13]%s 全部运行中容器一键切换出口\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【分流管理】%s\n' "$UI_CYAN" "$UI_RESET"
-        printf '    %s[14]%s 分流管理\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[15]%s 入口机直连\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[14]%s 分流管理（应用分流、入口机直连与 BT/PT 屏蔽）\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【维护操作】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[16]%s 从 GitHub 安全更新          %s[17]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
@@ -16720,12 +16855,13 @@ interactive_menu() {
             7) interactive_sort_exits ;;
             8) interactive_limit_menu ;;
             9) interactive_sync_and_enable ;;
-            10) interactive_sync_split_only ;;
+            10) interactive_split_menu ;;
             11) interactive_container_out_autofill ;;
             12) interactive_clear_container_out ;;
             13) interactive_switch_all_running_containers ;;
             14) interactive_split_menu ;;
-            15) interactive_entry_direct_menu ;;
+            # 兼容旧主菜单编号。
+            15) interactive_split_menu ;;
             16) update_from_github; exec "$INSTALL_BIN" menu ;;
             17) interactive_restore ;;
             18) interactive_uninstall ;;
@@ -17245,6 +17381,8 @@ uninstall_host() {
     cleanup_container_clients
     stop_and_remove_exit_services
     remove_split_dnsmasq_integration || true
+    split_v2_stop_dns
+    nft delete table inet "${NFT_TABLE}_split" 2>/dev/null || true
     reset_managed_ip_rules
     flush_exit_route_tables
     if command -v nft >/dev/null 2>&1; then
@@ -17252,7 +17390,7 @@ uninstall_host() {
         nft delete table inet "$(apply_guard_table)" 2>/dev/null || true
     fi
     restore_runtime_sysctls
-    rm -f "$SERVICE_FILE" "$AUTOSYNC_SERVICE"
+    rm -f "$SERVICE_FILE" "$AUTOSYNC_SERVICE" "$SPLIT_ENGINE_SERVICE"
     rm -f "$SYSTEMD_DIR/multi-user.target.wants/$APP_NAME.service" \
           "$SYSTEMD_DIR/multi-user.target.wants/$APP_NAME-autosync.service" \
           "$SYSTEMD_DIR"/multi-user.target.wants/${EXIT_SERVICE_PREFIX}-*.service \
@@ -17281,6 +17419,860 @@ uninstall_host() {
     info "已彻底卸载 cloudshlii 出口切换器。"
 }
 
+# BEGIN GENERATED SPLIT ENGINE
+write_split_engine() {
+    mkdir -p "$LIB_DIR"
+    local tmp changed=false
+    tmp="$(mktemp "$LIB_DIR/.split_engine.XXXXXX")"
+    cat > "$tmp" <<'SPLIT_ENGINE_PY'
+"""Compile Incus application policies and publish DNS identities to nftables."""
+
+import argparse
+import asyncio
+import contextlib
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+
+POOLS = {4: ipaddress.ip_network("198.18.0.0/15"), 6: ipaddress.ip_network("64:ff9b:1:e912::/96")}
+MAX_ALIASES = 8192
+MAX_TTL = 60
+LEASE_GRACE = 3600
+DNS_PORT = 1054
+DIRECT = "-"
+BUILTIN_DIRECT = "__proxy_direct"
+
+
+def rows(path, count, tab=True):
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            fields = line.split("\t") if tab else line.split()
+            if len(fields) >= count:
+                yield fields[:count]
+
+
+def read_json(path):
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {}
+
+
+def write_json(path, data):
+    fd, temporary = tempfile.mkstemp(prefix="." + path.name, dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, separators=(",", ":"))
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def name_of(app):
+    return "app_" + hashlib.sha256(app.encode()).hexdigest()[:20]
+
+
+def domain_name(value):
+    value = value.strip().lower().rstrip(".").removeprefix("*.")
+    value = value.encode("idna").decode("ascii")
+    if not re.fullmatch(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)+", value):
+        raise ValueError("invalid domain: " + value)
+    return value
+
+
+def normalize_ip(value):
+    address = ipaddress.ip_address(value.split("%", 1)[0])
+    return getattr(address, "ipv4_mapped", None) or address
+
+
+def config_snapshot(config, enabled, builtin, dns_enabled, redirect, block, bridges, dns_bridges):
+    split = config / "split"
+    raw = split / "cache" / "raw"
+    marks = {DIRECT: 0}
+    for name, mark in rows(config / "exits.tsv", 2, tab=False):
+        marks[name] = int(mark, 0)
+    split_only = {name for name, in rows(config / "split-only-exits.tsv", 1, tab=False)}
+    apps = {app: (name, category) for app, name, category in rows(split / "apps.tsv", 3)}
+    policies = dict(rows(split / "policies.tsv", 2)) if enabled else {}
+    forced_apps = {name for name, in rows(split / "force-policies.tsv", 1)} if enabled else set()
+    forced_categories = {name for name, in rows(split / "force-category-policies.tsv", 1)} if enabled else set()
+    conditions = {}
+    if enabled:
+        for category, source, target in rows(split / "force-category-on-exit-policies.tsv", 3):
+            for app, (_, app_category) in apps.items():
+                if app_category == category:
+                    conditions.setdefault(app, {})[source] = target
+        for app, source, target in rows(split / "force-on-exit-policies.tsv", 3):
+            conditions.setdefault(app, {})[source] = target
+    hosts = {}
+    for name, ip, _, allowed, current in rows(config / "containers.tsv", 5, tab=False):
+        address = normalize_ip(ip)
+        if address in POOLS[address.version]:
+            raise ValueError("container address overlaps the virtual address pool: " + ip)
+        hosts[name] = (str(address), allowed, current)
+    result = {"schema": 2, "bridges": bridges, "apps": {}, "current4": {}, "current6": {}, "overrides": {}}
+    for ip, _, current in hosts.values():
+        result["current" + str(normalize_ip(ip).version)][ip] = marks.get(current, 0)
+    if builtin:
+        policies[BUILTIN_DIRECT] = DIRECT
+        apps[BUILTIN_DIRECT] = ("入口机直连", "")
+    for app in dict.fromkeys([*policies, *conditions]):
+        if app not in apps or not re.fullmatch(r"[a-zA-Z0-9_.-]+", app):
+            continue
+        display, category = apps[app]
+        candidates = [value for value in policies.get(app, "").split(",") if value in marks]
+        forced = app in forced_apps or category in forced_categories
+        network_rules = {"exact": [], "suffix": [], "cidr4": [], "cidr6": []}
+        for line in rows(raw / (app + ".rules"), 1):
+            fields = line[0].split(",")
+            if len(fields) < 2:
+                continue
+            kind, value = (field.strip() for field in fields[:2])
+            if kind in ("DOMAIN", "DOMAIN-SUFFIX") and dns_enabled:
+                network_rules["exact" if kind == "DOMAIN" else "suffix"].append(domain_name(value))
+            elif kind in ("IP-CIDR", "IP-CIDR6"):
+                network = ipaddress.ip_network(value, strict=False)
+                if network.overlaps(POOLS[network.version]):
+                    raise ValueError("CIDR overlaps the virtual address pool: " + value)
+                network_rules["cidr" + str(network.version)].append(str(network))
+        if not any(network_rules.values()):
+            continue
+        result["apps"][app] = {
+            "display": display, "default": marks[candidates[0]] if candidates else None,
+            "force": forced,
+            "sources": {str(marks[source]): marks[target] for source, target in conditions.get(app, {}).items()
+                        if source in marks and target in marks and not forced},
+            "rules": network_rules,
+        }
+    for container, app, target in rows(split / "container-policies.tsv", 3):
+        policy = result["apps"].get(app)
+        if container not in hosts or not policy or policy["force"] or target not in marks:
+            continue
+        ip, allowed, _ = hosts[container]
+        if target in policies.get(app, "").split(",") and (
+                target == DIRECT or target in split_only or allowed == "*" or target in allowed.split(",")):
+            result["overrides"].setdefault(app, {})[ip] = marks[target]
+    result["has_domains"] = any(
+        policy["rules"]["exact"] or policy["rules"]["suffix"] for policy in result["apps"].values())
+    force_dns = block or (redirect and result["has_domains"])
+    result["dns_bridges"] = dns_bridges if force_dns else []
+    return result
+
+
+def domain_index(snapshot):
+    index = {"exact": {}, "suffix": {}}
+    apps = snapshot.get("apps", {})
+    ordered = sorted(apps, key=lambda app: app == BUILTIN_DIRECT)
+    for app in ordered:
+        for mode, names in index.items():
+            for domain in apps[app]["rules"][mode]:
+                names.setdefault(domain, app)
+    return index
+
+
+def match_index(index, domain):
+    exact = index["exact"].get(domain)
+    if exact and exact != BUILTIN_DIRECT:
+        return exact
+    suffixes = index["suffix"]
+    builtin = exact
+    while "." in domain:
+        suffix = suffixes.get(domain)
+        if suffix and suffix != BUILTIN_DIRECT:
+            return suffix
+        builtin = builtin or suffix
+        domain = domain.split(".", 1)[1]
+    return builtin
+
+
+def match_domain(snapshot, domain):
+    return match_index(domain_index(snapshot), domain)
+
+
+def explain(snapshot, config, domain, container):
+    app = match_domain(snapshot, domain)
+    policy = snapshot["apps"].get(app)
+    result = {"domain": domain, "app": app, "display": policy["display"] if policy else None}
+    if container is None:
+        return result
+    for name, address, _, _, _ in rows(config / "containers.tsv", 5, tab=False):
+        if container in (name, address):
+            ip = normalize_ip(address)
+            break
+    else:
+        raise ValueError("unknown container: " + container)
+    current = snapshot[f"current{ip.version}"][str(ip)]
+    stage, target = "实例当前出口", current
+    if policy:
+        override = snapshot["overrides"].get(app, {}).get(str(ip))
+        if policy["force"]:
+            stage, target = "全局强制", policy["default"]
+        elif str(current) in policy["sources"]:
+            stage, target = "按当前出口强制", policy["sources"][str(current)]
+        elif override is not None:
+            stage, target = "容器覆盖", override
+        elif policy["default"] is not None:
+            stage = "入口机直连" if app == BUILTIN_DIRECT else "普通应用分流"
+            target = policy["default"]
+    exits = {int(mark, 0): name for name, mark in rows(config / "exits.tsv", 2, tab=False)}
+    result.update(container=container, stage=stage, exit=exits.get(target, "入口机"), mark=target)
+    return result
+
+
+def nft_values(mapping):
+    return ", ".join(f"{key} : {value}" for key, value in mapping.items())
+
+
+def nft_map(name, types, mapping):
+    elements = f" elements = {{ {nft_values(mapping)} }};" if mapping else ""
+    return f"  map {name} {{ type {types};{elements} }}"
+
+
+def nft_expression(family):
+    return "ip" if family == 4 else "ip6"
+
+
+def family_items(mapping, family):
+    return {key: value for key, value in mapping.items() if normalize_ip(key).version == family}
+
+
+def render(table, snapshot, leases):
+    apps = snapshot["apps"]
+    maps = []
+    ingress = []
+    nat = []
+    chains = []
+    cidrs = []
+    if snapshot["bridges"]:
+        scope = "iifname { " + ", ".join(json.dumps(x) for x in snapshot["bridges"]) + " }"
+    else:
+        scope = 'iifname ""'
+    for family in (4, 6):
+        expr = nft_expression(family)
+        value_type = f"ipv{family}_addr"
+        active = [(alias, real, app) for alias, real, app in leases
+                  if app in apps and normalize_ip(alias).version == family]
+        maps += [
+            nft_map(f"current{family}", f"{value_type} : mark", snapshot[f"current{family}"]),
+            nft_map(f"alias{family}_app", f"{value_type} : verdict",
+                    {alias: "goto " + name_of(app) for alias, _, app in active}),
+            nft_map(f"alias{family}_ip", f"{value_type} : {value_type}",
+                    {alias: real for alias, real, _ in active}),
+        ]
+        registered = ", ".join(snapshot[f"current{family}"])
+        elements = f" elements = {{ {registered} }};" if registered else ""
+        maps.append(f"  set registered{family} {{ type {value_type};{elements} }}")
+        if snapshot["has_domains"] or leases:
+            ingress.extend([
+                f"    {scope} {expr} saddr @registered{family} {expr} daddr vmap @alias{family}_app",
+                f"    {scope} {expr} daddr {POOLS[family]} drop",
+            ])
+            nat.append(f"    {scope} meta nfproto ipv{family} dnat {expr} to {expr} daddr map @alias{family}_ip")
+    ingress += [
+        "    ct status dnat return",
+        f"    {scope} ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16 }} return",
+        f"    {scope} ip6 daddr {{ ::1, fc00::/7, fe80::/10, ff00::/8 }} return",
+    ]
+    for app, policy in apps.items():
+        name = name_of(app)
+        body = [f"  chain {name} {{"]
+        if policy["force"] and policy["default"] is not None:
+            body.append(f"    meta mark set {policy['default']} accept")
+        else:
+            for family in (4, 6):
+                expr = nft_expression(family)
+                body.append(f"    meta mark set {expr} saddr map @current{family}")
+            for source, target in policy["sources"].items():
+                body.append(f"    meta mark {source} meta mark set {target} accept")
+            for family in (4, 6):
+                expr = nft_expression(family)
+                override = f"over{family}_{name}"
+                maps.append(nft_map(override, f"ipv{family}_addr : mark",
+                                    family_items(snapshot["overrides"].get(app, {}), family)))
+                body.append(f"    meta mark set {expr} saddr map @{override} accept")
+            if policy["default"] is not None:
+                body.append(f"    meta mark set {policy['default']} accept")
+        chains.extend(body + ["  }"])
+        for family in (4, 6):
+            for value in policy["rules"][f"cidr{family}"]:
+                network = ipaddress.ip_network(value)
+                cidrs.append((not policy["force"], -network.prefixlen, value, family, name))
+    for _, _, value, family, name in sorted(cidrs):
+        expr = nft_expression(family)
+        ingress.append(f"    {scope} {expr} saddr @registered{family} {expr} daddr {value} jump {name}")
+    if snapshot["dns_bridges"]:
+        dns_scope = "iifname { " + ", ".join(json.dumps(x) for x in snapshot["dns_bridges"]) + " }"
+        nat.insert(0, f"    {dns_scope} meta l4proto {{ tcp, udp }} th dport 53 redirect to :53")
+    return "\n".join([
+        f"table inet {table} {{", *maps, *chains, "  chain classify {",
+        "    type filter hook prerouting priority -139; policy accept;",
+        "    ct direction reply return", *ingress, "  }", "  chain translate {",
+        "    type nat hook prerouting priority dstnat; policy accept;", *nat, "  }", "}", "",
+    ])
+
+
+def nft(data, check=False):
+    command = ["nft"] + (["-c"] if check else []) + ["-f", "-"]
+    subprocess.run(command, input=data, text=True, capture_output=True, timeout=10, check=True)
+
+
+def table_exists(table):
+    return subprocess.run(["nft", "list", "table", "inet", table], capture_output=True, timeout=5).returncode == 0
+
+
+def check_virtual_pool_routes():
+    for family, pool in POOLS.items():
+        output = subprocess.run(["ip", "-j", f"-{family}", "route", "show", "table", "main"],
+                                capture_output=True, text=True, timeout=5, check=True)
+        for route in json.loads(output.stdout):
+            destination = route.get("dst", "default")
+            if destination == "default":
+                continue
+            network = ipaddress.ip_network(destination, strict=False)
+            if network.prefixlen and pool.overlaps(network):
+                raise ValueError(f"route {destination} conflicts with virtual address pool {pool}")
+
+
+def differences(table, name, before, after):
+    deleted = [key for key in before if before[key] != after.get(key)]
+    changed = {key: value for key, value in after.items() if value != before.get(key)}
+    if deleted:
+        yield f"delete element inet {table} {name} {{ {', '.join(deleted)} }}"
+    if changed:
+        yield f"add element inet {table} {name} {{ {nft_values(changed)} }}"
+
+
+def registration_differences(table, family, before, after):
+    for operation, values in (("delete", before.keys() - after.keys()),
+                              ("add", after.keys() - before.keys())):
+        if values:
+            yield f"{operation} element inet {table} registered{family} {{ {', '.join(sorted(values))} }}"
+
+
+@contextlib.contextmanager
+def locked_database(run_dir):
+    run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (run_dir / "split-v2.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with contextlib.closing(sqlite3.connect(run_dir / "split-v2.sqlite")) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS leases (alias TEXT PRIMARY KEY, real TEXT, app TEXT, domain TEXT, "
+                       "expires INTEGER NOT NULL, UNIQUE(real, app, domain))")
+            yield db
+
+
+def apply(run_dir, table, desired):
+    with locked_database(run_dir) as db:
+        path = run_dir / "split-v2.json"
+        old = read_json(path)
+        exists = table_exists(table)
+        if exists and old and all(old.get(k) == desired[k] for k in ("schema", "apps", "bridges", "dns_bridges")):
+            changes = []
+            for family in (4, 6):
+                key = f"current{family}"
+                changes.extend(differences(table, key, old[key], desired[key]))
+                changes.extend(registration_differences(table, family, old[key], desired[key]))
+                for app, policy in desired["apps"].items():
+                    if not policy["force"]:
+                        before = family_items(old["overrides"].get(app, {}), family)
+                        after = family_items(desired["overrides"].get(app, {}), family)
+                        changes.extend(differences(table, f"over{family}_{name_of(app)}", before, after))
+            if changes:
+                nft("\n".join(changes) + "\n")
+        else:
+            if desired["has_domains"]:
+                check_virtual_pool_routes()
+            leases = db.execute("SELECT alias, real, app FROM leases").fetchall()
+            batch = (f"delete table inet {table}\n" if exists else "") + render(table, desired, leases)
+            nft(batch, check=True)
+            nft(batch)
+        if old != desired:
+            write_json(path, desired)
+
+
+def collect_expired(db, table, active_apps, now):
+    expired = db.execute("SELECT alias, app FROM leases WHERE expires <= ?", (now,)).fetchall()
+    if not expired:
+        return
+    active = set()
+    for family in ("ipv4", "ipv6"):
+        dump = subprocess.run(["conntrack", "-L", "-f", family, "-o", "extended"],
+                              text=True, capture_output=True, timeout=4, check=True)
+        active.update(re.findall(r"\bdst=(\S+)", dump.stdout))
+    removals = []
+    for alias, app in expired:
+        if alias in active:
+            continue
+        if app in active_apps:
+            family = normalize_ip(alias).version
+            removals.extend(f"delete element inet {table} alias{family}_{suffix} {{ {alias} }}"
+                            for suffix in ("app", "ip"))
+        db.execute("DELETE FROM leases WHERE alias=?", (alias,))
+    if removals:
+        nft("\n".join(removals) + "\n")
+    db.commit()
+
+
+def allocate(run_dir, table, app, domain, addresses):
+    with locked_database(run_dir) as db:
+        current = read_json(run_dir / "split-v2.json")
+        if match_domain(current, domain) != app:
+            raise ValueError("classification changed during DNS lookup")
+        result = {}
+        changes = []
+        now = int(time.time())
+        expires = now + LEASE_GRACE + MAX_TTL * 2
+        if db.execute("SELECT count(*) FROM leases").fetchone()[0] >= MAX_ALIASES:
+            collect_expired(db, table, current["apps"], now)
+        for real in dict.fromkeys(addresses):
+            old = db.execute("SELECT alias FROM leases WHERE real=? AND app=? AND domain=?",
+                             (real, app, domain)).fetchone()
+            if old:
+                result[real] = old[0]
+                db.execute("UPDATE leases SET expires=? WHERE alias=?", (expires, old[0]))
+                continue
+            if db.execute("SELECT count(*) FROM leases").fetchone()[0] >= MAX_ALIASES:
+                raise ValueError("virtual address pool is full")
+            family = normalize_ip(real).version
+            pool = POOLS[family]
+            offset = int(hashlib.sha256(f"{domain}/{app}/{real}".encode()).hexdigest(), 16) % (pool.num_addresses - 2)
+            while True:
+                alias = str(pool.network_address + offset + 1)
+                if db.execute("SELECT 1 FROM leases WHERE alias=?", (alias,)).fetchone() is None:
+                    break
+                offset = (offset + 1) % (pool.num_addresses - 2)
+            db.execute("INSERT INTO leases VALUES (?, ?, ?, ?, ?)", (alias, real, app, domain, expires))
+            result[real] = alias
+            changes.extend([
+                f"add element inet {table} alias{family}_app {{ {alias} : goto {name_of(app)} }}",
+                f"add element inet {table} alias{family}_ip {{ {alias} : {real} }}",
+            ])
+        if changes:
+            nft("\n".join(changes) + "\n")
+        db.commit()
+        return result
+
+
+def resolvers():
+    for path in (Path("/run/systemd/resolve/resolv.conf"), Path("/etc/resolv.conf")):
+        if path.is_file():
+            values = []
+            for match in re.finditer(r"(?m)^nameserver\s+(\S+)", path.read_text()):
+                value = normalize_ip(match[1])
+                if not value.is_unspecified:
+                    values.append(match[1])
+            if values:
+                return tuple(dict.fromkeys(values))
+    raise RuntimeError("no DNS upstream found")
+
+
+class Resolver:
+    def __init__(self, run_dir, table):
+        self.path = run_dir / "split-v2.json"
+        self.run_dir = run_dir
+        self.table = table
+        self.upstreams = resolvers()
+        self.mtime = None
+        self.index = domain_index({})
+        self.cache = {}
+        self.pending = asyncio.Semaphore(32)
+
+    def read_index(self):
+        stamp = self.path.stat().st_mtime_ns
+        if stamp != self.mtime:
+            updated = domain_index(read_json(self.path))
+            if updated != self.index:
+                self.cache.clear()
+                self.index = updated
+            self.mtime = stamp
+        return self.index
+
+    async def query(self, data):
+        import dns.asyncquery
+        import dns.flags
+        import dns.message
+        import dns.rcode
+        import dns.rdatatype
+        import dns.rrset
+
+        try:
+            request = dns.message.from_wire(data)
+        except Exception:
+            return b""
+        reply = dns.message.make_response(request)
+        if len(request.question) != 1:
+            reply.set_rcode(dns.rcode.FORMERR)
+            return reply.to_wire()
+        question = request.question[0]
+        try:
+            domain = domain_name(question.name.to_text())
+            app = match_index(self.read_index(), domain)
+            if app and question.rdtype in (dns.rdatatype.HTTPS, dns.rdatatype.SVCB):
+                reply.flags |= dns.flags.RA
+                return reply.to_wire()
+            key = (domain, question.rdtype, question.rdclass)
+            if app and key in self.cache:
+                deadline, wire = self.cache[key]
+                if deadline > time.monotonic():
+                    return data[:2] + wire[2:]
+                del self.cache[key]
+            max_attempts = min(len(self.upstreams), 3)
+            for upstream in self.upstreams[:max_attempts]:
+                try:
+                    answer = await dns.asyncquery.udp(request, upstream, timeout=2, raise_on_truncation=True)
+                    break
+                except dns.message.Truncated:
+                    answer = await dns.asyncquery.tcp(request, upstream, timeout=2)
+                    break
+                except (OSError, dns.exception.Timeout):
+                    continue
+            else:
+                raise RuntimeError("upstream DNS unavailable")
+            if app and question.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
+                sets = [rrset for rrset in answer.answer if rrset.rdtype == question.rdtype]
+                addresses = [str(record.address) for rrset in sets for record in rrset]
+                if addresses:
+                    if any((address := normalize_ip(x)).is_private or address in POOLS[address.version]
+                           or address.is_multicast for x in addresses):
+                        return answer.to_wire()
+                    aliases = await asyncio.to_thread(allocate, self.run_dir, self.table, app, domain, addresses)
+                    ttl = min(MAX_TTL, *(rrset.ttl for rrset in sets))
+                    answer.flags &= ~dns.flags.AD
+                    answer.answer = [dns.rrset.from_text_list(rrset.name, ttl, rrset.rdclass, rrset.rdtype,
+                                                            [aliases[str(record.address)] for record in rrset])
+                                     if rrset in sets else rrset for rrset in answer.answer
+                                     if rrset.rdtype != dns.rdatatype.RRSIG]
+                    wire = answer.to_wire()
+                    if len(self.cache) >= 1024:
+                        self.cache.pop(next(iter(self.cache)))
+                    self.cache[key] = (time.monotonic() + ttl, wire)
+                    return wire
+            return answer.to_wire()
+        except Exception as error:
+            print(f"split DNS query failed: {error}", file=sys.stderr, flush=True)
+            reply.set_rcode(dns.rcode.SERVFAIL)
+            return reply.to_wire()
+
+
+async def serve(run_dir, table):
+    resolver = Resolver(run_dir, table)
+    running = set()
+
+    class Datagram(asyncio.DatagramProtocol):
+        def connection_made(self, transport):
+            self.transport = transport
+
+        def datagram_received(self, data, address):
+            if len(running) < 32:
+                task = asyncio.create_task(self.answer(data, address))
+                running.add(task)
+                task.add_done_callback(running.discard)
+
+        async def answer(self, data, address):
+            reply = await resolver.query(data)
+            if reply:
+                self.transport.sendto(reply, address)
+
+    async def tcp(reader, writer):
+        try:
+            async with resolver.pending:
+                length = int.from_bytes(await asyncio.wait_for(reader.readexactly(2), 4), "big")
+                query = await asyncio.wait_for(reader.readexactly(length), 4)
+                reply = await resolver.query(query)
+                if reply:
+                    writer.write(len(reply).to_bytes(2, "big") + reply)
+                    await writer.drain()
+        except (OSError, asyncio.IncompleteReadError, asyncio.TimeoutError):
+            pass
+        finally:
+            writer.close()
+
+    transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(Datagram, local_addr=("127.0.0.1", DNS_PORT))
+    try:
+        async with await asyncio.start_server(tcp, "127.0.0.1", DNS_PORT, backlog=32) as server:
+            await server.serve_forever()
+    finally:
+        transport.close()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=("apply", "forwarders", "status", "explain", "serve", "preview"))
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--runtime", type=Path, required=True)
+    parser.add_argument("--table", required=True)
+    parser.add_argument("--bridges", nargs="*", default=[])
+    parser.add_argument("--dns-bridges", nargs="*", default=[])
+    parser.add_argument("--disabled", action="store_true")
+    parser.add_argument("--builtin", action="store_true")
+    parser.add_argument("--static-only", action="store_true")
+    parser.add_argument("--redirect", action="store_true")
+    parser.add_argument("--block", action="store_true")
+    parser.add_argument("--domain")
+    parser.add_argument("--container")
+    args = parser.parse_args()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", args.table):
+        parser.error("invalid nftables table name")
+    if args.action == "serve":
+        asyncio.run(serve(args.runtime, args.table))
+        return
+    snapshot = config_snapshot(args.config, not args.disabled, args.builtin, not args.static_only,
+                               args.redirect, args.block, args.bridges, args.dns_bridges)
+    if args.action == "apply":
+        apply(args.runtime, args.table, snapshot)
+    elif args.action == "preview":
+        print(render(args.table, snapshot, []), end="")
+    elif args.action == "forwarders":
+        domains = {domain for policy in snapshot["apps"].values()
+                   for mode in ("exact", "suffix") for domain in policy["rules"][mode]}
+        for domain in sorted(domains):
+            print(f"server=/{domain}/127.0.0.1#{DNS_PORT}")
+    elif args.action == "explain":
+        print(json.dumps(explain(snapshot, args.config, domain_name(args.domain), args.container),
+                         ensure_ascii=False, indent=2))
+    else:
+        applied = read_json(args.runtime / "split-v2.json")
+        print(f"分流表: {args.table}，应用: {len(applied.get('apps', {}))}，"
+              f"配置同步: {'正常' if snapshot == applied else '待应用'}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as exc:
+        print(getattr(exc, "stderr", None) or str(exc), file=sys.stderr)
+        raise SystemExit(1)
+SPLIT_ENGINE_PY
+    python3 -m py_compile "$tmp"
+    if ! cmp -s "$tmp" "$SPLIT_ENGINE_FILE"; then changed=true; fi
+    chmod 0755 "$tmp"
+    mv -f "$tmp" "$SPLIT_ENGINE_FILE"
+    rm -rf "$LIB_DIR/__pycache__"
+    if [ "$changed" = "true" ] && [ "${EGRESS_SPLIT_PREFLIGHT:-false}" != "true" ] &&
+        systemctl is-active --quiet "$APP_NAME-split-dns.service"; then
+        systemctl restart "$APP_NAME-split-dns.service"
+    fi
+}
+# END GENERATED SPLIT ENGINE
+
+split_v2_enabled() {
+    [ "${SPLIT_ENGINE:-v2}" = "v2" ]
+}
+
+split_v2_call() {
+    local action="$1" iface
+    shift
+    local -a bridges=() dns_bridges=() options=("$@")
+    [ -f "$SPLIT_ENGINE_FILE" ] || { warn "分流组件缺失，请执行 install-host 或 upgrade。"; return 1; }
+    for iface in $BRIDGE_IFACES; do
+        bridges+=("$iface")
+        [ ! -d "$INCUS_NETWORKS_DIR/$iface" ] || dns_bridges+=("$iface")
+    done
+    [ "$ENABLE_SPLIT_RULES" = "true" ] || options+=(--disabled)
+    if proxy_direct_any_enabled; then options+=(--builtin); fi
+    [ "$SPLIT_DNSMASQ_NFTSET" = "true" ] || options+=(--static-only)
+    [ "$SPLIT_FORCE_CONTAINER_DNS" != "true" ] || options+=(--redirect)
+    [ "$BLOCK_BT_PT_DOMAINS" != "true" ] || options+=(--block)
+    python3 "$SPLIT_ENGINE_FILE" "$action" --config "$CONFIG_DIR" --runtime "$RUN_DIR" \
+        --table "${NFT_TABLE}_split" --bridges "${bridges[@]}" --dns-bridges "${dns_bridges[@]}" "${options[@]}"
+}
+
+split_v2_health() {
+    local generated iface
+    generated="$(mktemp)" || return 1
+    if ! split_v2_call forwarders > "$generated"; then rm -f "$generated"; return 1; fi
+    if [ ! -s "$generated" ]; then rm -f "$generated"; return 0; fi
+    if ! nft list map inet "${NFT_TABLE}_split" alias4_ip >/dev/null ||
+        ! systemctl is-active --quiet "$APP_NAME-split-dns.service" ||
+        ! timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/1054' 2>/dev/null; then
+        rm -f "$generated"
+        warn "独立分流 DNS 或虚拟地址映射未就绪。"
+        return 1
+    fi
+    while IFS= read -r iface; do
+        if ! cmp -s "$generated" "$INCUS_NETWORKS_DIR/$iface/$APP_NAME-nftset.conf"; then
+            rm -f "$generated"
+            warn "网桥 $iface 的分流 DNS 配置未同步。"
+            return 1
+        fi
+    done < <(split_managed_dns_bridges)
+    rm -f "$generated"
+}
+
+split_v2_start_dns() {
+    local tmp attempt
+    if ! /usr/bin/python3 -c 'import dns.asyncquery' >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-dnspython || return 1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y python3-dns || return 1
+        else
+            warn "缺少 Python DNS 组件 dnspython。"
+            return 1
+        fi
+    fi
+    tmp="$(mktemp "$SYSTEMD_DIR/.split-dns.XXXXXX")" || return 1
+    cat > "$tmp" <<EOF
+[Unit]
+Description=Incus application split DNS
+After=network.target
+[Service]
+ExecStart=/usr/bin/python3 $SPLIT_ENGINE_FILE serve --config $CONFIG_DIR --runtime $RUN_DIR --table ${NFT_TABLE}_split
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN
+TasksMax=40
+EOF
+    chmod 0644 "$tmp"
+    if cmp -s "$tmp" "$SPLIT_ENGINE_SERVICE"; then
+        rm -f "$tmp"
+    else
+        mv -f "$tmp" "$SPLIT_ENGINE_SERVICE" || return 1
+        systemctl daemon-reload || return 1
+    fi
+    systemctl start "$APP_NAME-split-dns.service" || return 1
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if systemctl is-active --quiet "$APP_NAME-split-dns.service" &&
+            timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/1054' 2>/dev/null; then
+            return 0
+        fi
+        sleep .2
+    done
+    warn "独立分流 DNS 未在 127.0.0.1:1054 就绪。"
+    return 1
+}
+
+split_v2_stop_dns() {
+    [ ! -f "$SPLIT_ENGINE_SERVICE" ] || systemctl stop "$APP_NAME-split-dns.service" 2>/dev/null || true
+}
+
+do_apply_split_changes() {
+    if ! split_v2_enabled; then do_apply_nftables; return $?; fi
+    local rc=0
+    state_lock_acquire
+    apply_lock_acquire
+    if ! split_v2_call apply || ! apply_split_dnsmasq_nftsets; then rc=1; fi
+    apply_lock_release
+    state_lock_release
+    return "$rc"
+}
+
+interactive_split_toggle() {
+    local desired=true
+    [ "$ENABLE_SPLIT_RULES" != "true" ] || desired=false
+    if ! confirm_yes "将应用分流设置为 $desired，继续吗？"; then return 0; fi
+    if split_v2_enabled; then split_v2_set_flags "$desired" ENABLE_SPLIT_RULES; return $?; fi
+    local previous="$ENABLE_SPLIT_RULES"
+    set_config_value ENABLE_SPLIT_RULES "$desired"
+    load_config
+    if ! do_apply_split_changes; then
+        set_config_value ENABLE_SPLIT_RULES "$previous"
+        load_config
+        do_apply_split_changes || mark_nft_pending
+        warn "更新应用分流开关失败，已恢复上一配置。"
+    fi
+}
+
+split_v2_set_flags() {
+    local desired="$1" prior setting key value rc=0 pending=false
+    shift
+    state_lock_acquire
+    prior="$(mktemp "$CONFIG_DIR/.split-flags.XXXXXX")"
+    cp -a "$CONFIG_FILE" "$prior"
+    [ ! -e "$PENDING_NFT_FILE" ] || pending=true
+    mark_nft_pending
+    for setting in "$@"; do
+        key="${setting%%=*}"
+        value="$desired"
+        [[ "$setting" != *=* ]] || value="${setting#*=}"
+        set_config_value "$key" "$value"
+    done
+    load_config
+    if ! ensure_proxy_direct_rule_source || ! do_apply_split_changes || ! bt_pt_dns_block_health; then
+        mv -f "$prior" "$CONFIG_FILE"
+        load_config
+        if ensure_proxy_direct_rule_source && do_apply_split_changes; then
+            [ "$pending" = "true" ] || rm -f "$PENDING_NFT_FILE"
+        fi
+        warn "分流开关应用失败，已恢复原配置。"
+        rc=1
+    else
+        [ "$pending" = "true" ] || rm -f "$PENDING_NFT_FILE"
+        info "分流开关已应用。"
+    fi
+    rm -f "$prior"
+    state_lock_release
+    return "$rc"
+}
+
+interactive_split_diagnostics() {
+    local choice domain container
+    while true; do
+        printf '
+  1. 运行与配置状态
+  2. 查看域名匹配策略
+  3. 检查分流 DNS
+  0. 返回
+'
+        read -r -p "选择: " choice || return 0
+        case "$choice" in
+            1) split_v2_call status; pause_screen ;;
+            2)
+                domain="$(prompt_required "域名")"
+                read -r -p "实例名或 IP（留空只看匹配应用）: " container
+                if [ -n "$container" ]; then
+                    split_v2_call explain --domain "$domain" --container "$container"
+                else
+                    split_v2_call explain --domain "$domain"
+                fi
+                pause_screen ;;
+            3) split_dns_health; pause_screen ;;
+            0|"") return 0 ;;
+            *) warn "无效选项" ;;
+        esac
+    done
+}
+
+interactive_split_exit_menu() {
+    local choice selected
+    while true; do
+        printf '
+  1. 添加分流专用出口
+  2. 查看分流专用出口
+  3. 标记已有出口为分流专用
+  4. 取消分流专用标记
+  0. 返回
+'
+        read -r -p "选择: " choice || return 0
+        case "$choice" in
+            1) interactive_add_split_only_exit ;;
+            2) split_target_candidate_rows split-only; pause_screen ;;
+            3|4)
+                selected="$(prompt_required "出口名称")"
+                if selected="$(resolve_exit_target "$selected")" && [ "$selected" != "-" ]; then
+                    if [ "$choice" = "3" ]; then mark_split_only_exit "$selected"; else unmark_split_only_exit "$selected"; fi
+                else
+                    warn "未知出口"
+                fi
+                pause_screen ;;
+            0|"") return 0 ;;
+            *) warn "无效选项" ;;
+        esac
+    done
+}
+
 usage() {
     cat <<EOF
 $APP_NAME - cloudshlii Incus 容器自助出口切换器
@@ -17304,8 +18296,8 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       添加出口只写入并启动出口信息，不会自动同步容器；需要同步请执行 sync-enable。
 
   $0 add-vless 'vless://UUID@host:port?encryption=none&type=tcp#name'
-      添加一个不带 TLS/Reality 的 VLESS+TCP 节点出口。
-      手动添加可写: add-vless 自定义名称 地址/DDNS域名 端口 UUID
+      支持无 TLS 的 VLESS+TCP 以及 VLESS+WebSocket+TLS（type=ws&security=tls）。
+      TCP 手动添加可写: add-vless 自定义名称 地址/DDNS域名 端口 UUID
       添加出口只写入并启动出口信息，不会自动同步容器；需要同步请执行 sync-enable。
 
   $0 add-wg 出口名 Endpoint 服务端公钥 IPv4隧道地址 [IPv6隧道地址|-] [PSK|-] [MTU]
@@ -17437,8 +18429,8 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
       取消分类强制分流，但保留原来的宿主机分类/应用分流目标。
 
   $0 split-clear-all
-      一键清空全部分流规则：应用/分类/强制分流、容器覆盖、规则缓存和自定义分流规则都会删除。
-      应用目录保留，可继续按需重新添加分流。
+      清空应用/分类/强制分流、容器覆盖、自定义规则和相关缓存。
+      保留应用目录及入口机直连与 BT/PT 开关。
 
   $0 clear-container-out
       一键清空容器内 out/token、宿主机容器授权、当前出口和容器级分流覆盖。
@@ -17671,6 +18663,27 @@ case "$command_name" in
         ;;
     update-online|update-github|github-update)
         update_from_github "$@"
+        ;;
+    split-apply-runtime)
+        need_root
+        load_config
+        if split_v2_enabled; then
+            state_lock_acquire
+            split_v2_call apply
+            state_lock_release
+        else
+            do_apply_nftables
+        fi
+        ;;
+    split-explain)
+        need_root
+        load_config
+        [ -n "${1:-}" ] || die "用法: $0 split-explain 域名 [实例名或 IP]"
+        if [ -z "${2:-}" ]; then
+            split_v2_call explain --domain "$1"
+        else
+            split_v2_call explain --domain "$1" --container "$2"
+        fi
         ;;
     split-list)
         split_list "$@"

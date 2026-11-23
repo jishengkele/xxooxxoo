@@ -313,12 +313,14 @@ service_stop() {
     fi
 }
 
-render() {
-    load_state || die "尚未部署 WG 出口。"
+render() (
+    load_state || { warn "尚未部署 WG 出口。"; return 1; }
     local stage conf nft check private addresses="" network4="" network6="" nat4="" nat6=""
     local name public allowed4 allowed6 psk rest psk_line allowed peer_lines=""
-    stage="$(mktemp -d)"; conf="$stage/$WG_IFACE.conf"; nft="$(mktemp)"; check="$(mktemp)"
-    private="$(cat "$PRIVATE_KEY_FILE")"
+    stage="$(mktemp -d)" || return 1
+    trap 'rm -rf -- "$stage"' EXIT
+    conf="$stage/$WG_IFACE.conf"; nft="$stage/server.nft"; check="$stage/check.nft"
+    private="$(cat "$PRIVATE_KEY_FILE")" || return 1
     if [ "$WG_ADDRESS4" != "-" ]; then
         addresses="$WG_ADDRESS4"; network4="$(network_of "$WG_ADDRESS4")"
         nat4="    ip saddr $network4 oifname \"$WG_WAN_IFACE\" masquerade"
@@ -369,26 +371,29 @@ $nat6
   }
 }
 EOF
-    wg-quick strip "$conf" >/dev/null || die "WG 配置校验失败。"
-    nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && printf 'delete table inet %s\n' "$NFT_TABLE" > "$check"
-    cat "$nft" >> "$check"
-    nft -c -f "$check" || die "nftables 配置校验失败。"
-    install -m 600 "$conf" "$WG_CONF"
-    install -m 600 "$nft" "$NFT_FILE"
-    rm -rf "$stage"; rm -f "$nft" "$check"
-}
+    wg-quick strip "$conf" >/dev/null || { warn "WG 配置校验失败。"; return 1; }
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        printf 'delete table inet %s\n' "$NFT_TABLE" > "$check" || return 1
+    fi
+    cat "$nft" >> "$check" || return 1
+    nft -c -f "$check" || { warn "nftables 配置校验失败。"; return 1; }
+    install -m 600 "$conf" "$WG_CONF" && install -m 600 "$nft" "$NFT_FILE"
+)
 
 restart_server() {
     local old_conf="" old_nft=""
     [ -f "$WG_CONF" ] && { old_conf="$(mktemp)"; cp -a "$WG_CONF" "$old_conf"; }
     [ -f "$NFT_FILE" ] && { old_nft="$(mktemp)"; cp -a "$NFT_FILE" "$old_nft"; }
-    render
-    if service_start; then rm -f "$old_conf" "$old_nft"; return 0; fi
-    warn "启动失败，正在恢复旧配置。"
-    [ -z "$old_conf" ] || install -m 600 "$old_conf" "$WG_CONF"
-    [ -z "$old_nft" ] || install -m 600 "$old_nft" "$NFT_FILE"
+    local rendered=false
+    if render; then
+        rendered=true
+        if service_start; then rm -f "$old_conf" "$old_nft"; return 0; fi
+    fi
+    warn "生成或启动失败，正在恢复旧配置。"
+    if [ -n "$old_conf" ]; then install -m 600 "$old_conf" "$WG_CONF"; else rm -f "$WG_CONF"; fi
+    if [ -n "$old_nft" ]; then install -m 600 "$old_nft" "$NFT_FILE"; else rm -f "$NFT_FILE"; fi
     rm -f "$old_conf" "$old_nft"
-    service_start 2>/dev/null || true
+    [ "$rendered" != "true" ] || service_start 2>/dev/null || true
     return 1
 }
 
@@ -448,7 +453,7 @@ add_peer() {
     local name="${1:-}" public="${2:-}" address4="${3:--}" address6="${4:--}" psk="${5:--}"
     local tmp backup n p a4 a6 old_psk rest
     valid_name "$name" || { unlock; die "Peer 名称只能使用字母、数字、点、下划线和横线。"; }
-    valid_key "$public" || { unlock; die "入口机公钥无效。"; }
+    [ "$public" != "-" ] && valid_key "$public" || { unlock; die "入口机公钥无效。"; }
     valid_key "$psk" || { unlock; die "PSK 无效。"; }
     valid_address 4 "$address4" || { unlock; die "入口机 IPv4 隧道地址无效。"; }
     valid_address 6 "$address6" || { unlock; die "入口机 IPv6 隧道地址无效。"; }
