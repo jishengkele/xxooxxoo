@@ -6115,7 +6115,7 @@ start_proxy_exit() {
         rollback_proxy_exit_add "$name"
         die "$kind 出口 '$display' 已启动，但宿主机路由应用失败，已回滚本次添加。"
     fi
-    info "$kind 出口 '$display' 已添加并启动。需要接管或刷新容器时，请在主菜单选择 [9] 出口切换接管或 [10] 仅宿主机分流。"
+    info "$kind 出口 '$display' 已添加并启动。需要接管或刷新容器时，请选择主菜单 [9] 出口切换接管，或 [13] 分流管理 → [10] 仅分流模式。"
 }
 
 add_ss_exit_values() {
@@ -13465,7 +13465,7 @@ install_host() {
         restart_managed_service "$APP_NAME-autosync" >/dev/null 2>&1 || true
     fi
     info "宿主机基础组件和控制器文件已安装。"
-    info "安装步骤不会扫描或接管容器；需要接管时请在主菜单选择 [9] 出口切换接管或 [10] 仅宿主机分流。"
+    info "安装步骤不会扫描或接管容器；需要接管时请选择主菜单 [9] 出口切换接管，或 [13] 分流管理 → [10] 仅分流模式。"
     info "API 服务已启动并设置开机自启: $APP_NAME"
 }
 
@@ -16827,24 +16827,24 @@ interactive_menu() {
         printf '\n'
         printf '  %s【容器同步】%s\n' "$UI_CYAN" "$UI_RESET"
         printf '    %s[9]%s 同步运行中容器，并选择可切换出口\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[11]%s 容器 out/token 自动补齐开关\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[12]%s 一键清空全部实例出口信息\n' "$UI_GREEN" "$UI_RESET"
-        printf '    %s[13]%s 全部运行中容器一键切换出口\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[10]%s 容器 out/token 自动补齐开关\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[11]%s 一键清空全部实例出口信息\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[12]%s 全部运行中容器一键切换出口\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【分流管理】%s\n' "$UI_CYAN" "$UI_RESET"
-        printf '    %s[14]%s 分流管理（应用分流、入口机直连与 BT/PT 屏蔽）\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[13]%s 分流管理（应用分流、入口机直连与 BT/PT 屏蔽）\n' "$UI_GREEN" "$UI_RESET"
         printf '\n'
         printf '  %s【维护操作】%s\n' "$UI_CYAN" "$UI_RESET"
-        printf '    %s[16]%s 从 GitHub 安全更新          %s[17]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-          printf '    %s[18]%s 彻底卸载                    %s[19]%s 重建当前版本组件（不联网）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
-          printf '    %s[20]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
-          printf '    %s[21]%s 出口引用全面修复（自动映射或安全清理）\n' "$UI_GREEN" "$UI_RESET"
-          printf '    GitHub 更新命令：%ssbout update-github%s（跨版本请使用命令，不要记忆菜单编号）\n' "$UI_YELLOW" "$UI_RESET"
+        printf '    %s[14]%s 从 GitHub 安全更新          %s[15]%s 还原初始状态并清空接管\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[16]%s 彻底卸载                    %s[17]%s 重建当前版本组件（不联网）\n' "$UI_GREEN" "$UI_RESET" "$UI_GREEN" "$UI_RESET"
+        printf '    %s[18]%s sing-box 多实例并发优化\n' "$UI_GREEN" "$UI_RESET"
+        printf '    %s[19]%s 出口引用全面修复（自动映射或安全清理）\n' "$UI_GREEN" "$UI_RESET"
+        printf '    GitHub 更新命令：%ssbout update-github%s（跨版本请使用命令，不要记忆菜单编号）\n' "$UI_YELLOW" "$UI_RESET"
         printf '\n'
         printf '  ------------------------------------------------------------\n'
         printf '    %s[0]%s 退出\n' "$UI_GREEN" "$UI_RESET"
         ui_line
-          read -r -p "请输入选项 [0-21]: " choice
+        read -r -p "请输入选项 [0-19]: " choice
         case "$choice" in
             1) interactive_install_host ;;
             2) interactive_status ;;
@@ -16855,20 +16855,17 @@ interactive_menu() {
             7) interactive_sort_exits ;;
             8) interactive_limit_menu ;;
             9) interactive_sync_and_enable ;;
-            10) interactive_split_menu ;;
-            11) interactive_container_out_autofill ;;
-            12) interactive_clear_container_out ;;
-            13) interactive_switch_all_running_containers ;;
-            14) interactive_split_menu ;;
-            # 兼容旧主菜单编号。
-            15) interactive_split_menu ;;
-            16) update_from_github; exec "$INSTALL_BIN" menu ;;
-            17) interactive_restore ;;
-            18) interactive_uninstall ;;
-              19) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
-              20) interactive_proxy_optimization_menu ;;
-              21) repair_exit_references; pause_screen ;;
-              0) info "退出。"; exit 0 ;;
+            10) interactive_container_out_autofill ;;
+            11) interactive_clear_container_out ;;
+            12) interactive_switch_all_running_containers ;;
+            13) interactive_split_menu ;;
+            14) update_from_github; exec "$INSTALL_BIN" menu ;;
+            15) interactive_restore ;;
+            16) interactive_uninstall ;;
+            17) upgrade_config_and_components; exec "$INSTALL_BIN" menu ;;
+            18) interactive_proxy_optimization_menu ;;
+            19) repair_exit_references; pause_screen ;;
+            0) info "退出。"; exit 0 ;;
             *) warn "无效选项，请重新输入。"; sleep 1 ;;
         esac
     done
@@ -18434,7 +18431,7 @@ $APP_NAME - cloudshlii Incus 容器自助出口切换器
 
   $0 clear-container-out
       一键清空容器内 out/token、宿主机容器授权、当前出口和容器级分流覆盖。
-       自动同步会停止；出口节点与全局分流保留，请通过主菜单 9 或 10 重新同步。
+      自动同步会停止；出口节点与全局分流保留。重新同步请选择主菜单 [9]，或 [13] 分流管理 → [10] 仅分流模式。
 
   $0 enable-container-out
       重新开启容器 out/token 自动注入，并立即同步一次。
